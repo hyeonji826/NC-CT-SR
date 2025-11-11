@@ -1,0 +1,12 @@
+{
+  "glob": "E:/LD-CT SR/Data/nii_raw/NC/*/NC_raw.nii.gz",
+  "output_dir": "E:/LD-CT SR/Data/nii_cropped",
+  "mode": "index",                      
+  "from_center": true,                  
+  "center_fraction_xyz": [0.5, 0.5, 0.63],   
+  "offset_xyz_index": [0, 0, 0],     
+  "offset_xyz_mm": [0, 0, 50],       
+  "size_xyz": [320, 320, 208],
+  "pad_if_needed": false,
+  "save_name": "NC_crop.nii"        
+}
