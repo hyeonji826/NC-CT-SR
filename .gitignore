@@ -1,25 +1,83 @@
-DATA/*
-Weights/*
-*.log
-*.nii
-*.nii.gz
-*.pt
-*.pth
-*.ckpt
-*.csv
-*.json
-*.yaml
-*.yml
-*.ipynb
-__pycache__/
-.vscode/
-.env/
+# ============================
+# Global deny-all
+# ============================
+/*
+
+# ============================
+# Allowlist: essential files
+# ============================
+!/.gitignore
+!/README.md
+!/LICENSE
+
+# ============================
+# Allowlist: code directory
+# ============================
+!/_scripts/
+!/_scripts/**/*.py
+
+# Optional: allow external library code
+# !/SwinIR/**
+
+# ============================
+# Allowlist: config templates only
+# ============================
+!/configs/
+!/configs/**/*.example
+!/configs/README.md
+
+# ============================
+# Block sensitive / large file types
+# ============================
+**/*.dcm
+**/*.nii
+**/*.nii.gz
+**/*.mhd
+**/*.nrrd
+**/*.hdr
+**/*.img
+**/*.npy
+**/*.npz
+**/*.mat
+**/*.csv
+**/*.tsv
+**/*.xlsx
+**/*.json
+**/*.yaml
+**/*.yml
+**/*.ipynb
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.tif
+**/*.bmp
+
+# ============================
+# Block training artifacts
+# ============================
+**/*.tfevents.*
+**/*.pth
+**/*.pt
+**/*.ckpt
+
+# ============================
+# Python cache
+# ============================
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# ============================
+# Environment files
+# ============================
+.env
 .env.*
+
+# ============================
+# OS / IDE files
+# ============================
+.vscode/
 .idea/
 .DS_Store
-thumbs.db
-*.exe
-*.bat
-*.sh
-*.obj
-*.lib
+Thumbs.db
