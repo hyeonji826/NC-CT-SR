@@ -42,37 +42,35 @@ def compute_correlation(img1, img2):
 
 
 def compute_combined_similarity(nc_slice, ce_slice):
-    """
-    여러 metric 조합한 유사도
-    Returns: similarity score (0-1, higher is better)
-    """
+    """NC와 CE 슬라이스 간 유사도 계산 (크기 불일치 처리)"""
+    # 크기가 다르면 리사이즈
+    if nc_slice.shape != ce_slice.shape:
+        from skimage.transform import resize
+        # CE를 NC 크기에 맞춤
+        ce_slice = resize(ce_slice, nc_slice.shape, 
+                         order=1, preserve_range=True, anti_aliasing=True)
+    
+    # 정규화
+    nc_norm = (nc_slice - nc_slice.min()) / (nc_slice.max() - nc_slice.min() + 1e-8)
+    ce_norm = (ce_slice - ce_slice.min()) / (ce_slice.max() - ce_slice.min() + 1e-8)
+    
     # SSIM
-    ssim_score = ssim(nc_slice, ce_slice, data_range=1.0)
+    ssim_score = ssim(nc_norm, ce_norm, data_range=1.0)
     
-    # Histogram similarity
-    hist_score = compute_histogram_similarity(nc_slice, ce_slice)
+    # Histogram correlation
+    hist_nc, _ = np.histogram(nc_norm.flatten(), bins=256, range=(0, 1))
+    hist_ce, _ = np.histogram(ce_norm.flatten(), bins=256, range=(0, 1))
+    hist_corr = np.corrcoef(hist_nc, hist_ce)[0, 1]
     
-    # Correlation
-    corr_score = (compute_correlation(nc_slice, ce_slice) + 1) / 2  # [-1,1] → [0,1]
+    # 복합 점수
+    score = 0.7 * ssim_score + 0.3 * hist_corr
     
-    # Mean Absolute Error (inverted to similarity)
-    mae = np.mean(np.abs(nc_slice - ce_slice))
-    mae_score = 1 / (1 + mae)
-    
-    # Weighted combination
-    combined_score = (
-        0.4 * ssim_score +
-        0.3 * hist_score +
-        0.2 * corr_score +
-        0.1 * mae_score
-    )
-    
-    return combined_score, {
+    metrics = {
         'ssim': ssim_score,
-        'hist': hist_score,
-        'corr': corr_score,
-        'mae': mae_score
+        'hist_corr': hist_corr
     }
+    
+    return score, metrics
 
 
 def find_best_match_for_nc_slice(nc_slice, ce_volume_array):
@@ -147,9 +145,7 @@ def create_pseudo_pairs(args):
                     'ce_slice_idx': best_ce_idx,
                     'similarity_score': score,
                     'ssim': metrics['ssim'],
-                    'hist_sim': metrics['hist'],
-                    'correlation': metrics['corr'],
-                    'mae_sim': metrics['mae']
+                    'hist_sim': metrics['hist_corr'],
                 })
         
         all_pseudo_pairs.extend(volume_pairs)
