@@ -2,6 +2,7 @@
 """
 NC Enhancement with NAFNet
 구조 보존하면서 노이즈 제거 및 화질 개선
+(NAFSSR StereoSR 사전학습 가중치 로드 + 파인튜닝)
 """
 
 import warnings
@@ -175,11 +176,87 @@ class NAFNet(nn.Module):
 
 
 # ============================================================
+# StereoSR pretrained loader (NAFSSR → 1ch NAFNet)
+# ============================================================
+def _adapt_first_last_conv(src_w, tgt_shape):
+    # src_w, tgt: [Cout, Cin, k, k]
+    sw = src_w
+    # Cin 3->1
+    if sw.shape[1] != tgt_shape[1]:
+        if sw.shape[1] == 3 and tgt_shape[1] == 1:
+            sw = sw.mean(dim=1, keepdim=True)
+        else:
+            sw = sw[:, :tgt_shape[1]]
+    # Cout 3->1 (혹시 모를 경우)
+    if sw.shape[0] != tgt_shape[0]:
+        if sw.shape[0] == 3 and tgt_shape[0] == 1:
+            sw = sw.mean(dim=0, keepdim=True)
+        else:
+            sw = sw[:tgt_shape[0]]
+    return sw
+
+def _maybe_avg_bias(src_b, tgt_shape_out):
+    b = src_b
+    if b.shape[0] != tgt_shape_out:
+        if b.shape[0] == 3 and tgt_shape_out == 1:
+            b = b.mean().unsqueeze(0)
+        else:
+            b = b[:tgt_shape_out]
+    return b
+
+def load_stereosr_pretrained(model: torch.nn.Module, ckpt_path: str) -> int:
+    """
+    StereoSR(NAFSSR) 체크포인트에서 우리 NAFNet(1ch)으로 가능한 파라미터만 로드.
+    - 키/shape 일치: 그대로 로드
+    - intro/ending conv의 3채널↔1채널은 평균 변환
+    - shape 불일치/특수 모듈은 스킵
+    return: 로드된 텐서 개수
+    """
+    ckpt = torch.load(ckpt_path, map_location='cpu')
+    if isinstance(ckpt, dict):
+        for k in ['params_ema', 'params', 'state_dict', 'model', 'net', 'network']:
+            if k in ckpt and isinstance(ckpt[k], dict):
+                src = ckpt[k]
+                break
+        else:
+            src = ckpt
+    else:
+        src = ckpt
+    src = {k.replace('module.', ''): v for k, v in src.items()}
+
+    dst = model.state_dict()
+    loaded = 0
+    new_sd = {}
+
+    for k_dst, v_dst in dst.items():
+        if k_dst in src:
+            v_src = src[k_dst]
+            if v_src.shape == v_dst.shape:
+                new_sd[k_dst] = v_src
+                loaded += 1
+            else:
+                # intro/ending conv만 채널 보정 시도
+                if ('intro.weight' in k_dst or 'ending.weight' in k_dst) and v_src.ndim == 4 and v_dst.ndim == 4:
+                    new_sd[k_dst] = _adapt_first_last_conv(v_src, v_dst.shape)
+                    loaded += 1
+                elif ('intro.bias' in k_dst or 'ending.bias' in k_dst) and v_src.ndim == 1 and v_dst.ndim == 1:
+                    new_sd[k_dst] = _maybe_avg_bias(v_src, v_dst.shape[0])
+                    loaded += 1
+                else:
+                    pass
+        else:
+            pass
+
+    dst.update(new_sd)
+    model.load_state_dict(dst, strict=False)
+    return loaded
+
+
+# ============================================================
 # Dataset
 # ============================================================
 class NCEnhancementDataset(Dataset):
     """NC self-supervised dataset"""
-    
     def __init__(self, root, pairs_csv, split='train', image_size=512, num_slices=5):
         self.root = Path(root)
         self.image_size = image_size
@@ -204,12 +281,8 @@ class NCEnhancementDataset(Dataset):
         for _, row in df.iterrows():
             nc_path = Path(row['input_nc_norm'])
             ce_path = Path(row['target_ce_norm'])
-            
             if nc_path.exists() and ce_path.exists():
-                self.samples.append({
-                    'nc_path': nc_path,
-                    'ce_path': ce_path  # target으로 사용
-                })
+                self.samples.append({'nc_path': nc_path, 'ce_path': ce_path})
         
         print(f"[{split}] Loaded {len(self.samples)} samples")
     
@@ -233,7 +306,7 @@ class NCEnhancementDataset(Dataset):
         D_nc, H, W = nc_arr.shape
         D_ce = ce_arr.shape[0]
         
-        # 슬라이스 선택
+        # 중간 50% 구간에서 균등 샘플
         start_idx = min(D_nc, D_ce) // 4
         end_idx = 3 * min(D_nc, D_ce) // 4
         slice_idx = start_idx + (end_idx - start_idx) * slice_offset // self.num_slices
@@ -242,7 +315,7 @@ class NCEnhancementDataset(Dataset):
         nc_slice = nc_arr[min(slice_idx, D_nc-1)]
         ce_slice = ce_arr[min(slice_idx, D_ce-1)]
         
-        # [0, 1] 범위 유지 (NAFNet은 [0,1] 사용)
+        # [0,1] 가정
         nc_tensor = torch.from_numpy(nc_slice).unsqueeze(0).float()
         ce_tensor = torch.from_numpy(ce_slice).unsqueeze(0).float()
         
@@ -251,10 +324,7 @@ class NCEnhancementDataset(Dataset):
             nc_tensor = transforms.functional.resize(nc_tensor, (self.image_size, self.image_size), antialias=True)
             ce_tensor = transforms.functional.resize(ce_tensor, (self.image_size, self.image_size), antialias=True)
         
-        return {
-            'nc': nc_tensor,      # input
-            'ce': ce_tensor       # target
-        }
+        return {'nc': nc_tensor, 'ce': ce_tensor}
 
 
 # ============================================================
@@ -280,6 +350,15 @@ class NAFNetTrainer:
             enc_blk_nums=args.enc_blk_nums,
             dec_blk_nums=args.dec_blk_nums
         ).to(self.device)
+        
+        # ===== Load StereoSR (NAFSSR) pretrained if present =====
+        if getattr(args, 'pretrained_stereosr', ''):
+            ckpt_path = args.pretrained_stereosr
+            if not os.path.isfile(ckpt_path):
+                print(f"[WARN] Pretrained not found at {ckpt_path}. Skip loading.")
+            else:
+                n = load_stereosr_pretrained(self.model, ckpt_path)
+                print(f"[INFO] Loaded {n} tensors from NAFSSR-{args.pretrained_which} pretrained.")
         
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"Total params: {total_params:,}")
@@ -337,11 +416,9 @@ class NAFNetTrainer:
             nc = batch['nc'].to(self.device)
             ce = batch['ce'].to(self.device)
             
-            # Forward
             pred = self.model(nc)
             loss = self.criterion(pred, ce)
             
-            # Backward
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -359,11 +436,9 @@ class NAFNetTrainer:
         self.model.eval()
         total_loss = 0
         
-        # Validation loss
         for batch in tqdm(self.val_loader, desc="Validating"):
             nc = batch['nc'].to(self.device)
             ce = batch['ce'].to(self.device)
-            
             pred = self.model(nc)
             loss = self.criterion(pred, ce)
             total_loss += loss.item()
@@ -371,11 +446,10 @@ class NAFNetTrainer:
         avg_loss = total_loss / len(self.val_loader)
         self.val_losses.append(avg_loss)
         
-        # Save best model + sample
         if avg_loss < self.best_val_loss:
             self.best_val_loss = avg_loss
             self.save_checkpoint('best.pth')
-            self.save_sample_comparison(epoch)  # best일 때만 샘플 저장
+            self.save_sample_comparison(epoch)
             print(f"✓ Best model saved (val_loss: {avg_loss:.4f})")
         
         return avg_loss
@@ -384,21 +458,14 @@ class NAFNetTrainer:
     def save_sample_comparison(self, epoch):
         """Original NC vs Enhanced NC 비교 이미지 저장"""
         self.model.eval()
-        
-        # val dataset에서 첫 샘플 가져오기
         sample = self.val_dataset[0]
         nc = sample['nc'].unsqueeze(0).to(self.device)
-        
-        # Predict
         enhanced = self.model(nc)
         
-        # To numpy
         nc_np = nc.cpu()[0, 0].numpy()
         enhanced_np = enhanced.cpu()[0, 0].numpy()
         
-        # Save
         fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        
         axes[0].imshow(nc_np, cmap='gray', vmin=0, vmax=1)
         axes[0].set_title('Original NC', fontsize=14, fontweight='bold')
         axes[0].axis('off')
@@ -407,13 +474,12 @@ class NAFNetTrainer:
         axes[1].set_title('Enhanced NC (NAFNet)', fontsize=14, fontweight='bold', color='green')
         axes[1].axis('off')
         
-        # PSNR 계산
         from skimage.metrics import peak_signal_noise_ratio as psnr
         psnr_val = psnr(nc_np, enhanced_np, data_range=1.0)
         
         fig.text(0.5, 0.02, f'PSNR: {psnr_val:.2f} dB | Epoch: {epoch+1}', 
-                ha='center', fontsize=12,
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                 ha='center', fontsize=12,
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
         plt.tight_layout(rect=[0, 0.05, 1, 1])
         save_path = self.exp_dir / 'samples' / f'best_epoch_{epoch+1:03d}.png'
@@ -476,7 +542,13 @@ def main():
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--num-workers', type=int, default=4)
-    
+
+    # ===== 추가: StereoSR(NAFSSR) 프리트레인 경로/라벨 =====
+    parser.add_argument('--pretrained-stereosr', default=r'E:\LD-CT SR\Weights\NAFSSR-L_4x.pth',
+                        help='NAFSSR ckpt path (.pth). 빈 문자열이면 로드 생략')
+    parser.add_argument('--pretrained-which', default='4x', choices=['2x', '4x'],
+                        help='로그 표기용')
+
     args = parser.parse_args()
     
     if torch.cuda.is_available():

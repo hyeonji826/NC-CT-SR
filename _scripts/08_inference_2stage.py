@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-2-Stage NC Enhancement Pipeline
-Stage 1: NC → Enhanced NC (화질 개선)
-Stage 2: Enhanced NC → Pseudo CE (약한 조영 효과)
+2-Stage NC Enhancement Pipeline (Updated)
+Stage 1: NC → Enhanced NC (NAFNet - 구조 완벽 보존)
+Stage 2: Enhanced NC → Pseudo CE (SD LoRA - 약한 조영 효과)
 """
 
 import warnings
@@ -13,6 +13,8 @@ import argparse
 from pathlib import Path
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import SimpleITK as sitk
@@ -33,6 +35,156 @@ import lpips
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
+
+
+# ============================================================
+# NAFNet (from 09_train_nafnet.py)
+# ============================================================
+class LayerNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        ctx.eps = eps
+        N, C, H, W = x.size()
+        mu = x.mean(1, keepdim=True)
+        var = (x - mu).pow(2).mean(1, keepdim=True)
+        y = (x - mu) / (var + eps).sqrt()
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        eps = ctx.eps
+        N, C, H, W = grad_output.size()
+        y, var, weight = ctx.saved_variables
+        g = grad_output * weight.view(1, C, 1, 1)
+        mean_g = g.mean(dim=1, keepdim=True)
+        mean_gy = (g * y).mean(dim=1, keepdim=True)
+        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(dim=0), None
+
+
+class LayerNorm2d(nn.Module):
+    def __init__(self, channels, eps=1e-6):
+        super(LayerNorm2d, self).__init__()
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
+        self.eps = eps
+
+    def forward(self, x):
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
+
+
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
+class NAFBlock(nn.Module):
+    def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.):
+        super().__init__()
+        dw_channel = c * DW_Expand
+        self.conv1 = nn.Conv2d(in_channels=c, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel, bias=True)
+        self.conv3 = nn.Conv2d(in_channels=dw_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels=dw_channel // 2, out_channels=dw_channel // 2, kernel_size=1, padding=0, stride=1, groups=1, bias=True),
+        )
+        
+        self.sg = SimpleGate()
+        
+        ffn_channel = FFN_Expand * c
+        self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        
+        self.norm1 = LayerNorm2d(c)
+        self.norm2 = LayerNorm2d(c)
+        
+        self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+        self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+        
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+
+    def forward(self, inp):
+        x = inp
+        x = self.norm1(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.sg(x)
+        x = x * self.sca(x)
+        x = self.conv3(x)
+        x = self.dropout1(x)
+        y = inp + x * self.beta
+        
+        x = self.conv4(self.norm2(y))
+        x = self.sg(x)
+        x = self.conv5(x)
+        x = self.dropout2(x)
+        return y + x * self.gamma
+
+
+class NAFNet(nn.Module):
+    def __init__(self, img_channel=1, width=32, middle_blk_num=12, enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 2]):
+        super().__init__()
+        
+        self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1, bias=True)
+        self.ending = nn.Conv2d(in_channels=width, out_channels=img_channel, kernel_size=3, padding=1, stride=1, groups=1, bias=True)
+        
+        self.encoders = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        self.middle_blks = nn.ModuleList()
+        self.ups = nn.ModuleList()
+        self.downs = nn.ModuleList()
+        
+        chan = width
+        for num in enc_blk_nums:
+            self.encoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
+            self.downs.append(nn.Conv2d(chan, 2*chan, 2, 2))
+            chan = chan * 2
+        
+        self.middle_blks = nn.Sequential(*[NAFBlock(chan) for _ in range(middle_blk_num)])
+        
+        for num in dec_blk_nums:
+            self.ups.append(nn.Sequential(nn.Conv2d(chan, chan * 2, 1, bias=False), nn.PixelShuffle(2)))
+            chan = chan // 2
+            self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
+        
+        self.padder_size = 2 ** len(self.encoders)
+
+    def forward(self, inp):
+        B, C, H, W = inp.shape
+        inp = self.check_image_size(inp)
+        
+        x = self.intro(inp)
+        
+        encs = []
+        for encoder, down in zip(self.encoders, self.downs):
+            x = encoder(x)
+            encs.append(x)
+            x = down(x)
+        
+        x = self.middle_blks(x)
+        
+        for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
+            x = up(x)
+            x = x + enc_skip
+            x = decoder(x)
+        
+        x = self.ending(x)
+        x = x + inp
+        
+        return x[:, :, :H, :W]
+
+    def check_image_size(self, x):
+        _, _, h, w = x.size()
+        mod_pad_h = (self.padder_size - h % self.padder_size) % self.padder_size
+        mod_pad_w = (self.padder_size - w % self.padder_size) % self.padder_size
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h))
+        return x
 
 
 # ============================================================
@@ -126,22 +278,35 @@ class NCCTDataset(Dataset):
 
 
 # ============================================================
-# 2-Stage Pipeline
+# 2-Stage Pipeline (NAFNet + SD LoRA)
 # ============================================================
 class TwoStagePipeline:
-    def __init__(self, enhancement_checkpoint, style_checkpoint, device='cuda'):
+    def __init__(self, nafnet_checkpoint, style_checkpoint, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        print("Loading Stable Diffusion components...")
+        # Stage 1: NAFNet
+        print("Loading Stage 1 (NAFNet) model...")
+        self.nafnet = NAFNet(
+            img_channel=1,
+            width=32,
+            middle_blk_num=12,
+            enc_blk_nums=[2, 2, 4, 8],
+            dec_blk_nums=[2, 2, 2, 2]
+        ).to(self.device)
+        
+        checkpoint = torch.load(nafnet_checkpoint, map_location=self.device)
+        self.nafnet.load_state_dict(checkpoint['model'])
+        self.nafnet.eval()
+        
+        # Stage 2: SD LoRA
+        print("Loading Stage 2 (SD LoRA) model...")
         model_id = "stabilityai/stable-diffusion-2-1-base"
         
-        # VAE
         self.vae = AutoencoderKL.from_pretrained(
             model_id, subfolder="vae", torch_dtype=torch.float32
         ).to(self.device)
         self.vae.eval()
         
-        # Text Encoder
         self.tokenizer = CLIPTokenizer.from_pretrained(
             model_id, subfolder="tokenizer"
         )
@@ -150,31 +315,16 @@ class TwoStagePipeline:
         ).to(self.device)
         self.text_encoder.eval()
         
-        # Stage 1: Enhancement Model
-        print("Loading Stage 1 (Enhancement) model...")
-        base_unet_1 = UNet2DConditionModel.from_pretrained(
-            model_id, subfolder="unet", torch_dtype=torch.float32
-        )
-        self.unet_enhance = PeftModel.from_pretrained(
-            base_unet_1,
-            enhancement_checkpoint,
-            is_trainable=False
-        ).to(self.device)
-        self.unet_enhance.eval()
-        
-        # Stage 2: Style Model
-        print("Loading Stage 2 (Style) model...")
-        base_unet_2 = UNet2DConditionModel.from_pretrained(
+        base_unet = UNet2DConditionModel.from_pretrained(
             model_id, subfolder="unet", torch_dtype=torch.float32
         )
         self.unet_style = PeftModel.from_pretrained(
-            base_unet_2,
+            base_unet,
             style_checkpoint,
             is_trainable=False
         ).to(self.device)
         self.unet_style.eval()
         
-        # Scheduler
         self.scheduler = DDIMScheduler.from_pretrained(
             model_id, subfolder="scheduler"
         )
@@ -203,48 +353,21 @@ class TwoStagePipeline:
         return prompt_embeds
     
     @torch.no_grad()
-    def enhance_nc(self, nc_image, strength=0.7):
-        """Stage 1: NC → Enhanced NC (화질 개선)"""
-        nc_rgb = nc_image.repeat(1, 3, 1, 1).to(self.device, dtype=torch.float32)
-        
-        init_latents = self.vae.encode(nc_rgb).latent_dist.sample()
-        init_latents = init_latents * self.vae.config.scaling_factor
-        
-        prompt = "high quality CT scan, denoised medical image, enhanced liver contrast"
-        encoder_hidden_states = self.encode_prompt(prompt)
-        
-        # Add noise
-        noise = torch.randn_like(init_latents)
-        timesteps = self.scheduler.timesteps
-        start_step = int(len(timesteps) * (1 - strength))
-        timestep = timesteps[start_step:start_step+1]
-        
-        latents = self.scheduler.add_noise(init_latents, noise, timestep)
-        
-        # Denoising with enhancement model
-        for t in timesteps[start_step:]:
-            latent_model_input = latents
-            
-            noise_pred = self.unet_enhance(
-                latent_model_input,
-                t,
-                encoder_hidden_states=encoder_hidden_states
-            ).sample
-            
-            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-        
-        # Decode
-        latents = 1 / self.vae.config.scaling_factor * latents
-        image = self.vae.decode(latents).sample
-        
-        return image
+    def enhance_nc(self, nc_image):
+        """Stage 1: NC → Enhanced NC (NAFNet - 구조 보존)"""
+        # nc_image: [1, 1, H, W], [0, 1] range
+        enhanced = self.nafnet(nc_image)
+        return enhanced
     
     @torch.no_grad()
     def apply_ce_style(self, enhanced_nc, strength=0.3):
         """Stage 2: Enhanced NC → Pseudo CE (약한 조영 효과)"""
-        # enhanced_nc는 이미 [-1, 1] 범위
+        # enhanced_nc: [1, 1, H, W], [0, 1] range
+        # SD는 [-1, 1] 범위 필요
+        enhanced_nc_scaled = enhanced_nc * 2.0 - 1.0
+        enhanced_rgb = enhanced_nc_scaled.repeat(1, 3, 1, 1).to(self.device, dtype=torch.float32)
         
-        latents = self.vae.encode(enhanced_nc).latent_dist.sample()
+        latents = self.vae.encode(enhanced_rgb).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor
         
         prompt = "contrast-enhanced CT scan, medical imaging, enhanced blood vessels"
@@ -258,7 +381,7 @@ class TwoStagePipeline:
         
         latents = self.scheduler.add_noise(latents, noise, timestep)
         
-        # Denoising with style model
+        # Denoising
         for t in timesteps[start_step:]:
             latent_model_input = latents
             
@@ -274,9 +397,12 @@ class TwoStagePipeline:
         latents = 1 / self.vae.config.scaling_factor * latents
         image = self.vae.decode(latents).sample
         
+        # [-1, 1] → [0, 1]
+        image = (image + 1.0) / 2.0
+        
         return image
     
-    def process_dataset(self, dataset, output_dir, enhance_strength=0.7, style_strength=0.3):
+    def process_dataset(self, dataset, output_dir, style_strength=0.3):
         """데이터셋 전체 처리"""
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -287,17 +413,17 @@ class TwoStagePipeline:
         
         for batch in tqdm(dataloader, desc="Processing 2-stage pipeline"):
             pid = batch['pid'][0]
-            nc = batch['nc']  # [1, 1, H, W]
+            nc = batch['nc']  # [1, 1, H, W], [0, 1]
             nc_raw = batch['nc_raw'].numpy()[0]
             ce_real_raw = batch['ce_real_raw'].numpy()[0]
             
-            # Stage 1: NC → Enhanced NC
-            enhanced_nc = self.enhance_nc(nc, strength=enhance_strength)
-            enhanced_nc_np = (enhanced_nc / 2 + 0.5).clamp(0, 1).cpu()[0, 0].numpy()
+            # Stage 1: NC → Enhanced NC (NAFNet)
+            enhanced_nc = self.enhance_nc(nc.to(self.device))
+            enhanced_nc_np = enhanced_nc.cpu()[0, 0].numpy()
             
             # Stage 2: Enhanced NC → Pseudo CE
             pseudo_ce = self.apply_ce_style(enhanced_nc, strength=style_strength)
-            pseudo_ce_np = (pseudo_ce / 2 + 0.5).clamp(0, 1).cpu()[0, 0].numpy()
+            pseudo_ce_np = pseudo_ce.cpu()[0, 0].numpy()
             
             # Resize for metrics
             if nc_raw.shape != enhanced_nc_np.shape:
@@ -451,34 +577,32 @@ class TwoStagePipeline:
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description='2-Stage NC Enhancement Pipeline')
+    parser = argparse.ArgumentParser(description='2-Stage NC Enhancement Pipeline (NAFNet + SD LoRA)')
     
     parser.add_argument('--root', default=r'E:\LD-CT SR')
     parser.add_argument('--pairs-csv', default='Data/pairs.csv')
-    parser.add_argument('--enhancement-checkpoint', required=True, 
-                       help='Path to Stage 1 (enhancement) checkpoint')
+    parser.add_argument('--nafnet-checkpoint', required=True, 
+                       help='Path to NAFNet checkpoint (best.pth)')
     parser.add_argument('--style-checkpoint', required=True,
-                       help='Path to Stage 2 (CE style) checkpoint')
-    parser.add_argument('--output-dir', default='Outputs/translations/2stage_pipeline')
+                       help='Path to SD LoRA CE style checkpoint')
+    parser.add_argument('--output-dir', default='Outputs/translations/2stage_nafnet')
     
     parser.add_argument('--split', default='test', choices=['train', 'val', 'test'])
-    parser.add_argument('--enhance-strength', type=float, default=0.7,
-                       help='Stage 1 strength (0-1)')
     parser.add_argument('--style-strength', type=float, default=0.3,
-                       help='Stage 2 strength (0-1, lower = less CE effect)')
+                       help='Stage 2 CE style strength (0-1, lower = less CE effect)')
     parser.add_argument('--image-size', type=int, default=512)
     
     args = parser.parse_args()
     
     print(f"\n{'='*80}")
-    print("2-Stage NC Enhancement Pipeline")
-    print(f"  Stage 1: Enhancement (strength={args.enhance_strength})")
-    print(f"  Stage 2: CE Style (strength={args.style_strength})")
+    print("2-Stage NC Enhancement Pipeline (NAFNet + SD LoRA)")
+    print(f"  Stage 1: NAFNet (구조 보존 화질 개선)")
+    print(f"  Stage 2: SD LoRA (CE style, strength={args.style_strength})")
     print(f"{'='*80}\n")
     
     # Load pipeline
     pipeline = TwoStagePipeline(
-        args.enhancement_checkpoint,
+        args.nafnet_checkpoint,
         args.style_checkpoint
     )
     
@@ -494,7 +618,6 @@ def main():
     pipeline.process_dataset(
         dataset,
         args.output_dir,
-        enhance_strength=args.enhance_strength,
         style_strength=args.style_strength
     )
 
