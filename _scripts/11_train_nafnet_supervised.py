@@ -1,83 +1,53 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
-Supervised NAFNet Training with Pseudo-pairs
-NC → CE 직접 학습 (Pseudo-paired)
+NAFNet Supervised Training Script with Pretrained Model Support
+Pseudo-pairs를 이용한 supervised learning + 사전학습 모델 fine-tuning
 """
 
-import warnings
-warnings.filterwarnings('ignore')
-
-import os
-import argparse
-import random
-from pathlib import Path
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import SimpleITK as sitk
+import numpy as np
+from pathlib import Path
+from PIL import Image
+import argparse
 from tqdm import tqdm
 import pandas as pd
-import matplotlib.pyplot as plt
+import time
+import json
+from torch.utils.tensorboard import SummaryWriter
 
-
-# NAFNet Architecture (동일)
-class LayerNormFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias, eps):
-        ctx.eps = eps
-        N, C, H, W = x.size()
-        mu = x.mean(1, keepdim=True)
-        var = (x - mu).pow(2).mean(1, keepdim=True)
-        y = (x - mu) / (var + eps).sqrt()
-        ctx.save_for_backward(y, var, weight)
-        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
-        return y
-    @staticmethod
-    def backward(ctx, grad_output):
-        eps = ctx.eps
-        N, C, H, W = grad_output.size()
-        y, var, weight = ctx.saved_variables
-        g = grad_output * weight.view(1, C, 1, 1)
-        mean_g = g.mean(dim=1, keepdim=True)
-        mean_gy = (g * y).mean(dim=1, keepdim=True)
-        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
-        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(dim=0), None
-
-class LayerNorm2d(nn.Module):
-    def __init__(self, channels, eps=1e-6):
-        super(LayerNorm2d, self).__init__()
-        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
-        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
-        self.eps = eps
-    def forward(self, x):
-        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
-
-class SimpleGate(nn.Module):
-    def forward(self, x):
-        x1, x2 = x.chunk(2, dim=1)
-        return x1 * x2
 
 class NAFBlock(nn.Module):
+    """NAFNet의 기본 블록"""
     def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.):
         super().__init__()
         dw_channel = c * DW_Expand
-        self.conv1 = nn.Conv2d(c, dw_channel, 1, padding=0, stride=1, groups=1, bias=True)
-        self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, padding=1, stride=1, groups=dw_channel, bias=True)
-        self.conv3 = nn.Conv2d(dw_channel // 2, c, 1, padding=0, stride=1, groups=1, bias=True)
-        self.sca = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dw_channel // 2, dw_channel // 2, 1, padding=0, stride=1, groups=1, bias=True))
+        self.conv1 = nn.Conv2d(c, dw_channel, 1, 1, 0, bias=True)
+        self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, 1, 1, groups=dw_channel, bias=True)
+        self.conv3 = nn.Conv2d(dw_channel // 2, c, 1, 1, 0, bias=True)
+        
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dw_channel // 2, dw_channel // 2, 1, 1, 0, bias=True),
+        )
+        
         self.sg = SimpleGate()
+        
         ffn_channel = FFN_Expand * c
-        self.conv4 = nn.Conv2d(c, ffn_channel, 1, padding=0, stride=1, groups=1, bias=True)
-        self.conv5 = nn.Conv2d(ffn_channel // 2, c, 1, padding=0, stride=1, groups=1, bias=True)
+        self.conv4 = nn.Conv2d(c, ffn_channel, 1, 1, 0, bias=True)
+        self.conv5 = nn.Conv2d(ffn_channel // 2, c, 1, 1, 0, bias=True)
+        
         self.norm1 = LayerNorm2d(c)
         self.norm2 = LayerNorm2d(c)
+        
         self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
         self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+        
         self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
         self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+
     def forward(self, inp):
         x = inp
         x = self.norm1(x)
@@ -88,315 +58,585 @@ class NAFBlock(nn.Module):
         x = self.conv3(x)
         x = self.dropout1(x)
         y = inp + x * self.beta
-        x = self.conv4(self.norm2(y))
+        
+        x = self.norm2(y)
+        x = self.conv4(x)
         x = self.sg(x)
         x = self.conv5(x)
         x = self.dropout2(x)
+        
         return y + x * self.gamma
 
-class NAFNet(nn.Module):
-    def __init__(self, img_channel=1, width=64, middle_blk_num=6, enc_blk_nums=[1,1,2,4], dec_blk_nums=[1,1,1,1]):
+
+class SimpleGate(nn.Module):
+    """Simple Gate activation"""
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+
+class LayerNorm2d(nn.Module):
+    """2D Layer Normalization"""
+    def __init__(self, channels, eps=1e-6):
         super().__init__()
-        self.intro = nn.Conv2d(img_channel, width, 3, padding=1, stride=1, groups=1, bias=True)
-        self.ending = nn.Conv2d(width, img_channel, 3, padding=1, stride=1, groups=1, bias=True)
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.eps = eps
+
+    def forward(self, x):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+        return x
+
+
+class NAFNet(nn.Module):
+    """NAFNet 모델"""
+    def __init__(self, img_channel=3, width=32, middle_blk_num=12, 
+                 enc_blk_nums=[2, 2, 4, 8], dec_blk_nums=[2, 2, 2, 2]):
+        super().__init__()
+        
+        self.intro = nn.Conv2d(img_channel, width, 3, 1, 1, bias=True)
+        self.ending = nn.Conv2d(width, img_channel, 3, 1, 1, bias=True)
+        
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()
         self.middle_blks = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
+        
         chan = width
         for num in enc_blk_nums:
             self.encoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
             self.downs.append(nn.Conv2d(chan, 2*chan, 2, 2))
             chan = chan * 2
+        
         self.middle_blks = nn.Sequential(*[NAFBlock(chan) for _ in range(middle_blk_num)])
+        
         for num in dec_blk_nums:
-            self.ups.append(nn.Sequential(nn.Conv2d(chan, chan*2, 1, bias=False), nn.PixelShuffle(2)))
+            self.ups.append(nn.Sequential(
+                nn.Conv2d(chan, chan * 2, 1, bias=False),
+                nn.PixelShuffle(2)
+            ))
             chan = chan // 2
             self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
+        
         self.padder_size = 2 ** len(self.encoders)
+
     def forward(self, inp):
         B, C, H, W = inp.shape
         inp = self.check_image_size(inp)
+        
         x = self.intro(inp)
+        
         encs = []
         for encoder, down in zip(self.encoders, self.downs):
             x = encoder(x)
             encs.append(x)
             x = down(x)
+        
         x = self.middle_blks(x)
+        
         for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
             x = up(x)
             x = x + enc_skip
             x = decoder(x)
+        
         x = self.ending(x)
         x = x + inp
+        
         return x[:, :, :H, :W]
+    
     def check_image_size(self, x):
         _, _, h, w = x.size()
         mod_pad_h = (self.padder_size - h % self.padder_size) % self.padder_size
         mod_pad_w = (self.padder_size - w % self.padder_size) % self.padder_size
-        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h))
+        x = torch.nn.functional.pad(x, (0, mod_pad_w, 0, mod_pad_h))
         return x
 
-class SSIMLoss(nn.Module):
-    def __init__(self, window_size=11):
-        super().__init__()
-        self.ws = window_size
-        g = torch.tensor([np.exp(-(x-window_size//2)**2/(2*1.5**2)) for x in range(window_size)], dtype=torch.float32)
-        g = (g / g.sum()).unsqueeze(1)
-        window = g @ g.t()
-        self.register_buffer('w', window.unsqueeze(0).unsqueeze(0))
-    def forward(self, x, y):
-        w = self.w.to(x.device)
-        C1, C2 = 0.01**2, 0.03**2
-        mu1 = F.conv2d(x, w, padding=self.ws//2)
-        mu2 = F.conv2d(y, w, padding=self.ws//2)
-        mu1_sq, mu2_sq, mu1_mu2 = mu1*mu1, mu2*mu2, mu1*mu2
-        sigma1_sq = F.conv2d(x*x, w, padding=self.ws//2) - mu1_sq
-        sigma2_sq = F.conv2d(y*y, w, padding=self.ws//2) - mu2_sq
-        sigma12 = F.conv2d(x*y, w, padding=self.ws//2) - mu1_mu2
-        ssim = ((2*mu1_mu2+C1)*(2*sigma12+C2)) / ((mu1_sq+mu2_sq+C1)*(sigma1_sq+sigma2_sq+C2))
-        return 1 - ssim.mean()
 
-
-# Pseudo-paired Dataset
-class PseudoPairedDataset(Dataset):
-    def __init__(self, root, pseudo_pairs_csv, split='train', image_size=512, augment=True):
-        self.root = Path(root)
-        self.image_size = image_size
-        self.augment = augment and (split == 'train')
+class PseudoPairDataset(Dataset):
+    """Pseudo-pairs CSV로부터 학습 데이터셋 생성"""
+    def __init__(self, csv_path, patch_size=256, augment=True):
+        self.csv_path = Path(csv_path)
+        self.pairs_df = pd.read_csv(csv_path)
+        self.patch_size = patch_size
+        self.augment = augment
         
-        df = pd.read_csv(self.root / pseudo_pairs_csv)
-        
-        # Train/Val/Test split
-        n_total = len(df)
-        n_train = int(n_total * 0.8)
-        n_val = int(n_total * 0.1)
-        
-        if split == 'train':
-            df = df.iloc[:n_train]
-        elif split == 'val':
-            df = df.iloc[n_train:n_train+n_val]
-        else:
-            df = df.iloc[n_train+n_val:]
-        
-        self.pairs = df.reset_index(drop=True)
-        print(f"[{split}] Loaded {len(self.pairs)} pseudo-pairs")
+        print(f"Loaded {len(self.pairs_df)} pseudo-pairs from {csv_path}")
     
     def __len__(self):
-        return len(self.pairs)
+        return len(self.pairs_df)
     
     def __getitem__(self, idx):
-        row = self.pairs.iloc[idx]
+        row = self.pairs_df.iloc[idx]
         
-        # Load NC slice
+        # Load NC and CE volumes
+        import SimpleITK as sitk
         nc_img = sitk.ReadImage(row['nc_path'])
         nc_arr = sitk.GetArrayFromImage(nc_img).astype(np.float32)
         nc_slice = nc_arr[int(row['nc_slice_idx'])]
         
-        # Load CE slice
         ce_img = sitk.ReadImage(row['ce_path'])
         ce_arr = sitk.GetArrayFromImage(ce_img).astype(np.float32)
         ce_slice = ce_arr[int(row['ce_slice_idx'])]
         
-        # To tensor
-        nc_tensor = torch.from_numpy(nc_slice).unsqueeze(0).float()
-        ce_tensor = torch.from_numpy(ce_slice).unsqueeze(0).float()
+        # Resize if needed
+        if ce_slice.shape != nc_slice.shape:
+            from skimage.transform import resize
+            ce_slice = resize(ce_slice, nc_slice.shape, 
+                            order=1, preserve_range=True, anti_aliasing=True)
         
-        # Resize
-        if nc_tensor.shape[1] != self.image_size or nc_tensor.shape[2] != self.image_size:
-            nc_tensor = transforms.functional.resize(nc_tensor, (self.image_size, self.image_size), antialias=False)
-            ce_tensor = transforms.functional.resize(ce_tensor, (self.image_size, self.image_size), antialias=False)
+        # Random crop to patch_size
+        H, W = nc_slice.shape
+        if H > self.patch_size and W > self.patch_size:
+            top = np.random.randint(0, H - self.patch_size)
+            left = np.random.randint(0, W - self.patch_size)
+            nc_slice = nc_slice[top:top+self.patch_size, left:left+self.patch_size]
+            ce_slice = ce_slice[top:top+self.patch_size, left:left+self.patch_size]
         
         # Augmentation
         if self.augment:
-            if random.random() > 0.5:
-                nc_tensor = transforms.functional.hflip(nc_tensor)
-                ce_tensor = transforms.functional.hflip(ce_tensor)
-            if random.random() > 0.5:
-                nc_tensor = transforms.functional.vflip(nc_tensor)
-                ce_tensor = transforms.functional.vflip(ce_tensor)
-            if random.random() > 0.5:
-                k = random.randint(1, 3)
-                nc_tensor = torch.rot90(nc_tensor, k, dims=[1,2])
-                ce_tensor = torch.rot90(ce_tensor, k, dims=[1,2])
+            # Random flip
+            if np.random.rand() > 0.5:
+                nc_slice = np.fliplr(nc_slice)
+                ce_slice = np.fliplr(ce_slice)
+            if np.random.rand() > 0.5:
+                nc_slice = np.flipud(nc_slice)
+                ce_slice = np.flipud(ce_slice)
+            # Random rotation (90, 180, 270)
+            k = np.random.randint(0, 4)
+            nc_slice = np.rot90(nc_slice, k)
+            ce_slice = np.rot90(ce_slice, k)
         
-        return {'input': nc_tensor, 'target': ce_tensor}
+        # Convert to tensor (add channel dimension)
+        nc_slice = torch.from_numpy(nc_slice.copy()).unsqueeze(0)  # [1, H, W]
+        ce_slice = torch.from_numpy(ce_slice.copy()).unsqueeze(0)  # [1, H, W]
+        
+        # Convert grayscale to RGB (repeat channel)
+        nc_slice = nc_slice.repeat(3, 1, 1)
+        ce_slice = ce_slice.repeat(3, 1, 1)
+        
+        return nc_slice, ce_slice
 
 
-# Trainer
-class Trainer:
-    def __init__(self, args):
-        self.args = args
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.exp_dir = Path(args.exp_dir)
-        self.exp_dir.mkdir(parents=True, exist_ok=True)
-        (self.exp_dir / 'checkpoints').mkdir(exist_ok=True)
-        (self.exp_dir / 'samples').mkdir(exist_ok=True)
-        
-        print("Building NAFNet...")
-        self.model = NAFNet(img_channel=1, width=args.width, middle_blk_num=args.middle_blk_num,
-                           enc_blk_nums=args.enc_blk_nums, dec_blk_nums=args.dec_blk_nums).to(self.device)
-        print(f"Total params: {sum(p.numel() for p in self.model.parameters()):,}")
-        
-        self.l1 = nn.L1Loss()
-        self.ssim_loss = SSIMLoss()
-        self.ssim_w = args.ssim_w
-        
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=args.epochs, eta_min=1e-6)
-        
-        self.train_dataset = PseudoPairedDataset(args.root, args.pseudo_pairs_csv, 'train', args.image_size, True)
-        self.val_dataset = PseudoPairedDataset(args.root, args.pseudo_pairs_csv, 'val', args.image_size, False)
-        
-        self.train_loader = DataLoader(self.train_dataset, args.batch_size, True, num_workers=args.num_workers, pin_memory=True)
-        self.val_loader = DataLoader(self.val_dataset, args.batch_size, False, num_workers=args.num_workers)
-        
-        self.train_losses = []
-        self.val_losses = []
-        self.best_val_loss = float('inf')
-        self.patience = args.patience
-        self.patience_counter = 0
+def calculate_psnr(img1, img2):
+    """PSNR 계산"""
+    mse = torch.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return 100
+    return 20 * torch.log10(1.0 / torch.sqrt(mse))
+
+
+def load_pretrained_model(model, pretrained_path, device):
+    """사전학습 모델 로드"""
+    print(f"\n{'='*80}")
+    print(f"Loading pretrained model from: {pretrained_path}")
+    print(f"{'='*80}")
     
-    def _loss(self, pred, target):
-        return self.l1(pred, target) + self.ssim_w * self.ssim_loss(pred, target)
+    checkpoint = torch.load(pretrained_path, map_location=device)
     
-    def train_epoch(self, epoch):
-        self.model.train()
-        total = 0
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
-        for batch in pbar:
-            inp = batch['input'].to(self.device)
-            target = batch['target'].to(self.device)
-            pred = self.model(inp)
-            loss = self._loss(pred, target)
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            total += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
-        avg = total / len(self.train_loader)
-        self.train_losses.append(avg)
-        return avg
+    # 체크포인트 구조 확인
+    if 'params' in checkpoint:
+        state_dict = checkpoint['params']
+    elif 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    elif 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
     
-    @torch.no_grad()
-    def validate(self, epoch):
-        self.model.eval()
-        total = 0
-        for batch in tqdm(self.val_loader, desc="Validating"):
-            inp = batch['input'].to(self.device)
-            target = batch['target'].to(self.device)
-            pred = self.model(inp)
-            loss = self._loss(pred, target)
-            total += loss.item()
-        avg = total / len(self.val_loader)
-        self.val_losses.append(avg)
-        if avg < self.best_val_loss:
-            self.best_val_loss = avg
-            self.patience_counter = 0
-            self.save_checkpoint('best.pth')
-            self.save_sample(epoch)
-            print(f"✓ Best model saved (val_loss: {avg:.4f})")
+    # 키 이름 매칭 (필요시)
+    model_dict = model.state_dict()
+    pretrained_dict = {}
+    
+    for k, v in state_dict.items():
+        # 'module.' 제거
+        new_k = k.replace('module.', '')
+        
+        # 모델에 해당 키가 있고 shape이 일치하면 로드
+        if new_k in model_dict and model_dict[new_k].shape == v.shape:
+            pretrained_dict[new_k] = v
         else:
-            self.patience_counter += 1
-            print(f"  Patience: {self.patience_counter}/{self.patience}")
-        return avg
+            print(f"  [SKIP] {new_k}: shape mismatch or not found")
     
-    @torch.no_grad()
-    def save_sample(self, epoch):
-        from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
-        self.model.eval()
-        sample = self.val_dataset[0]
-        inp = sample['input'].unsqueeze(0).to(self.device)
-        target = sample['target'].unsqueeze(0).to(self.device)
-        pred = self.model(inp)
-        inp_np = inp.cpu()[0,0].numpy()
-        pred_np = pred.cpu()[0,0].numpy()
-        target_np = target.cpu()[0,0].numpy()
-        psnr_val = psnr(target_np, pred_np, data_range=1.0)
-        ssim_val = ssim(target_np, pred_np, data_range=1.0)
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-        axes[0].imshow(inp_np, cmap='gray', vmin=0, vmax=1)
-        axes[0].set_title('NC Input', fontsize=14, fontweight='bold')
-        axes[0].axis('off')
-        axes[1].imshow(pred_np, cmap='gray', vmin=0, vmax=1)
-        axes[1].set_title('Predicted CE', fontsize=14, fontweight='bold', color='green')
-        axes[1].axis('off')
-        axes[2].imshow(target_np, cmap='gray', vmin=0, vmax=1)
-        axes[2].set_title('Target CE (Pseudo-paired)', fontsize=14, fontweight='bold')
-        axes[2].axis('off')
-        fig.text(0.5, 0.02, f'PSNR: {psnr_val:.2f} dB | SSIM: {ssim_val:.4f} | Epoch: {epoch+1} | Val Loss: {self.best_val_loss:.4f}',
-                ha='center', fontsize=12, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-        plt.tight_layout(rect=[0, 0.05, 1, 1])
-        save_path = self.exp_dir / 'samples' / f'best_epoch_{epoch+1:03d}.png'
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"  Sample saved: {save_path}")
+    # 로드된 파라미터 통계
+    loaded_keys = len(pretrained_dict)
+    total_keys = len(model_dict)
+    print(f"\nLoaded {loaded_keys}/{total_keys} parameters from pretrained model")
+    print(f"Loading ratio: {loaded_keys/total_keys*100:.1f}%")
     
-    def save_checkpoint(self, filename):
-        torch.save({'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict(),
-                   'scheduler': self.scheduler.state_dict(), 'train_losses': self.train_losses,
-                   'val_losses': self.val_losses, 'best_val_loss': self.best_val_loss,
-                   'patience_counter': self.patience_counter}, self.exp_dir / 'checkpoints' / filename)
+    # 파라미터 로드
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
     
-    def train(self):
-        print(f"\n{'='*80}")
-        print("Supervised NAFNet Training (NC → CE)")
-        print(f"  Method: Pseudo-paired Supervised Learning")
-        print(f"  Loss: L1 + SSIM({self.ssim_w})")
-        print(f"  Early Stopping: patience={self.patience}")
-        print(f"{'='*80}\n")
-        for epoch in range(self.args.epochs):
-            train_loss = self.train_epoch(epoch)
-            val_loss = self.validate(epoch)
-            self.scheduler.step()
-            lr = self.optimizer.param_groups[0]['lr']
-            print(f"\nEpoch {epoch+1}/{self.args.epochs}")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Val Loss:   {val_loss:.4f}")
-            print(f"  LR:         {lr:.2e}")
-            if self.patience_counter >= self.patience:
-                print(f"\n⚠️  Early stopping at epoch {epoch+1}")
-                break
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f'epoch_{epoch+1:03d}.pth')
-        print("\n✓ Training complete!")
+    print(f"{'='*80}\n")
+    
+    return model
+
+
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
+    """1 epoch 학습"""
+    model.train()
+    total_loss = 0
+    total_psnr = 0
+    
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    for nc, ce in pbar:
+        nc, ce = nc.to(device), ce.to(device)
+        
+        # Forward
+        output = model(nc)
+        loss = criterion(output, ce)
+        
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # Metrics
+        with torch.no_grad():
+            psnr = calculate_psnr(output, ce)
+        
+        total_loss += loss.item()
+        total_psnr += psnr.item()
+        
+        pbar.set_postfix({
+            'loss': f'{loss.item():.4f}',
+            'psnr': f'{psnr.item():.2f}'
+        })
+    
+    avg_loss = total_loss / len(dataloader)
+    avg_psnr = total_psnr / len(dataloader)
+    
+    return avg_loss, avg_psnr
+
+
+def validate(model, dataloader, criterion, device, epoch=None, sample_dir=None):
+    """Validation"""
+    model.eval()
+    total_loss = 0
+    total_psnr = 0
+    
+    # Save samples
+    save_samples = (epoch is not None and sample_dir is not None and epoch % 5 == 0)
+    saved_count = 0
+    max_samples = 3
+    
+    with torch.no_grad():
+        for batch_idx, (nc, ce) in enumerate(tqdm(dataloader, desc="Validating")):
+            nc, ce = nc.to(device), ce.to(device)
+            
+            output = model(nc)
+            loss = criterion(output, ce)
+            psnr = calculate_psnr(output, ce)
+            
+            total_loss += loss.item()
+            total_psnr += psnr.item()
+            
+            # Save sample images
+            if save_samples and saved_count < max_samples and batch_idx == 0:
+                for i in range(min(max_samples - saved_count, nc.size(0))):
+                    # Convert to numpy and save
+                    nc_img = nc[i].cpu().numpy()[0]  # Take first channel
+                    ce_img = ce[i].cpu().numpy()[0]
+                    out_img = output[i].cpu().numpy()[0]
+                    
+                    import matplotlib.pyplot as plt
+                    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                    
+                    axes[0].imshow(nc_img, cmap='gray', vmin=0, vmax=1)
+                    axes[0].set_title('Input (NC)', fontsize=12, fontweight='bold')
+                    axes[0].axis('off')
+                    
+                    axes[1].imshow(out_img, cmap='gray', vmin=0, vmax=1)
+                    axes[1].set_title('Output', fontsize=12, fontweight='bold')
+                    axes[1].axis('off')
+                    
+                    axes[2].imshow(ce_img, cmap='gray', vmin=0, vmax=1)
+                    axes[2].set_title('Target (CE)', fontsize=12, fontweight='bold')
+                    axes[2].axis('off')
+                    
+                    plt.tight_layout()
+                    save_path = sample_dir / f'best_epoch_{epoch:03d}.png'
+                    plt.savefig(save_path, dpi=100, bbox_inches='tight')
+                    plt.close()
+                    
+                    saved_count += 1
+                    if saved_count >= max_samples:
+                        break
+    
+    avg_loss = total_loss / len(dataloader)
+    avg_psnr = total_psnr / len(dataloader)
+    
+    return avg_loss, avg_psnr
+
+
+def train(args):
+    """메인 학습 함수"""
+    # Device 설정
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # 디렉토리 생성
+    output_dir = Path(args.output_dir)
+    exp_name = args.exp_name if args.exp_name else 'nafnet_nc2ce'
+    
+    # experiments 폴더 안에 저장
+    exp_dir = output_dir / 'experiments' / exp_name
+    checkpoint_dir = exp_dir / 'checkpoints'
+    log_dir = exp_dir / 'logs'
+    sample_dir = exp_dir / 'samples'
+    
+    # 기존 폴더가 있어도 덮어쓰기 (exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nExperiment directory: {exp_dir}")
+    print(f"  - Checkpoints: {checkpoint_dir}")
+    print(f"  - Logs: {log_dir}")
+    print(f"  - Samples: {sample_dir}")
+    
+    # TensorBoard
+    writer = SummaryWriter(log_dir)
+    
+    # 데이터셋 생성
+    print("\nLoading datasets...")
+    train_dataset = PseudoPairDataset(
+        args.train_csv,
+        patch_size=args.patch_size,
+        augment=True
+    )
+    
+    # Validation dataset (if provided)
+    val_dataloader = None
+    if args.val_csv:
+        val_dataset = PseudoPairDataset(
+            args.val_csv,
+            patch_size=args.patch_size,
+            augment=False
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+    
+    # 모델 생성
+    print("\nCreating model...")
+    model = NAFNet(
+        img_channel=3,
+        width=args.width,
+        middle_blk_num=args.middle_blk_num,
+        enc_blk_nums=args.enc_blk_nums,
+        dec_blk_nums=args.dec_blk_nums
+    ).to(device)
+    
+    # 사전학습 모델 로드
+    if args.pretrained:
+        model = load_pretrained_model(model, args.pretrained, device)
+    
+    # Loss & Optimizer
+    criterion = nn.L1Loss()
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    
+    # 학습 시작
+    print(f"\n{'='*80}")
+    print("Starting Training")
+    print(f"{'='*80}")
+    print(f"Train samples: {len(train_dataset)}")
+    if val_dataloader:
+        print(f"Val samples: {len(val_dataset)}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Learning rate: {args.lr}")
+    print(f"{'='*80}\n")
+    
+    best_psnr = 0
+    patience_counter = 0
+    
+    for epoch in range(1, args.epochs + 1):
+        start_time = time.time()
+        
+        # Train
+        train_loss, train_psnr = train_epoch(
+            model, train_dataloader, criterion, optimizer, device, epoch
+        )
+        
+        # Validate
+        if val_dataloader:
+            val_loss, val_psnr = validate(model, val_dataloader, criterion, device, epoch, sample_dir)
+        else:
+            val_loss, val_psnr = 0, 0
+        
+        # Scheduler step
+        scheduler.step()
+        
+        # Logging
+        epoch_time = time.time() - start_time
+        print(f"\nEpoch {epoch}/{args.epochs} - {epoch_time:.1f}s")
+        print(f"  Train - Loss: {train_loss:.4f}, PSNR: {train_psnr:.2f} dB")
+        if val_dataloader:
+            print(f"  Val   - Loss: {val_loss:.4f}, PSNR: {val_psnr:.2f} dB")
+        print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        
+        # TensorBoard
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('PSNR/train', train_psnr, epoch)
+        if val_dataloader:
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('PSNR/val', val_psnr, epoch)
+        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+        
+        # Save checkpoint
+        if epoch % args.save_freq == 0:
+            checkpoint_path = checkpoint_dir / f'model_epoch_{epoch}.pth'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_loss': train_loss,
+                'train_psnr': train_psnr,
+                'val_loss': val_loss,
+                'val_psnr': val_psnr,
+                'config': {
+                    'width': args.width,
+                    'middle_blk_num': args.middle_blk_num,
+                    'enc_blk_nums': args.enc_blk_nums,
+                    'dec_blk_nums': args.dec_blk_nums
+                }
+            }, checkpoint_path)
+            print(f"  Saved checkpoint: {checkpoint_path}")
+        
+        # Save best model (keep multiple checkpoints)
+        current_psnr = val_psnr if val_dataloader else train_psnr
+        if current_psnr > best_psnr:
+            best_psnr = current_psnr
+            # Save with epoch number to keep history
+            best_path = checkpoint_dir / f'best_model_epoch_{epoch}_psnr_{best_psnr:.2f}.pth'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_psnr': best_psnr,
+                'train_loss': train_loss,
+                'train_psnr': train_psnr,
+                'val_loss': val_loss,
+                'val_psnr': val_psnr,
+                'config': {
+                    'width': args.width,
+                    'middle_blk_num': args.middle_blk_num,
+                    'enc_blk_nums': args.enc_blk_nums,
+                    'dec_blk_nums': args.dec_blk_nums
+                }
+            }, best_path)
+            
+            # Also save as 'best_model.pth' for easy access (latest best)
+            latest_best = checkpoint_dir / 'best_model.pth'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'best_psnr': best_psnr,
+                'config': {
+                    'width': args.width,
+                    'middle_blk_num': args.middle_blk_num,
+                    'enc_blk_nums': args.enc_blk_nums,
+                    'dec_blk_nums': args.dec_blk_nums
+                }
+            }, latest_best)
+            
+            print(f"  ⭐ New best model! PSNR: {best_psnr:.2f} dB (Epoch {epoch})")
+            print(f"     Saved: {best_path.name}")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= args.patience:
+            print(f"\nEarly stopping triggered after {epoch} epochs")
+            break
+        
+        print()
+    
+    writer.close()
+    print(f"\n{'='*80}")
+    print("Training completed!")
+    print(f"Best PSNR: {best_psnr:.2f} dB")
+    print(f"Results saved to: {exp_dir}")
+    print(f"  - Best model: {checkpoint_dir / 'best_model.pth'}")
+    print(f"  - Checkpoints: {checkpoint_dir}")
+    print(f"  - Samples: {sample_dir}")
+    print(f"{'='*80}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--root', default=r'E:\LD-CT SR')
-    parser.add_argument('--pseudo-pairs-csv', default='Data/pseudo_pairs.csv')
-    parser.add_argument('--exp-dir', default='Outputs/experiments/nafnet_supervised')
-    parser.add_argument('--width', type=int, default=64)
-    parser.add_argument('--middle-blk-num', type=int, default=6)
-    parser.add_argument('--enc-blk-nums', type=int, nargs='+', default=[1,1,2,4])
-    parser.add_argument('--dec-blk-nums', type=int, nargs='+', default=[1,1,1,1])
-    parser.add_argument('--image-size', type=int, default=512)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--ssim-w', type=float, default=0.5)
-    parser.add_argument('--weight-decay', type=float, default=0.001)
-    parser.add_argument('--patience', type=int, default=15)
-    parser.add_argument('--num-workers', type=int, default=4)
+    parser = argparse.ArgumentParser(description='NAFNet Supervised Training with Pretrained Model')
+    
+    # Data
+    parser.add_argument('--train_csv', type=str, required=True,
+                       help='Path to training pseudo-pairs CSV')
+    parser.add_argument('--val_csv', type=str, default=None,
+                       help='Path to validation pseudo-pairs CSV (optional)')
+    parser.add_argument('--output_dir', type=str, default='Outputs',
+                       help='Output directory for experiments')
+    parser.add_argument('--exp_name', type=str, default='nafnet_nc2ce',
+                       help='Experiment name (creates subdirectory in output_dir)')
+    
+    # Pretrained model
+    parser.add_argument('--pretrained', type=str, default=None,
+                       help='Path to pretrained model (e.g., NAFSSR-B_4x.pth)')
+    
+    # Model architecture
+    parser.add_argument('--width', type=int, default=32,
+                       help='Base channel width')
+    parser.add_argument('--middle_blk_num', type=int, default=12,
+                       help='Number of middle blocks')
+    parser.add_argument('--enc_blk_nums', type=int, nargs='+', default=[2, 2, 4, 8],
+                       help='Number of encoder blocks per stage')
+    parser.add_argument('--dec_blk_nums', type=int, nargs='+', default=[2, 2, 2, 2],
+                       help='Number of decoder blocks per stage')
+    
+    # Training
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of training epochs')
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='Batch size')
+    parser.add_argument('--patch_size', type=int, default=256,
+                       help='Training patch size')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                       help='Learning rate')
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of data loading workers')
+    
+    # Checkpointing
+    parser.add_argument('--save_freq', type=int, default=10,
+                       help='Save checkpoint every N epochs')
+    parser.add_argument('--patience', type=int, default=15,
+                       help='Early stopping patience')
+    
+    # Device
+    parser.add_argument('--device', type=str, default='cuda',
+                       choices=['cuda', 'cpu'], help='Device to use')
+    
     args = parser.parse_args()
     
-    if torch.cuda.is_available():
-        print(f"\n{'='*80}")
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"{'='*80}\n")
-    
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-    
-    trainer = Trainer(args)
-    trainer.train()
+    train(args)
+
 
 if __name__ == '__main__':
     main()
