@@ -2,28 +2,48 @@ python _scripts/11_train_nafnet_supervised.py \
     --train_csv "E:\LD-CT SR\Data\noise2noise_pairs.csv" \
     --pretrained "E:\LD-CT SR\Weights\NAFNet-SIDD-width32.pth" \
     --output_dir "E:\LD-CT SR\Outputs" \
-    --exp_name nafnet_noise2noise \
-    --epochs 100 \
+    --exp_name nafnet_sharp_edges_v2 \
+    --epochs 50 \
     --batch_size 8 \
     --lr 1e-4 \
+    --mse_weight 0.3 \
+    --edge_weight 0.6 \
+    --tv_weight 0.1 \
+    --device cuda
+
+더 선명하게 (blur 적게): --mse_weight 0.3 --perceptual_weight 0.4 --edge_weight 0.3
+
+
+python _scripts/12_train_nafnet_inpainting.py \
+    --train_csv "E:\LD-CT SR\Data\noise2noise_pairs.csv" \
+    --pretrained "E:\LD-CT SR\Weights\NAFNet-SIDD-width32.pth" \
+    --output_dir "E:\LD-CT SR\Outputs" \
+    --exp_name nafnet_inpainting_sharp \
+    --epochs 50 \
+    --batch_size 8 \
+    --lr 1e-4 \
+    --mse_weight 0.3 \
+    --edge_weight 0.70 \
+    --use_inpainting \
+    --use_edge \
     --device cuda
 
 
 
-python _scripts/12_inference_nafnet.py \
+python _scripts/13_train_controlnet_nc2ce.py \
+    --root "E:\LD-CT SR" \
+    --pairs-csv Data/pairs.csv \
+    --exp-dir Outputs/experiments/controlnet_nc2ce \
+    --epochs 100 \
+    --batch-size 2 \
+    --lr 1e-5 \
+    --image-size 512 \
+    --device cuda
+
+
+python _scripts/14_inference_nafnet.py \
     --checkpoint "E:\LD-CT SR\Outputs\experiments\nafnet_noise2noise\checkpoints\best_model.pth" \
     --pairs_csv "E:\LD-CT SR\Data\pairs.csv" \
     --root_dir "E:\LD-CT SR" \
     --output_dir "Data/denoised_nc" \
-    --device cuda
-
-
-
-python _scripts/13_train_nc2ce_style.py \
-    --root "E:\LD-CT SR" \
-    --pairs-csv Data/pairs.csv \
-    --denoised-nc-dir Data/denoised_nc \
-    --exp-dir Outputs/experiments/sd_nc2ce_style \
-    --epochs 50 \
-    --batch-size 4 \
     --device cuda

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-NAFNet Progressive Training Script
-Stage 1: NAFSSR-B pretrained (detail enhancement)
-Stage 2: Noise2Noise fine-tuning with Perceptual Loss (light denoising + edge preservation)
+NAFNet Inpainting-based Training Script
+노이즈 감지 → 주변 픽셀로 채우기 (Blur 없는 Denoising)
+Edge 강화 (0.70) + Detail preservation
 """
 
 import torch
@@ -259,13 +259,42 @@ class NAFNet(nn.Module):
 
 class Noise2NoiseDataset(Dataset):
     """Noise2Noise CSV로부터 self-supervised denoising 데이터셋 생성"""
-    def __init__(self, csv_path, patch_size=256, augment=True):
+    def __init__(self, csv_path, patch_size=256, augment=True, use_inpainting=True):
         self.csv_path = Path(csv_path)
         self.pairs_df = pd.read_csv(csv_path)
         self.patch_size = patch_size
         self.augment = augment
+        self.use_inpainting = use_inpainting
         
         print(f"Loaded {len(self.pairs_df)} Noise2Noise pairs from {csv_path}")
+        if use_inpainting:
+            print("  Using inpainting-based noise removal (preserve details)")
+    
+    def detect_noise_pixels(self, slice_2d, threshold=0.15):
+        """노이즈 픽셀 감지 (이상치 검출)"""
+        # Median filter로 부드러운 버전 생성
+        from scipy.ndimage import median_filter
+        smoothed = median_filter(slice_2d, size=3)
+        
+        # 차이가 큰 픽셀 = 노이즈
+        diff = np.abs(slice_2d - smoothed)
+        noise_mask = diff > threshold
+        
+        return noise_mask
+    
+    def inpaint_noise(self, slice_2d, noise_mask):
+        """노이즈 부분을 주변 픽셀로 채우기"""
+        import cv2
+        
+        # OpenCV inpainting
+        img_uint8 = (slice_2d * 255).astype(np.uint8)
+        mask_uint8 = (noise_mask * 255).astype(np.uint8)
+        
+        # Telea algorithm (fast, detail-preserving)
+        inpainted = cv2.inpaint(img_uint8, mask_uint8, inpaintRadius=3, 
+                               flags=cv2.INPAINT_TELEA)
+        
+        return inpainted.astype(np.float32) / 255.0
     
     def __len__(self):
         return len(self.pairs_df)
@@ -287,6 +316,18 @@ class Noise2NoiseDataset(Dataset):
             from skimage.transform import resize
             slice2 = resize(slice2, slice1.shape, 
                           order=1, preserve_range=True, anti_aliasing=True)
+        
+        # Optional: Inpainting-based preprocessing
+        if self.use_inpainting:
+            # Detect and inpaint noise in slice1
+            noise_mask1 = self.detect_noise_pixels(slice1)
+            if noise_mask1.any():
+                slice1 = self.inpaint_noise(slice1, noise_mask1)
+            
+            # Detect and inpaint noise in slice2
+            noise_mask2 = self.detect_noise_pixels(slice2)
+            if noise_mask2.any():
+                slice2 = self.inpaint_noise(slice2, noise_mask2)
         
         # Random crop to patch_size
         H, W = slice1.shape
@@ -716,7 +757,8 @@ def train(args):
     train_dataset = Noise2NoiseDataset(
         args.train_csv,
         patch_size=args.patch_size,
-        augment=True
+        augment=True,
+        use_inpainting=args.use_inpainting
     )
     
     # Validation dataset (if provided)
@@ -725,7 +767,8 @@ def train(args):
         val_dataset = Noise2NoiseDataset(
             args.val_csv,
             patch_size=args.patch_size,
-            augment=False
+            augment=False,
+            use_inpainting=args.use_inpainting
         )
         val_dataloader = DataLoader(
             val_dataset,
@@ -780,7 +823,7 @@ def train(args):
     start_epoch, best_psnr = load_checkpoint_if_exists(checkpoint_dir, model, optimizer, scheduler)
     
     print(f"\n{'='*80}")
-    print("Progressive Training: NAFNet-SIDD + Enhanced Edge Preservation")
+    print("Inpainting-based Training: NAFNet-SIDD + Noise Inpainting + Sharp Edges")
     print(f"{'='*80}")
     print(f"Train samples: {len(train_dataset)}")
     if val_dataloader:
@@ -788,13 +831,15 @@ def train(args):
     print(f"Batch size: {args.batch_size}")
     print(f"Epochs: {args.epochs} (starting from epoch {start_epoch})")
     print(f"Learning rate: {args.lr}")
+    print(f"\nPreprocessing:")
+    print(f"  Inpainting: {args.use_inpainting} (노이즈 감지 → 주변 픽셀로 채우기)")
     print(f"\nLoss Configuration:")
     print(f"  MSE weight: {args.mse_weight} (기본 denoising)")
     if args.use_edge:
-        print(f"  Edge weight: {args.edge_weight} (경계 선명도 - Sobel+Laplacian)")
+        print(f"  Edge weight: {args.edge_weight} (경계 선명도 극대화 - Sobel+Laplacian)")
     if args.use_tv:
         print(f"  TV weight: {args.tv_weight} (Anti-blur, warmup: {args.tv_warmup} epochs)")
-    print(f"Strategy: Sharp denoising with edge preservation")
+    print(f"Strategy: Detail-preserving denoising with sharp edges")
     if start_epoch > 1:
         print(f"\n✓ Resuming from epoch {start_epoch}, Best PSNR: {best_psnr:.2f} dB")
     print(f"{'='*80}\n")
@@ -940,7 +985,7 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='NAFNet Progressive Training (NAFSSR-B + Noise2Noise + Perceptual Loss)')
+    parser = argparse.ArgumentParser(description='NAFNet Inpainting-based Training (Detail-preserving Denoising + Sharp Edges)')
     
     # Data
     parser.add_argument('--train_csv', type=str, required=True,
@@ -949,8 +994,12 @@ def main():
                        help='Path to validation Noise2Noise pairs CSV (optional)')
     parser.add_argument('--output_dir', type=str, default='Outputs',
                        help='Output directory for experiments')
-    parser.add_argument('--exp_name', type=str, default='nafnet_noise2noise',
+    parser.add_argument('--exp_name', type=str, default='nafnet_inpainting_sharp',
                        help='Experiment name (creates subdirectory in output_dir)')
+    
+    # Preprocessing
+    parser.add_argument('--use_inpainting', action='store_true', default=True,
+                       help='Use inpainting-based noise removal (detail-preserving)')
     
     # Pretrained model
     parser.add_argument('--pretrained', type=str, default=None,
