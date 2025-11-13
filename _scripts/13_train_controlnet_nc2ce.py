@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 NC to CE Style Transfer - Stable Diffusion + ControlNet + LoRA
-NC를 구조 가이드로 사용하여 CE 스타일 생성
-Imperfect pairing 문제 해결, End-to-End 학습
+Canny Edge를 구조 가이드로 사용하여 CE 스타일 생성
 """
 
 import warnings
@@ -22,6 +21,7 @@ from PIL import Image
 import SimpleITK as sitk
 from tqdm import tqdm
 import pandas as pd
+import cv2
 
 from diffusers import (
     AutoencoderKL,
@@ -33,6 +33,41 @@ from diffusers import (
 from diffusers.models.controlnet import ControlNetOutput
 from peft import LoraConfig, get_peft_model
 from transformers import CLIPTextModel, CLIPTokenizer
+
+
+# ============================================================
+# Canny Edge Extraction for ControlNet
+# ============================================================
+def get_canny_edge(image_batch):
+    """배치 이미지에서 Canny edge 추출
+    Args:
+        image_batch: [B, 3, H, W] tensor, range [-1, 1]
+    Returns:
+        edges: [B, 3, H, W] tensor, range [-1, 1]
+    """
+    batch_size = image_batch.shape[0]
+    edges_list = []
+    
+    for i in range(batch_size):
+        # [3, H, W] → [H, W]
+        img_np = image_batch[i, 0].cpu().numpy()
+        
+        # [-1, 1] → [0, 255]
+        img_np = ((img_np + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+        
+        # Canny edge detection
+        edges = cv2.Canny(img_np, threshold1=100, threshold2=200)
+        
+        # [0, 255] → [-1, 1]
+        edges = edges.astype(np.float32) / 127.5 - 1.0
+        
+        # [H, W] → [3, H, W]
+        edges_tensor = torch.from_numpy(edges).unsqueeze(0).repeat(3, 1, 1)
+        edges_list.append(edges_tensor)
+    
+    # List → [B, 3, H, W]
+    edges_batch = torch.stack(edges_list, dim=0)
+    return edges_batch.to(image_batch.device)
 
 
 # ============================================================
@@ -303,10 +338,8 @@ class ControlNetTrainer:
             target_images = batch['target_images'].to(self.device, dtype=torch.float32)
             prompts = batch['prompts']
             
-            # Encode control images (NC)
-            with torch.no_grad():
-                control_latents = self.vae.encode(control_images).latent_dist.sample()
-                control_latents = control_latents * self.vae.config.scaling_factor
+            # ✅ Canny Edge 추출 (NC 이미지 대신 사용)
+            control_edges = get_canny_edge(control_images)
             
             # Encode target images (CE)
             with torch.no_grad():
@@ -326,12 +359,13 @@ class ControlNetTrainer:
             
             noisy_latents = self.noise_scheduler.add_noise(target_latents, noise, timesteps)
             
-            # ControlNet forward - NC를 control로 사용
+            # ✅ ControlNet forward - Canny Edge를 control로 사용
             down_block_res_samples, mid_block_res_sample = self.controlnet(
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states=encoder_hidden_states,
-                controlnet_cond=control_latents,  # NC latent as control
+                controlnet_cond=control_edges,
+                conditioning_scale=1.0,
                 return_dict=False
             )
             
@@ -376,13 +410,17 @@ class ControlNetTrainer:
         total_loss = 0
         valid_batches = 0
         
+        # Keep track of last batch for sample generation
+        last_batch = None
+        last_control_images = None
+        
         for batch in tqdm(self.val_loader, desc="Validating"):
             control_images = batch['control_images'].to(self.device, dtype=torch.float32)
             target_images = batch['target_images'].to(self.device, dtype=torch.float32)
             prompts = batch['prompts']
             
-            control_latents = self.vae.encode(control_images).latent_dist.sample()
-            control_latents = control_latents * self.vae.config.scaling_factor
+            # ✅ Canny Edge 추출
+            control_edges = get_canny_edge(control_images)
             
             target_latents = self.vae.encode(target_images).latent_dist.sample()
             target_latents = target_latents * self.vae.config.scaling_factor
@@ -396,9 +434,12 @@ class ControlNetTrainer:
             ).long()
             noisy_latents = self.noise_scheduler.add_noise(target_latents, noise, timesteps)
             
+            # ✅ ControlNet with Canny Edge
             down_block_res_samples, mid_block_res_sample = self.controlnet(
                 noisy_latents, timesteps, encoder_hidden_states,
-                controlnet_cond=control_latents, return_dict=False
+                controlnet_cond=control_edges,
+                conditioning_scale=1.0,
+                return_dict=False
             )
             
             model_pred = self.unet(
@@ -412,6 +453,10 @@ class ControlNetTrainer:
             if not (torch.isnan(loss) or torch.isinf(loss)):
                 total_loss += loss.item()
                 valid_batches += 1
+            
+            # Keep last batch for sample generation
+            last_batch = batch
+            last_control_images = control_images
         
         avg_loss = total_loss / max(valid_batches, 1)
         self.val_losses.append(avg_loss)
@@ -422,26 +467,26 @@ class ControlNetTrainer:
             self.save_checkpoint('best')
             
             # Generate sample
-            self.generate_sample(epoch, batch)
+            if last_batch is not None and last_control_images is not None:
+                self.generate_sample(epoch, last_batch, last_control_images)
             
             print(f"✓ Best model saved (val_loss: {avg_loss:.4f})")
         
         return avg_loss
     
     @torch.no_grad()
-    def generate_sample(self, epoch, batch):
-        """샘플 생성 - NC control로 CE style 생성"""
+    def generate_sample(self, epoch, batch, control_images):
+        """샘플 생성 - Canny Edge control로 CE style 생성"""
         self.controlnet.eval()
         self.unet.eval()
         
         # 첫 번째 샘플만 사용
-        control_image = batch['control_images'][:1].to(self.device, dtype=torch.float32)
+        control_image = control_images[:1].to(self.device, dtype=torch.float32)
         target_image = batch['target_images'][:1].to(self.device, dtype=torch.float32)
         prompt = batch['prompts'][:1]
         
-        # Encode control
-        control_latents = self.vae.encode(control_image).latent_dist.sample()
-        control_latents = control_latents * self.vae.config.scaling_factor
+        # ✅ Canny Edge 추출
+        control_edge = get_canny_edge(control_image)
         
         # Text embedding
         encoder_hidden_states = self.encode_prompt(prompt)
@@ -460,10 +505,12 @@ class ControlNetTrainer:
         
         # Denoising loop
         for t in tqdm(ddim_scheduler.timesteps, desc="Generating", leave=False):
-            # ControlNet
+            # ✅ ControlNet with Canny Edge
             down_block_res_samples, mid_block_res_sample = self.controlnet(
                 latents, t, encoder_hidden_states,
-                controlnet_cond=control_latents, return_dict=False
+                controlnet_cond=control_edge,
+                conditioning_scale=1.0,
+                return_dict=False
             )
             
             # UNet prediction
@@ -484,24 +531,30 @@ class ControlNetTrainer:
         
         # Denormalize
         control_np = (control_image[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
+        control_edge_np = (control_edge[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
         generated_np = (generated_image[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
         target_np = (target_image[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
         
-        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        # ✅ 4개 이미지 표시
+        fig, axes = plt.subplots(1, 4, figsize=(24, 6))
         
         axes[0].imshow(control_np, cmap='gray', vmin=0, vmax=1)
-        axes[0].set_title('Input NC (Control)', fontsize=14, fontweight='bold')
+        axes[0].set_title('Input NC', fontsize=14, fontweight='bold')
         axes[0].axis('off')
         
-        axes[1].imshow(generated_np, cmap='gray', vmin=0, vmax=1)
-        axes[1].set_title('Generated CE-style', fontsize=14, fontweight='bold')
+        axes[1].imshow(control_edge_np, cmap='gray', vmin=0, vmax=1)
+        axes[1].set_title('Canny Edge (Control)', fontsize=14, fontweight='bold')
         axes[1].axis('off')
         
-        axes[2].imshow(target_np, cmap='gray', vmin=0, vmax=1)
-        axes[2].set_title('Target CE', fontsize=14, fontweight='bold')
+        axes[2].imshow(generated_np, cmap='gray', vmin=0, vmax=1)
+        axes[2].set_title('Generated CE-style', fontsize=14, fontweight='bold')
         axes[2].axis('off')
         
-        plt.suptitle(f'Best Model - Epoch {epoch+1}', fontsize=16, fontweight='bold')
+        axes[3].imshow(target_np, cmap='gray', vmin=0, vmax=1)
+        axes[3].set_title('Target CE', fontsize=14, fontweight='bold')
+        axes[3].axis('off')
+        
+        plt.suptitle(f'Best Model - Epoch {epoch+1} (Canny Edge Control)', fontsize=16, fontweight='bold')
         plt.tight_layout()
         
         save_path = self.exp_dir / 'samples' / f'best_epoch_{epoch+1:03d}.png'
@@ -530,7 +583,7 @@ class ControlNetTrainer:
     
     def train(self):
         print(f"\n{'='*80}")
-        print("NC to CE Style Transfer with ControlNet + LoRA")
+        print("NC to CE with ControlNet + LoRA (Canny Edge Control)")
         print(f"{'='*80}\n")
         
         for epoch in range(self.args.epochs):
@@ -555,11 +608,11 @@ class ControlNetTrainer:
 # Main
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description='NC to CE with ControlNet')
+    parser = argparse.ArgumentParser(description='NC to CE with ControlNet (Canny Edge)')
     
     parser.add_argument('--root', default=r'E:\LD-CT SR')
     parser.add_argument('--pairs-csv', default='Data/pairs.csv')
-    parser.add_argument('--exp-dir', default='Outputs/experiments/controlnet_nc2ce')
+    parser.add_argument('--exp-dir', default='Outputs/experiments/controlnet_canny')
     
     parser.add_argument('--lora-rank', type=int, default=8)
     parser.add_argument('--lora-alpha', type=int, default=16)
