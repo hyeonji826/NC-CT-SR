@@ -1,143 +1,61 @@
 #!/usr/bin/env python3
-"""
-Improved NAFNet Inpainting-based Training Script
-- ICNR init for sub-pixel convs + PixelShuffle -> conv smoothing
-- Option to use Upsample+Conv alternative
-- VGG perceptual with ImageNet normalization
-- Residual prediction preserved
-- High-frequency (HF) loss and SSIM toggle
-- Inpainting: optional feather blending for mask boundaries
-- Safer defaults for loss weights (L1-centric)
-"""
-import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from pathlib import Path
-from PIL import Image
 import argparse
 from tqdm import tqdm
 import pandas as pd
-import time
-import json
-from torch.utils.tensorboard import SummaryWriter
-import torchvision.models as models
-from piq import ssim as piq_ssim
-# Optional: try import for SSIM (if available). If not, fallback to simple SSIM implementation.
+import SimpleITK as sitk
+import cv2
+from scipy.ndimage import distance_transform_edt, binary_dilation
+import random
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim_metric
+from skimage.metrics import peak_signal_noise_ratio as psnr_metric
+
 try:
-    from piq import ssim as piq_ssim  # piq is optional; prefer if installed
-    HAS_PIQ = True
-except Exception:
-    HAS_PIQ = False
-
-# --------------------------- Utilities ---------------------------
-
-def icnr_init(tensor, upscale_factor=2, init=nn.init.kaiming_normal_):
-    """ICNR initialization for sub-pixel conv weights.
-    tensor: weight tensor of shape [out_ch, in_ch, k, k]
-    upscale_factor: pixelshuffle scale
-    """
-    with torch.no_grad():
-        out_ch, in_ch, k1, k2 = tensor.shape
-        new_out = out_ch // (upscale_factor ** 2)
-        if new_out <= 0:
-            init(tensor)
-            return
-        subkernel = torch.zeros((new_out, in_ch, k1, k2), dtype=tensor.dtype, device=tensor.device)
-        init(subkernel)
-        subkernel = subkernel.repeat(upscale_factor ** 2, 1, 1, 1)
-        tensor.copy_(subkernel)
+    from pytorch_msssim import ssim
+except ImportError:
+    ssim = None
 
 
-def gaussian_feather_mask(mask, radius=7):
-    """Feather mask edges with a Gaussian kernel (mask in [0,255] uint8).
-    Returns float mask in [0,1]."""
-    import cv2
-    if mask.dtype != np.uint8:
-        mask_uint8 = (mask * 255).astype(np.uint8)
-    else:
-        mask_uint8 = mask
-    ksize = max(3, int(radius) * 2 + 1)
-    blurred = cv2.GaussianBlur(mask_uint8, (ksize, ksize), sigmaX=radius)
-    return (blurred.astype(np.float32) / 255.0)
+class LayerNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, eps):
+        ctx.eps = eps
+        N, C, H, W = x.size()
+        mu = x.mean(1, keepdim=True)
+        var = (x - mu).pow(2).mean(1, keepdim=True)
+        y = (x - mu) / (var + eps).sqrt()
+        ctx.save_for_backward(y, var, weight)
+        y = weight.view(1, C, 1, 1) * y + bias.view(1, C, 1, 1)
+        return y
 
-# --------------------------- Losses ---------------------------
-
-class PerceptualLoss(nn.Module):
-    """VGG-based perceptual loss with ImageNet normalization for consistency.
-    For grayscale CT we repeat channels to 3 and normalize using ImageNet mean/std.
-    """
-    def __init__(self, device, use_gpu_norm=True):
-        super().__init__()
-        self.device = device
-        # Load pretrained VGG features (eval)
-        vgg = models.vgg16(pretrained=True).features.to(device).eval()
-        for p in vgg.parameters():
-            p.requires_grad = False
-        self.layers = nn.ModuleList([
-            vgg[:4].eval(),
-            vgg[:9].eval(),
-            vgg[:16].eval(),
-        ])
-        self.weights = [1.0, 0.75, 0.5]
-        # ImageNet stats
-        self.im_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
-        self.im_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
-
-    def forward(self, pred, target):
-        # pred/target: [B,3,H,W] in [0,1]
-        # Normalize using ImageNet mean/std
-        pred_n = (pred - self.im_mean) / self.im_std
-        target_n = (target - self.im_mean) / self.im_std
-        loss = 0.0
-        for layer, w in zip(self.layers, self.weights):
-            pred_feat = layer(pred_n)
-            target_feat = layer(target_n)
-            loss = loss + w * F.mse_loss(pred_feat, target_feat)
-        return loss
+    @staticmethod
+    def backward(ctx, grad_output):
+        eps = ctx.eps
+        N, C, H, W = grad_output.size()
+        y, var, weight = ctx.saved_tensors
+        g = grad_output * weight.view(1, C, 1, 1)
+        mean_g = g.mean(dim=1, keepdim=True)
+        mean_gy = (g * y).mean(dim=1, keepdim=True)
+        gx = 1. / torch.sqrt(var + eps) * (g - y * mean_gy - mean_g)
+        return gx, (grad_output * y).sum(dim=3).sum(dim=2).sum(dim=0), grad_output.sum(dim=3).sum(dim=2).sum(dim=0), None
 
 
-class EdgeLoss(nn.Module):
-    """Sobel + Laplacian edge loss. Works on single-channel.
-    """
-    def __init__(self):
-        super().__init__()
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1,1,3,3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0,0,0], [1,2,1]], dtype=torch.float32).view(1,1,3,3)
-        lap = torch.tensor([[0,1,0],[1,-4,1],[0,1,0]], dtype=torch.float32).view(1,1,3,3)
-        self.register_buffer('sobel_x', sobel_x)
-        self.register_buffer('sobel_y', sobel_y)
-        self.register_buffer('lap', lap)
+class LayerNorm2d(nn.Module):
+    def __init__(self, channels, eps=1e-6):
+        super(LayerNorm2d, self).__init__()
+        self.register_parameter('weight', nn.Parameter(torch.ones(channels)))
+        self.register_parameter('bias', nn.Parameter(torch.zeros(channels)))
+        self.eps = eps
 
-    def forward(self, pred, target):
-        # pred/target: [B,3,H,W] -> take first channel
-        pred_g = pred[:, :1, :, :]
-        target_g = target[:, :1, :, :]
-        sx = F.conv2d(pred_g, self.sobel_x, padding=1)
-        sy = F.conv2d(pred_g, self.sobel_y, padding=1)
-        pred_s = torch.sqrt(sx**2 + sy**2 + 1e-6)
-        tx = F.conv2d(target_g, self.sobel_x, padding=1)
-        ty = F.conv2d(target_g, self.sobel_y, padding=1)
-        tgt_s = torch.sqrt(tx**2 + ty**2 + 1e-6)
-        pred_l = torch.abs(F.conv2d(pred_g, self.lap, padding=1))
-        tgt_l = torch.abs(F.conv2d(target_g, self.lap, padding=1))
-        loss_s = F.l1_loss(pred_s, tgt_s)
-        loss_l = F.l1_loss(pred_l, tgt_l)
-        return 0.7 * loss_s + 0.3 * loss_l
+    def forward(self, x):
+        return LayerNormFunction.apply(x, self.weight, self.bias, self.eps)
 
-
-def hf_loss(pred, target, kernel_size=9, sigma=3.0):
-    """High-frequency loss computed as L1 between (img - blurred(img))."""
-    pred_blur = F.gaussian_blur(pred, kernel_size=(kernel_size, kernel_size), sigma=(sigma, sigma))
-    tgt_blur = F.gaussian_blur(target, kernel_size=(kernel_size, kernel_size), sigma=(sigma, sigma))
-    pred_h = pred - pred_blur
-    tgt_h = target - tgt_blur
-    return F.l1_loss(pred_h, tgt_h)
-
-# --------------------------- NAFNet blocks (unchanged but minor fixes) ---------------------------
 
 class SimpleGate(nn.Module):
     def forward(self, x):
@@ -145,38 +63,32 @@ class SimpleGate(nn.Module):
         return x1 * x2
 
 
-class LayerNorm2d(nn.Module):
-    def __init__(self, channels, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(channels))
-        self.bias = nn.Parameter(torch.zeros(channels))
-        self.eps = eps
-
-    def forward(self, x):
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        return self.weight[:, None, None] * x + self.bias[:, None, None]
-
-
 class NAFBlock(nn.Module):
     def __init__(self, c, DW_Expand=2, FFN_Expand=2, drop_out_rate=0.):
         super().__init__()
         dw_channel = c * DW_Expand
-        self.conv1 = nn.Conv2d(c, dw_channel, 1, 1, 0, bias=True)
-        self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, 1, 1, groups=dw_channel, bias=True)
-        self.conv3 = nn.Conv2d(dw_channel // 2, c, 1, 1, 0, bias=True)
-        self.sca = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dw_channel // 2, dw_channel // 2, 1,1,0,bias=True))
+        self.conv1 = nn.Conv2d(in_channels=c, out_channels=dw_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv2 = nn.Conv2d(in_channels=dw_channel, out_channels=dw_channel, kernel_size=3, padding=1, stride=1, groups=dw_channel, bias=True)
+        self.conv3 = nn.Conv2d(in_channels=dw_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        
+        self.sca = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels=dw_channel // 2, out_channels=dw_channel // 2, kernel_size=1, padding=0, stride=1, groups=1, bias=True),
+        )
+        
         self.sg = SimpleGate()
         ffn_channel = FFN_Expand * c
-        self.conv4 = nn.Conv2d(c, ffn_channel, 1,1,0,bias=True)
-        self.conv5 = nn.Conv2d(ffn_channel // 2, c,1,1,0,bias=True)
+        self.conv4 = nn.Conv2d(in_channels=c, out_channels=ffn_channel, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        self.conv5 = nn.Conv2d(in_channels=ffn_channel // 2, out_channels=c, kernel_size=1, padding=0, stride=1, groups=1, bias=True)
+        
         self.norm1 = LayerNorm2d(c)
         self.norm2 = LayerNorm2d(c)
-        self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate>0 else nn.Identity()
-        self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate>0 else nn.Identity()
-        self.beta = nn.Parameter(torch.zeros((1,c,1,1)), requires_grad=True)
-        self.gamma = nn.Parameter(torch.zeros((1,c,1,1)), requires_grad=True)
+        
+        self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+        self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
+        
+        self.beta = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
+        self.gamma = nn.Parameter(torch.zeros((1, c, 1, 1)), requires_grad=True)
 
     def forward(self, inp):
         x = inp
@@ -188,8 +100,8 @@ class NAFBlock(nn.Module):
         x = self.conv3(x)
         x = self.dropout1(x)
         y = inp + x * self.beta
-        x = self.norm2(y)
-        x = self.conv4(x)
+        
+        x = self.conv4(self.norm2(y))
         x = self.sg(x)
         x = self.conv5(x)
         x = self.dropout2(x)
@@ -197,387 +109,424 @@ class NAFBlock(nn.Module):
 
 
 class NAFNet(nn.Module):
-    def __init__(self, img_channel=3, width=32, middle_blk_num=12,
-                 enc_blk_nums=[2,2,4,8], dec_blk_nums=[2,2,2,2],
-                 use_pixelshuffle=True, upsample_mode='pixelshuffle'):
+    def __init__(self, img_channel=1, width=32, middle_blk_num=12, enc_blk_nums=[2,2,4,8], dec_blk_nums=[2,2,2,2]):
         super().__init__()
-        self.intro = nn.Conv2d(img_channel, width, 3,1,1,bias=True)
-        self.ending = nn.Conv2d(width, img_channel, 3,1,1,bias=True)
+        self.intro = nn.Conv2d(in_channels=img_channel, out_channels=width, kernel_size=3, padding=1, stride=1, groups=1, bias=True)
+        self.ending = nn.Conv2d(in_channels=width, out_channels=img_channel, kernel_size=3, padding=1, stride=1, groups=1, bias=True)
+        
         self.encoders = nn.ModuleList()
         self.decoders = nn.ModuleList()
         self.middle_blks = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
+        
         chan = width
         for num in enc_blk_nums:
             self.encoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
-            self.downs.append(nn.Conv2d(chan, 2*chan, 2,2))
+            self.downs.append(nn.Conv2d(chan, 2*chan, 2, 2))
             chan = chan * 2
+        
         self.middle_blks = nn.Sequential(*[NAFBlock(chan) for _ in range(middle_blk_num)])
-        # Upsampling: either PixelShuffle + conv smoothing or Upsample+Conv
-        self.use_pixelshuffle = use_pixelshuffle
+        
         for num in dec_blk_nums:
-            if self.use_pixelshuffle and upsample_mode == 'pixelshuffle':
-                conv = nn.Conv2d(chan, chan * 4, 3,1,1, bias=True)
-                icnr_init(conv.weight, upscale_factor=2)
-                up = nn.Sequential(conv, nn.PixelShuffle(2), nn.Conv2d(chan, chan//2, 3,1,1), nn.ReLU(inplace=True))
-                chan = chan // 2
-                self.ups.append(up)
-                self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
-            else:
-                up = nn.Sequential(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                                   nn.Conv2d(chan, chan//2, 3,1,1), nn.ReLU(inplace=True))
-                chan = chan // 2
-                self.ups.append(up)
-                self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
+            self.ups.append(nn.Sequential(
+                nn.Conv2d(chan, chan * 2, 1, bias=False),
+                nn.PixelShuffle(2)
+            ))
+            chan = chan // 2
+            self.decoders.append(nn.Sequential(*[NAFBlock(chan) for _ in range(num)]))
+        
         self.padder_size = 2 ** len(self.encoders)
 
     def forward(self, inp):
-        B,C,H,W = inp.shape
-        x = self.check_image_size(inp)
-        x = self.intro(x)
+        B, C, H, W = inp.shape
+        inp = self.check_image_size(inp)
+        
+        x = self.intro(inp)
         encs = []
+        
         for encoder, down in zip(self.encoders, self.downs):
             x = encoder(x)
             encs.append(x)
             x = down(x)
+        
         x = self.middle_blks(x)
+        
         for decoder, up, enc_skip in zip(self.decoders, self.ups, encs[::-1]):
             x = up(x)
             x = x + enc_skip
             x = decoder(x)
+        
         x = self.ending(x)
-        x = x + inp  # residual
+        x = x + inp
+        
         return x[:, :, :H, :W]
 
     def check_image_size(self, x):
-        _,_,h,w = x.size()
+        _, _, h, w = x.size()
         mod_pad_h = (self.padder_size - h % self.padder_size) % self.padder_size
         mod_pad_w = (self.padder_size - w % self.padder_size) % self.padder_size
-        x = torch.nn.functional.pad(x, (0, mod_pad_w, 0, mod_pad_h))
+        x = F.pad(x, (0, mod_pad_w, 0, mod_pad_h))
         return x
 
-# --------------------------- Dataset ---------------------------
+
+def create_soft_mask(binary_mask, feather_radius=5):
+    dist = distance_transform_edt(~binary_mask)
+    soft_mask = np.clip(dist / feather_radius, 0, 1)
+    return soft_mask
+
+
+def detect_noise_pixels(img, threshold=0.98, kernel_size=5):
+    img_uint8 = (img * 255).astype(np.uint8)
+    high_threshold = int(threshold * 255)
+    noise_mask = img_uint8 >= high_threshold
+    
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    noise_mask = cv2.morphologyEx(noise_mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel).astype(bool)
+    
+    return noise_mask
+
+
+def soft_inpaint(img, mask, feather_radius=5):
+    dilated_mask = binary_dilation(mask, iterations=2)
+    img_uint8 = (img * 255).astype(np.uint8)
+    mask_uint8 = dilated_mask.astype(np.uint8) * 255
+    inpainted_uint8 = cv2.inpaint(img_uint8, mask_uint8, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    inpainted = inpainted_uint8.astype(np.float32) / 255.0
+    
+    soft_mask = create_soft_mask(mask, feather_radius)
+    blended = img * (1 - soft_mask) + inpainted * soft_mask
+    
+    return blended, soft_mask
+
+
+class CombinedLoss(nn.Module):
+    def __init__(self, l1_weight=0.7, ssim_weight=0.15, edge_weight=0.15):
+        super().__init__()
+        self.l1_weight = l1_weight
+        self.ssim_weight = ssim_weight
+        self.edge_weight = edge_weight
+        
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
+
+    def edge_loss(self, pred, target):
+        pred_edge_x = F.conv2d(pred, self.sobel_x, padding=1)
+        pred_edge_y = F.conv2d(pred, self.sobel_y, padding=1)
+        target_edge_x = F.conv2d(target, self.sobel_x, padding=1)
+        target_edge_y = F.conv2d(target, self.sobel_y, padding=1)
+        
+        pred_edge = torch.sqrt(pred_edge_x**2 + pred_edge_y**2 + 1e-8)
+        target_edge = torch.sqrt(target_edge_x**2 + target_edge_y**2 + 1e-8)
+        
+        return F.l1_loss(pred_edge, target_edge)
+
+    def forward(self, pred, target):
+        loss_l1 = F.l1_loss(pred, target)
+        
+        if ssim is not None:
+            loss_ssim = 1 - ssim(pred, target, data_range=1.0, size_average=True)
+        else:
+            loss_ssim = torch.tensor(0.0, device=pred.device)
+        
+        loss_edge = self.edge_loss(pred, target)
+        
+        total_loss = (self.l1_weight * loss_l1 + 
+                      self.ssim_weight * loss_ssim + 
+                      self.edge_weight * loss_edge)
+        
+        return total_loss, {
+            'l1': loss_l1.item(),
+            'ssim': loss_ssim.item(),
+            'edge': loss_edge.item(),
+            'total': total_loss.item()
+        }
+
 
 class Noise2NoiseDataset(Dataset):
-    def __init__(self, csv_path, patch_size=256, augment=True, use_inpainting=True, feather_radius=7):
-        self.csv_path = Path(csv_path)
-        self.pairs_df = pd.read_csv(csv_path)
-        self.patch_size = patch_size
+    def __init__(self, csv_path, image_size=512, augment=True, use_soft_inpainting=True, feather_radius=5):
+        self.pairs = pd.read_csv(csv_path)
+        self.image_size = image_size
         self.augment = augment
-        self.use_inpainting = use_inpainting
+        self.use_soft_inpainting = use_soft_inpainting
         self.feather_radius = feather_radius
-        print(f"Loaded {len(self.pairs_df)} Noise2Noise pairs from {csv_path}")
-
-    def detect_noise_pixels(self, slice_2d, threshold=0.15):
-        from scipy.ndimage import median_filter
-        smoothed = median_filter(slice_2d, size=3)
-        diff = np.abs(slice_2d - smoothed)
-        noise_mask = diff > threshold
-        return noise_mask
-
-    def inpaint_noise(self, slice_2d, noise_mask):
-        import cv2
-        img_uint8 = np.clip(slice_2d * 255.0, 0, 255).astype(np.uint8)
-        mask_uint8 = (noise_mask * 255).astype(np.uint8)
-        inpainted = cv2.inpaint(img_uint8, mask_uint8, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-        return inpainted.astype(np.float32) / 255.0, mask_uint8
-
+        
     def __len__(self):
-        return len(self.pairs_df)
-
+        return len(self.pairs)
+    
+    def load_slice(self, nifti_path, slice_idx):
+        img = sitk.ReadImage(str(nifti_path))
+        arr = sitk.GetArrayFromImage(img)[slice_idx]
+        arr = np.clip((arr + 1000) / 2000, 0, 1)
+        return arr
+    
+    def augment_pair(self, img1, img2):
+        if not self.augment:
+            return img1, img2
+        
+        if random.random() > 0.5:
+            img1 = np.fliplr(img1)
+            img2 = np.fliplr(img2)
+        
+        if random.random() > 0.5:
+            img1 = np.flipud(img1)
+            img2 = np.flipud(img2)
+        
+        k = random.randint(0, 3)
+        if k > 0:
+            img1 = np.rot90(img1, k)
+            img2 = np.rot90(img2, k)
+        
+        if random.random() > 0.5:
+            scale = random.uniform(0.95, 1.05)
+            shift = random.uniform(-0.02, 0.02)
+            img1 = np.clip(img1 * scale + shift, 0, 1)
+            img2 = np.clip(img2 * scale + shift, 0, 1)
+        
+        return img1, img2
+    
     def __getitem__(self, idx):
-        row = self.pairs_df.iloc[idx]
-        import SimpleITK as sitk
-        nc_img = sitk.ReadImage(row['nc_path'])
-        nc_arr = sitk.GetArrayFromImage(nc_img).astype(np.float32)
-        slice1 = nc_arr[int(row['slice1_idx'])]
-        slice2 = nc_arr[int(row['slice2_idx'])]
-        if slice2.shape != slice1.shape:
-            from skimage.transform import resize
-            slice2 = resize(slice2, slice1.shape, order=1, preserve_range=True, anti_aliasing=True)
-        if self.use_inpainting:
-            noise_mask1 = self.detect_noise_pixels(slice1)
-            if noise_mask1.any():
-                slice1_ip, mask1 = self.inpaint_noise(slice1, noise_mask1)
-                m1 = gaussian_feather_mask(mask1, radius=self.feather_radius)
-                slice1 = slice1_ip * m1 + slice1 * (1 - m1)
-            noise_mask2 = self.detect_noise_pixels(slice2)
-            if noise_mask2.any():
-                slice2_ip, mask2 = self.inpaint_noise(slice2, noise_mask2)
-                m2 = gaussian_feather_mask(mask2, radius=self.feather_radius)
-                slice2 = slice2_ip * m2 + slice2 * (1 - m2)
-        H,W = slice1.shape
-        if H > self.patch_size and W > self.patch_size:
-            top = np.random.randint(0, H - self.patch_size)
-            left = np.random.randint(0, W - self.patch_size)
-            slice1 = slice1[top:top+self.patch_size, left:left+self.patch_size]
-            slice2 = slice2[top:top+self.patch_size, left:left+self.patch_size]
-        if self.augment:
-            if np.random.rand() > 0.5:
-                slice1 = np.fliplr(slice1); slice2 = np.fliplr(slice2)
-            if np.random.rand() > 0.5:
-                slice1 = np.flipud(slice1); slice2 = np.flipud(slice2)
-            k = np.random.randint(0,4)
-            slice1 = np.rot90(slice1, k); slice2 = np.rot90(slice2, k)
-            # small subpixel jitter
-            if np.random.rand() < 0.5:
-                from scipy.ndimage import shift
-                sx, sy = (np.random.uniform(-1,1), np.random.uniform(-1,1))
-                slice1 = shift(slice1, shift=(sx, sy), mode='reflect')
-                slice2 = shift(slice2, shift=(sx, sy), mode='reflect')
-        slice1 = np.clip(slice1, 0, 1)
-        slice2 = np.clip(slice2, 0, 1)
-        t1 = torch.from_numpy(slice1.copy()).unsqueeze(0).float()
-        t2 = torch.from_numpy(slice2.copy()).unsqueeze(0).float()
-        t1 = t1.repeat(3,1,1); t2 = t2.repeat(3,1,1)
-        return t1, t2
-
-# --------------------------- Metrics & utils ---------------------------
-
-def calculate_psnr(img1, img2):
-    mse = torch.mean((img1 - img2) ** 2)
-    if mse == 0:
-        return torch.tensor(100.0)
-    return 20 * torch.log10(1.0 / torch.sqrt(mse))
-
-# --------------------------- Checkpoint helper (non-interactive) ---------------------------
-
-def load_checkpoint_if_exists(checkpoint_dir, model, optimizer=None, scheduler=None, resume=False):
-    best_checkpoint = checkpoint_dir / 'best_model.pth'
-    if best_checkpoint.exists() and resume:
-        checkpoint = torch.load(best_checkpoint, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0) + 1
-        best_psnr = checkpoint.get('best_psnr', 0)
-        print(f"Resumed from {best_checkpoint} epoch {start_epoch-1}")
-        return start_epoch, best_psnr
-    return 1, 0
-
-# --------------------------- Training / Validation ---------------------------
-
-def train_epoch(model, dataloader, criterion_dict, optimizer, device, epoch, args):
-    model.train()
-    totals = {k:0.0 for k in ['loss','mse','edge','hf','percept','psnr']}
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for noisy1, noisy2 in pbar:
-        noisy1 = noisy1.to(device); noisy2 = noisy2.to(device)
-        denoised = model(noisy1)
-        loss_mse = criterion_dict['mse'](denoised, noisy2)
-        loss_edge = criterion_dict['edge'](denoised, noisy2) if 'edge' in criterion_dict else torch.tensor(0.0, device=device)
-        loss_hf = hf_loss(denoised, noisy2) if args.use_hf else torch.tensor(0.0, device=device)
-        loss_perc = criterion_dict['perc'](denoised, noisy2) if 'perc' in criterion_dict else torch.tensor(0.0, device=device)
-        loss = args.mse_weight * loss_mse + args.edge_weight * loss_edge + args.hf_weight * loss_hf + args.perc_weight * loss_perc
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        psnr = calculate_psnr(denoised, noisy2)
-        totals['loss'] += loss.item(); totals['mse'] += loss_mse.item(); totals['edge'] += (loss_edge.item() if isinstance(loss_edge, torch.Tensor) else 0)
-        totals['hf'] += (loss_hf.item() if isinstance(loss_hf, torch.Tensor) else 0); totals['percept'] += (loss_perc.item() if isinstance(loss_perc, torch.Tensor) else 0)
-        totals['psnr'] += psnr.item()
-        pbar.set_postfix({'loss':f"{loss.item():.4f}", 'psnr':f"{psnr.item():.2f}"})
-    n = len(dataloader)
-    return totals['loss']/n, totals['mse']/n, totals['edge']/n, totals['psnr']/n
-
-def validate(model, dataloader, criterion_dict, device, args, epoch=None, sample_dir=None):
-    model.eval()
-    total_loss = 0.0; total_psnr = 0.0
-    save_samples = (epoch is not None and sample_dir is not None and epoch % 5 == 0)
-    saved_count = 0; max_samples = 3
-    with torch.no_grad():
-        for batch_idx, (noisy1, noisy2) in enumerate(tqdm(dataloader, desc='Validating')):
-            noisy1 = noisy1.to(device); noisy2 = noisy2.to(device)
-            denoised = model(noisy1)
-            loss = criterion_dict['mse'](denoised, noisy2)
-            if 'edge' in criterion_dict:
-                loss = loss + args.edge_weight * criterion_dict['edge'](denoised, noisy2)
-            if 'perc' in criterion_dict:
-                loss = loss + args.perc_weight * criterion_dict['perc'](denoised, noisy2)
-            psnr = calculate_psnr(denoised, noisy2)
-            total_loss += loss.item(); total_psnr += psnr.item()
-            if save_samples and saved_count < max_samples and batch_idx == 0:
-                import matplotlib.pyplot as plt
-                for i in range(min(max_samples - saved_count, noisy1.size(0))):
-                    noisy1_img = noisy1[i].cpu().numpy()[0]
-                    noisy2_img = noisy2[i].cpu().numpy()[0]
-                    denoised_img = denoised[i].cpu().numpy()[0]
-                    fig, axes = plt.subplots(1,3,figsize=(12,4))
-                    axes[0].imshow(noisy1_img, cmap='gray'); axes[0].axis('off'); axes[0].set_title('Noisy1')
-                    axes[1].imshow(denoised_img, cmap='gray'); axes[1].axis('off'); axes[1].set_title('Denoised')
-                    axes[2].imshow(noisy2_img, cmap='gray'); axes[2].axis('off'); axes[2].set_title('Target')
-                    plt.tight_layout(); save_path = sample_dir / f'val_epoch_{epoch}_sample_{i}.png'; plt.savefig(save_path, dpi=120); plt.close()
-                    saved_count += 1
-                    if saved_count >= max_samples: break
-    n = len(dataloader)
-    return total_loss / n, total_psnr / n
+        row = self.pairs.iloc[idx]
+        
+        img1 = self.load_slice(row['nc_path'], row['slice1_idx'])
+        img2 = self.load_slice(row['nc_path'], row['slice2_idx'])
+        
+        img1, img2 = self.augment_pair(img1, img2)
+        
+        img1 = cv2.resize(img1, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        img2 = cv2.resize(img2, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        
+        if self.use_soft_inpainting:
+            noise_mask1 = detect_noise_pixels(img1)
+            noise_mask2 = detect_noise_pixels(img2)
+            
+            if noise_mask1.sum() > 0:
+                img1, _ = soft_inpaint(img1, noise_mask1, self.feather_radius)
+            
+            if noise_mask2.sum() > 0:
+                img2, _ = soft_inpaint(img2, noise_mask2, self.feather_radius)
+        
+        img1 = torch.from_numpy(img1).float().unsqueeze(0)
+        img2 = torch.from_numpy(img2).float().unsqueeze(0)
+        
+        return {'noisy1': img1, 'noisy2': img2}
 
 
-# -------------------------------------------------------------------
-# pretrained model loader
-# -------------------------------------------------------------------
-def load_pretrained_model(model, pretrained_path, device):
-    """Load pretrained weights into model (if available)."""
-    import torch
+class NAFNetTrainer:
+    def __init__(self, args):
+        self.args = args
+        self.device = torch.device(args.device)
+        
+        self.exp_dir = Path(args.exp_dir)
+        self.ckpt_dir = self.exp_dir / 'ckpt'
+        self.samples_dir = self.exp_dir / 'samples'
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.samples_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.model = NAFNet(img_channel=1, width=args.width).to(self.device)
+        
+        if args.pretrained and Path(args.pretrained).exists():
+            state = torch.load(args.pretrained, map_location=self.device, weights_only=False)
+            if 'params' in state:
+                pretrained_dict = state['params']
+                model_dict = self.model.state_dict()
+                
+                # 채널 수가 다른 레이어는 제외
+                filtered_dict = {}
+                for k, v in pretrained_dict.items():
+                    if k in model_dict:
+                        if v.shape == model_dict[k].shape:
+                            filtered_dict[k] = v
+                        else:
+                            print(f"Skipping {k}: shape mismatch {v.shape} vs {model_dict[k].shape}")
+                
+                self.model.load_state_dict(filtered_dict, strict=False)
+                print(f"Loaded {len(filtered_dict)}/{len(model_dict)} layers from pretrained")
+        
+        self.criterion = CombinedLoss(
+            l1_weight=args.l1_weight,
+            ssim_weight=args.ssim_weight,
+            edge_weight=args.edge_weight
+        ).to(self.device)
+        
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=args.lr,
+            weight_decay=1e-4
+        )
+        
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=args.epochs,
+            eta_min=1e-6
+        )
+        
+        self.train_dataset = Noise2NoiseDataset(
+            csv_path=args.train_csv,
+            image_size=args.image_size,
+            augment=True,
+            use_soft_inpainting=args.use_soft_inpainting,
+            feather_radius=args.feather_radius
+        )
+        
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
+        self.start_epoch = 0
+        self.best_loss = float('inf')
+        self.train_losses = []
+        
+        if args.resume:
+            self.load_checkpoint(args.resume)
+    
+    def load_checkpoint(self, ckpt_path):
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            return
+        
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.best_loss = checkpoint['best_loss']
+        self.train_losses = checkpoint.get('train_losses', [])
+    
+    def train_epoch(self, epoch):
+        self.model.train()
+        epoch_losses = []
+        
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
+        for batch in pbar:
+            noisy1 = batch['noisy1'].to(self.device)
+            noisy2 = batch['noisy2'].to(self.device)
+            
+            pred = self.model(noisy1)
+            loss, loss_dict = self.criterion(pred, noisy2)
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            epoch_losses.append(loss.item())
+            pbar.set_postfix(loss=loss.item())
+        
+        avg_loss = np.mean(epoch_losses)
+        self.train_losses.append(avg_loss)
+        self.scheduler.step()
+        
+        return avg_loss
+    
+    @torch.no_grad()
+    def save_samples(self, epoch):
+        self.model.eval()
+        batch = next(iter(self.train_loader))
+        noisy1 = batch['noisy1'][:4].to(self.device)
+        noisy2 = batch['noisy2'][:4].to(self.device)
+        
+        pred = self.model(noisy1)
+        
+        psnr_vals = []
+        ssim_vals = []
+        for i in range(min(4, noisy1.shape[0])):
+            pred_np = pred[i, 0].cpu().numpy()
+            target_np = noisy2[i, 0].cpu().numpy()
+            psnr_vals.append(psnr_metric(target_np, pred_np, data_range=1.0))
+            ssim_vals.append(ssim_metric(target_np, pred_np, data_range=1.0))
+        
+        avg_psnr = np.mean(psnr_vals)
+        avg_ssim = np.mean(ssim_vals)
+        
+        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+        fig.suptitle(f'Epoch {epoch+1} | PSNR: {avg_psnr:.2f} | SSIM: {avg_ssim:.4f}', fontsize=14)
+        
+        for i in range(4):
+            axes[0, i].imshow(noisy1[i, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[0, i].set_title(f'Input')
+            axes[0, i].axis('off')
+            
+            axes[1, i].imshow(pred[i, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[1, i].set_title(f'Output (PSNR: {psnr_vals[i]:.2f})')
+            axes[1, i].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(self.samples_dir / f'epoch_{epoch+1:03d}.png', dpi=100, bbox_inches='tight')
+        plt.close()
+    
+    def save_checkpoint(self, epoch, is_best=False):
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_loss': self.best_loss,
+            'train_losses': self.train_losses,
+        }
+        
+        torch.save(checkpoint, self.ckpt_dir / f'epoch_{epoch+1:03d}.pth')
+        
+        if is_best:
+            torch.save(checkpoint, self.ckpt_dir / 'best.pth')
+    
+    def train(self):
+        for epoch in range(self.start_epoch, self.args.epochs):
+            avg_loss = self.train_epoch(epoch)
+            
+            if (epoch + 1) % self.args.sample_interval == 0:
+                self.save_samples(epoch)
+            
+            is_best = avg_loss < self.best_loss
+            if is_best:
+                self.best_loss = avg_loss
+            
+            if (epoch + 1) % self.args.save_interval == 0 or is_best:
+                self.save_checkpoint(epoch, is_best)
 
-    if pretrained_path is None or not os.path.exists(pretrained_path):
-        print("[WARN] No pretrained weights found, training from scratch.")
-        return model
-
-    print(f"[INFO] Loading pretrained weights from: {pretrained_path}")
-    checkpoint = torch.load(pretrained_path, map_location=device)
-
-    # SwinIR/NAFNet 체크포인트 호환
-    if "params" in checkpoint:
-        state_dict = checkpoint["params"]
-    elif "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-
-    # key mismatch 자동 보정
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        new_k = k.replace("module.", "")  # DDP 제거
-        new_state_dict[new_k] = v
-
-    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
-    if missing:
-        print(f"[WARN] Missing keys ({len(missing)}): {missing[:5]}...")
-    if unexpected:
-        print(f"[WARN] Unexpected keys ({len(unexpected)}): {unexpected[:5]}...")
-
-    print("[INFO] Pretrained weights loaded successfully.")
-    return model
-
-
-# --------------------------- Main train function ---------------------------
-
-def train(args):
-    device = torch.device(args.device if torch.cuda.is_available() and args.device=='cuda' else 'cpu')
-    print(f"Using device: {device}")
-    output_dir = Path(args.output_dir)
-    exp_dir = output_dir / 'experiments' / args.exp_name
-    checkpoint_dir = exp_dir / 'checkpoints'
-    log_dir = exp_dir / 'logs'
-    sample_dir = exp_dir / 'samples'
-    checkpoint_dir.mkdir(parents=True, exist_ok=True); log_dir.mkdir(parents=True, exist_ok=True); sample_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir)
-
-    print("\nLoading datasets...")
-    train_dataset = Noise2NoiseDataset(args.train_csv, patch_size=args.patch_size, augment=True, use_inpainting=args.use_inpainting, feather_radius=args.feather_radius)
-    val_dataloader = None
-    if args.val_csv:
-        val_dataset = Noise2NoiseDataset(args.val_csv, patch_size=args.patch_size, augment=False, use_inpainting=args.use_inpainting, feather_radius=args.feather_radius)
-        val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-
-    print("\nCreating model...")
-    model = NAFNet(img_channel=3, width=args.width, middle_blk_num=args.middle_blk_num, enc_blk_nums=args.enc_blk_nums, dec_blk_nums=args.dec_blk_nums, use_pixelshuffle=(not args.disable_pixelshuffle)).to(device)
-
-    if args.pretrained:
-        model = load_pretrained_model(model, args.pretrained, device)
-
-    criterion_dict = {'mse': nn.L1Loss()}
-    if args.use_edge:
-        print('Initializing Edge loss')
-        criterion_dict['edge'] = EdgeLoss()
-    if args.use_perceptual:
-        print('Initializing Perceptual loss (VGG)')
-        criterion_dict['perc'] = PerceptualLoss(device)
-    if args.use_hf:
-        print('Using high-frequency loss')
-
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
-
-    start_epoch, best_psnr = load_checkpoint_if_exists(checkpoint_dir, model, optimizer, scheduler, resume=args.resume)
-
-    print(f"Train samples: {len(train_dataset)} | Batch size: {args.batch_size} | Epochs: {args.epochs} (start {start_epoch})")
-    print(f"Loss weights -> mse: {args.mse_weight}, edge: {args.edge_weight}, hf: {args.hf_weight}, perc: {args.perc_weight}")
-
-    patience_counter = 0
-    for epoch in range(start_epoch, args.epochs + 1):
-        start_time = time.time()
-        train_loss, train_mse, train_edge, train_psnr = train_epoch(model, train_dataloader, criterion_dict, optimizer, device, epoch, args)
-        if val_dataloader:
-            val_loss, val_psnr = validate(model, val_dataloader, criterion_dict, device, args, epoch, sample_dir)
-        else:
-            val_loss, val_psnr = 0, 0
-        scheduler.step()
-        epoch_time = time.time() - start_time
-        print(f"\nEpoch {epoch}/{args.epochs} - {epoch_time:.1f}s")
-        print(f" Train - Loss: {train_loss:.4f} (MSE: {train_mse:.4f}, Edge: {train_edge:.4f}) PSNR: {train_psnr:.2f} dB")
-        if val_dataloader:
-            print(f" Val   - Loss: {val_loss:.4f}, PSNR: {val_psnr:.2f} dB")
-        writer.add_scalar('Loss/train', train_loss, epoch)
-        writer.add_scalar('PSNR/train', train_psnr, epoch)
-        if val_dataloader:
-            writer.add_scalar('Loss/val', val_loss, epoch); writer.add_scalar('PSNR/val', val_psnr, epoch)
-
-        # Save checkpoint
-        if epoch % args.save_freq == 0:
-            ckpt_path = checkpoint_dir / f'model_epoch_{epoch}.pth'
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict()}, ckpt_path)
-            print(f" Saved checkpoint: {ckpt_path}")
-
-        current_psnr = val_psnr if val_dataloader else train_psnr
-        if current_psnr > best_psnr:
-            best_psnr = current_psnr
-            metrics_dict = {'train_loss': train_loss, 'train_mse': train_mse, 'train_edge': train_edge, 'val_loss': val_loss, 'val_psnr': val_psnr}
-            best_path = checkpoint_dir / f'best_model_epoch_{epoch}_psnr_{best_psnr:.2f}.pth'
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(), 'best_psnr': best_psnr, 'metrics': metrics_dict}, best_path)
-            latest_best = checkpoint_dir / 'best_model.pth'
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'best_psnr': best_psnr, 'metrics': metrics_dict}, latest_best)
-            print(f" ⭐ New best model! PSNR: {best_psnr:.2f} dB (Epoch {epoch}) Saved: {best_path.name}")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-        if patience_counter >= args.patience:
-            print(f"Early stopping triggered after {epoch} epochs")
-            break
-
-    writer.close()
-    print('Training completed!')
-    print(f' Best PSNR: {best_psnr:.2f} dB')
-
-# --------------------------- Argument parser ---------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Improved NAFNet Training')
-    parser.add_argument('--train_csv', type=str, required=True)
-    parser.add_argument('--val_csv', type=str, default=None)
-    parser.add_argument('--output_dir', type=str, default='Outputs')
-    parser.add_argument('--exp_name', type=str, default='nafnet_pixelshuffle_improved')
-    parser.add_argument('--use_inpainting', action='store_true', default=False)
-    parser.add_argument('--feather_radius', type=float, default=7.0)
-    parser.add_argument('--pretrained', type=str, default=None)
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument('--train-csv', type=str, required=True)
+    parser.add_argument('--pretrained', type=str, default='')
+    parser.add_argument('--exp-dir', type=str, required=True)
+    parser.add_argument('--resume', type=str, default='')
+    
     parser.add_argument('--width', type=int, default=32)
-    parser.add_argument('--middle_blk_num', type=int, default=8)
-    parser.add_argument('--enc_blk_nums', type=int, nargs='+', default=[2,2,4,8])
-    parser.add_argument('--dec_blk_nums', type=int, nargs='+', default=[2,2,2,2])
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--patch_size', type=int, default=256)
+    parser.add_argument('--image-size', type=int, default=512)
+    
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--mse_weight', type=float, default=0.8)
-    parser.add_argument('--edge_weight', type=float, default=0.2)
-    parser.add_argument('--hf_weight', type=float, default=0.1)
-    parser.add_argument('--perc_weight', type=float, default=0.0)
-    parser.add_argument('--use_edge', action='store_true', default=True)
-    parser.add_argument('--use_perceptual', action='store_true', default=False)
-    parser.add_argument('--use_hf', action='store_true', default=False)
-    parser.add_argument('--disable_pixelshuffle', action='store_true', default=False)
-    parser.add_argument('--save_freq', type=int, default=10)
-    parser.add_argument('--patience', type=int, default=15)
-    parser.add_argument('--device', type=str, default='cuda', choices=['cuda','cpu'])
-    parser.add_argument('--resume', action='store_true', default=False)
+    parser.add_argument('--num-workers', type=int, default=4)
+    
+    parser.add_argument('--l1-weight', type=float, default=0.7)
+    parser.add_argument('--ssim-weight', type=float, default=0.15)
+    parser.add_argument('--edge-weight', type=float, default=0.15)
+    
+    parser.add_argument('--use-soft-inpainting', action='store_true', default=True)
+    parser.add_argument('--feather-radius', type=int, default=5)
+    
+    parser.add_argument('--sample-interval', type=int, default=5)
+    parser.add_argument('--save-interval', type=int, default=10)
+    parser.add_argument('--device', type=str, default='cuda')
+    
     args = parser.parse_args()
-    train(args)
+    
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+    
+    trainer = NAFNetTrainer(args)
+    trainer.train()
+
 
 if __name__ == '__main__':
     main()

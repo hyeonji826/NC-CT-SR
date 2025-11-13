@@ -1,292 +1,182 @@
-# -*- coding: utf-8 -*-
-"""
-NC to CE Style Transfer - Stable Diffusion + ControlNet + LoRA
-Canny Edge를 구조 가이드로 사용하여 CE 스타일 생성
-"""
-
-import warnings
-warnings.filterwarnings('ignore', category=FutureWarning)
-warnings.filterwarnings('ignore', message='.*torch.utils._pytree.*')
-
-import os
-import argparse
-import random
-from pathlib import Path
-import numpy as np
+#!/usr/bin/env python3
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
-import SimpleITK as sitk
+import numpy as np
+from pathlib import Path
+import argparse
 from tqdm import tqdm
 import pandas as pd
+import SimpleITK as sitk
 import cv2
+import random
+import matplotlib.pyplot as plt
+from skimage.metrics import structural_similarity as ssim_metric
+from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 
-from diffusers import (
-    AutoencoderKL,
-    UNet2DConditionModel,
-    DDPMScheduler,
-    DDIMScheduler,
-    ControlNetModel
-)
-from diffusers.models.controlnet import ControlNetOutput
-from peft import LoraConfig, get_peft_model
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler, ControlNetModel
 from transformers import CLIPTextModel, CLIPTokenizer
+from peft import LoraConfig, get_peft_model
 
 
-# ============================================================
-# Canny Edge Extraction for ControlNet
-# ============================================================
-def get_canny_edge(image_batch):
-    """배치 이미지에서 Canny edge 추출
-    Args:
-        image_batch: [B, 3, H, W] tensor, range [-1, 1]
-    Returns:
-        edges: [B, 3, H, W] tensor, range [-1, 1]
-    """
-    batch_size = image_batch.shape[0]
-    edges_list = []
+class StructureLoss(nn.Module):
+    def __init__(self, hu_min=-30, hu_max=150):
+        super().__init__()
+        self.hu_min = hu_min
+        self.hu_max = hu_max
     
-    for i in range(batch_size):
-        # [3, H, W] → [H, W]
-        img_np = image_batch[i, 0].cpu().numpy()
-        
-        # [-1, 1] → [0, 255]
-        img_np = ((img_np + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-        
-        # Canny edge detection
-        edges = cv2.Canny(img_np, threshold1=100, threshold2=200)
-        
-        # [0, 255] → [-1, 1]
-        edges = edges.astype(np.float32) / 127.5 - 1.0
-        
-        # [H, W] → [3, H, W]
-        edges_tensor = torch.from_numpy(edges).unsqueeze(0).repeat(3, 1, 1)
-        edges_list.append(edges_tensor)
+    def get_organ_mask(self, ct_image):
+        hu = ct_image * 1000
+        mask = (hu > self.hu_min) & (hu < self.hu_max)
+        return mask.float()
     
-    # List → [B, 3, H, W]
-    edges_batch = torch.stack(edges_list, dim=0)
-    return edges_batch.to(image_batch.device)
+    def dice_loss(self, pred_mask, target_mask):
+        smooth = 1e-5
+        intersection = (pred_mask * target_mask).sum(dim=(2, 3))
+        union = pred_mask.sum(dim=(2, 3)) + target_mask.sum(dim=(2, 3))
+        dice = (2 * intersection + smooth) / (union + smooth)
+        return 1 - dice.mean()
+    
+    def forward(self, pred, target):
+        pred_mask = self.get_organ_mask(pred)
+        target_mask = self.get_organ_mask(target)
+        return self.dice_loss(pred_mask, target_mask)
 
 
-# ============================================================
-# Dataset: NC (control) + CE (target)
-# ============================================================
-class NCCEControlNetDataset(Dataset):
-    """NC를 control로, CE를 target으로 사용하는 데이터셋"""
+def extract_edges(img):
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                           dtype=torch.float32, device=img.device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                           dtype=torch.float32, device=img.device).view(1, 1, 3, 3)
     
-    def __init__(self, root, pairs_csv, split='train', image_size=512, num_slices=5):
-        self.root = Path(root)
+    edge_x = F.conv2d(img, sobel_x, padding=1)
+    edge_y = F.conv2d(img, sobel_y, padding=1)
+    edge = torch.sqrt(edge_x**2 + edge_y**2 + 1e-8)
+    edge = (edge - edge.min()) / (edge.max() - edge.min() + 1e-8) * 2 - 1
+    return edge
+
+
+class NCCEPairDataset(Dataset):
+    def __init__(self, csv_path, image_size=512, augment=True):
+        self.pairs = pd.read_csv(csv_path)
         self.image_size = image_size
-        self.num_slices = num_slices
+        self.augment = augment
         
-        # pairs.csv 로드
-        df = pd.read_csv(self.root / pairs_csv)
-        
-        # Train/Val/Test split (8:1:1)
-        n_total = len(df)
-        n_train = int(n_total * 0.8)
-        n_val = int(n_total * 0.1)
-        
-        if split == 'train':
-            df = df.iloc[:n_train]
-        elif split == 'val':
-            df = df.iloc[n_train:n_train+n_val]
-        else:  # test
-            df = df.iloc[n_train+n_val:]
-        
-        df = df.reset_index(drop=True)
-        
-        self.pairs = []
-        for _, row in df.iterrows():
-            nc_path = Path(row['input_nc_norm'])
-            ce_path = Path(row['target_ce_norm'])
-            
-            if nc_path.exists() and ce_path.exists():
-                self.pairs.append({
-                    'nc_path': nc_path,
-                    'ce_path': ce_path,
-                    'patient_id': row['id7']
-                })
-        
-        print(f"[{split}] Loaded {len(self.pairs)} NC-CE pairs")
-    
     def __len__(self):
-        return len(self.pairs) * self.num_slices
+        return len(self.pairs)
+    
+    def load_slice(self, nifti_path, slice_idx):
+        img = sitk.ReadImage(str(nifti_path))
+        arr = sitk.GetArrayFromImage(img)[slice_idx]
+        arr = np.clip((arr + 1000) / 1000, -1, 1)
+        return arr
+    
+    def augment_pair(self, nc, ce):
+        if not self.augment:
+            return nc, ce
+        
+        if random.random() > 0.5:
+            nc = np.fliplr(nc)
+            ce = np.fliplr(ce)
+        
+        if random.random() > 0.5:
+            nc = np.flipud(nc)
+            ce = np.flipud(ce)
+        
+        k = random.randint(0, 3)
+        if k > 0:
+            nc = np.rot90(nc, k)
+            ce = np.rot90(ce, k)
+        
+        if random.random() > 0.5:
+            scale = random.uniform(0.95, 1.05)
+            shift = random.uniform(-0.05, 0.05)
+            nc = np.clip(nc * scale + shift, -1, 1)
+            ce = np.clip(ce * scale + shift, -1, 1)
+        
+        return nc, ce
     
     def __getitem__(self, idx):
-        pair_idx = idx // self.num_slices
-        slice_offset = idx % self.num_slices
+        row = self.pairs.iloc[idx]
         
-        pair = self.pairs[pair_idx]
+        nc = self.load_slice(row['nc_path'], row['nc_slice_idx'])
+        ce = self.load_slice(row['ce_path'], row['ce_slice_idx'])
         
-        # Load volumes
-        nc_img = sitk.ReadImage(str(pair['nc_path']))
-        nc_arr = sitk.GetArrayFromImage(nc_img).astype(np.float32)
+        nc, ce = self.augment_pair(nc, ce)
         
-        ce_img = sitk.ReadImage(str(pair['ce_path']))
-        ce_arr = sitk.GetArrayFromImage(ce_img).astype(np.float32)
+        nc = cv2.resize(nc, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
+        ce = cv2.resize(ce, (self.image_size, self.image_size), interpolation=cv2.INTER_LINEAR)
         
-        # Select corresponding slices from middle region
-        D_nc = nc_arr.shape[0]
-        D_ce = ce_arr.shape[0]
+        nc = torch.from_numpy(nc).float().unsqueeze(0)
+        ce = torch.from_numpy(ce).float().unsqueeze(0)
         
-        # NC slice
-        start_nc = D_nc // 4
-        end_nc = 3 * D_nc // 4
-        slice_idx_nc = start_nc + (end_nc - start_nc) * slice_offset // self.num_slices
-        slice_idx_nc = np.clip(slice_idx_nc, 0, D_nc - 1)
-        nc_slice = nc_arr[slice_idx_nc]
+        edge = extract_edges(nc.unsqueeze(0)).squeeze(0)
         
-        # CE slice (corresponding position)
-        slice_idx_ce = int(slice_idx_nc * D_ce / D_nc)
-        slice_idx_ce = np.clip(slice_idx_ce, 0, D_ce - 1)
-        ce_slice = ce_arr[slice_idx_ce]
-        
-        # Resize CE to match NC
-        if ce_slice.shape != nc_slice.shape:
-            from skimage.transform import resize
-            ce_slice = resize(ce_slice, nc_slice.shape, 
-                            order=1, preserve_range=True, anti_aliasing=True)
-        
-        # Convert to [-1, 1] range
-        nc_slice = nc_slice * 2.0 - 1.0
-        ce_slice = ce_slice * 2.0 - 1.0
-        
-        # To tensor
-        nc_tensor = torch.from_numpy(nc_slice).unsqueeze(0)  # [1, H, W]
-        ce_tensor = torch.from_numpy(ce_slice).unsqueeze(0)  # [1, H, W]
-        
-        # Resize
-        if nc_tensor.shape[1] != self.image_size or nc_tensor.shape[2] != self.image_size:
-            nc_tensor = transforms.functional.resize(
-                nc_tensor, (self.image_size, self.image_size), antialias=True
-            )
-            ce_tensor = transforms.functional.resize(
-                ce_tensor, (self.image_size, self.image_size), antialias=True
-            )
-        
-        # Prompt
-        prompt = "high quality contrast-enhanced CT scan with clear tissue boundaries and enhanced blood vessels"
+        nc_rgb = nc.repeat(3, 1, 1)
+        ce_rgb = ce.repeat(3, 1, 1)
+        edge_rgb = edge.repeat(3, 1, 1)
         
         return {
-            'control_image': nc_tensor,  # NC as control
-            'target_image': ce_tensor,   # CE as target
-            'prompt': prompt
+            'nc': nc_rgb,
+            'ce': ce_rgb,
+            'edge': edge_rgb,
+            'prompt': 'contrast-enhanced CT scan, medical imaging, high quality'
         }
-
-
-# ============================================================
-# Collate function
-# ============================================================
-def collate_fn(examples):
-    control_images = torch.stack([ex['control_image'] for ex in examples])
-    target_images = torch.stack([ex['target_image'] for ex in examples])
-    
-    # Repeat to 3 channels
-    control_images = control_images.repeat(1, 3, 1, 1)
-    target_images = target_images.repeat(1, 3, 1, 1)
-    
-    prompts = [ex['prompt'] for ex in examples]
-    
-    return {
-        'control_images': control_images,
-        'target_images': target_images,
-        'prompts': prompts
-    }
-
-
-# ============================================================
-# Trainer
-# ============================================================
 class ControlNetTrainer:
     def __init__(self, args):
         self.args = args
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Directories
+        root = Path(args.root)
         self.exp_dir = Path(args.exp_dir)
-        self.exp_dir.mkdir(parents=True, exist_ok=True)
-        (self.exp_dir / 'checkpoints').mkdir(exist_ok=True)
-        (self.exp_dir / 'samples').mkdir(exist_ok=True)
+        self.ckpt_dir = self.exp_dir / 'ckpt'
+        self.samples_dir = self.exp_dir / 'samples'
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.samples_dir.mkdir(parents=True, exist_ok=True)
         
-        print("Loading Stable Diffusion + ControlNet components...")
-        model_id = "stabilityai/stable-diffusion-2-1-base"
+        model_id = "runwayml/stable-diffusion-v1-5"
         
-        # VAE
-        self.vae = AutoencoderKL.from_pretrained(
-            model_id, subfolder="vae", torch_dtype=torch.float32
-        ).to(self.device)
+        self.vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae").to(self.device)
+        self.text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder").to(self.device)
+        self.tokenizer = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
+        self.unet = UNet2DConditionModel.from_pretrained(model_id, subfolder="unet").to(self.device)
+        
         self.vae.requires_grad_(False)
-        self.vae.eval()
-        
-        # Text encoder
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            model_id, subfolder="tokenizer"
-        )
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            model_id, subfolder="text_encoder", torch_dtype=torch.float32
-        ).to(self.device)
         self.text_encoder.requires_grad_(False)
-        self.text_encoder.eval()
         
-        # ControlNet - 처음부터 학습
-        print("Initializing ControlNet from scratch...")
-        self.controlnet = ControlNetModel.from_unet(
-            UNet2DConditionModel.from_pretrained(
-                model_id, subfolder="unet", torch_dtype=torch.float32
+        self.controlnet = ControlNetModel.from_unet(self.unet).to(self.device)
+        
+        if args.use_lora:
+            lora_config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+                lora_dropout=0.1,
             )
-        ).to(self.device)
+            self.unet = get_peft_model(self.unet, lora_config)
         
-        # UNet with LoRA
-        self.unet = UNet2DConditionModel.from_pretrained(
-            model_id, subfolder="unet", torch_dtype=torch.float32
+        self.scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
+        self.scheduler.set_timesteps(args.num_inference_steps)
+        
+        self.structure_loss = StructureLoss().to(self.device)
+        
+        trainable_params = list(self.controlnet.parameters())
+        if args.use_lora:
+            trainable_params += list(filter(lambda p: p.requires_grad, self.unet.parameters()))
+        
+        self.optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+        
+        self.scheduler_lr = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=args.epochs,
+            eta_min=1e-7
         )
         
-        # LoRA for UNet
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-            lora_dropout=0.1,
-            bias="none"
-        )
-        self.unet = get_peft_model(self.unet, lora_config)
-        self.unet.to(self.device)
-        
-        # Trainable parameters
-        controlnet_params = sum(p.numel() for p in self.controlnet.parameters())
-        unet_trainable = sum(p.numel() for p in self.unet.parameters() if p.requires_grad)
-        print(f"ControlNet params: {controlnet_params:,}")
-        print(f"UNet trainable (LoRA): {unet_trainable:,}")
-        
-        # Noise scheduler
-        self.noise_scheduler = DDPMScheduler.from_pretrained(
-            model_id, subfolder="scheduler"
-        )
-        
-        # Optimizer - ControlNet + UNet LoRA
-        self.optimizer = torch.optim.AdamW(
-            list(self.controlnet.parameters()) + list(self.unet.parameters()),
-            lr=args.lr,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
-        )
-        
-        # LR Scheduler
-        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=args.epochs, eta_min=1e-6
-        )
-        
-        # Datasets
-        self.train_dataset = NCCEControlNetDataset(
-            args.root, args.pairs_csv, split='train',
-            image_size=args.image_size, num_slices=args.num_slices
-        )
-        self.val_dataset = NCCEControlNetDataset(
-            args.root, args.pairs_csv, split='val',
-            image_size=args.image_size, num_slices=2
+        self.train_dataset = NCCEPairDataset(
+            csv_path=root / args.pairs_csv,
+            image_size=args.image_size,
+            augment=True
         )
         
         self.train_loader = DataLoader(
@@ -294,346 +184,281 @@ class ControlNetTrainer:
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=args.num_workers,
-            collate_fn=collate_fn,
             pin_memory=True
         )
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            collate_fn=collate_fn
-        )
         
-        # Logging
+        self.start_epoch = 0
+        self.best_loss = float('inf')
         self.train_losses = []
-        self.val_losses = []
-        self.best_val_loss = float('inf')
+        
+        if args.resume:
+            self.load_checkpoint(args.resume)
     
-    def encode_prompt(self, prompts):
+    def load_checkpoint(self, ckpt_path):
+        ckpt_path = Path(ckpt_path)
+        if not ckpt_path.exists():
+            return
+        
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.controlnet.load_state_dict(checkpoint['controlnet_state_dict'])
+        if self.args.use_lora and checkpoint['unet_state_dict']:
+            self.unet.load_state_dict(checkpoint['unet_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler_lr.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.start_epoch = checkpoint['epoch'] + 1
+        self.best_loss = checkpoint['best_loss']
+        self.train_losses = checkpoint.get('train_losses', [])
+    
+    def encode_prompt(self, prompt):
         text_inputs = self.tokenizer(
-            prompts,
+            prompt,
             padding="max_length",
             max_length=self.tokenizer.model_max_length,
             truncation=True,
-            return_tensors="pt"
+            return_tensors="pt",
         )
-        text_input_ids = text_inputs.input_ids.to(self.device)
+        text_embeddings = self.text_encoder(text_inputs.input_ids.to(self.device))[0]
+        return text_embeddings
+    
+    @torch.no_grad()
+    def encode_image(self, images):
+        latents = self.vae.encode(images).latent_dist.sample()
+        latents = latents * 0.18215
+        return latents
+    
+    @torch.no_grad()
+    def decode_latents(self, latents):
+        latents = latents / 0.18215
+        images = self.vae.decode(latents).sample
+        images = (images + 1) / 2
+        return images.clamp(0, 1)
+    
+    def train_step(self, batch):
+        nc = batch['nc'].to(self.device)
+        ce = batch['ce'].to(self.device)
+        edge = batch['edge'].to(self.device)
+        prompts = batch['prompt']
+        
+        batch_size = nc.shape[0]
+        
+        text_embeddings = self.encode_prompt(prompts)
+        
+        nc_latents = self.encode_image(nc)
+        ce_latents = self.encode_image(ce)
+        
+        timesteps = torch.randint(0, self.scheduler.config.num_train_timesteps, 
+                                  (batch_size,), device=self.device).long()
+        
+        noise = torch.randn_like(ce_latents)
+        noisy_latents = self.scheduler.add_noise(ce_latents, noise, timesteps)
+        
+        control_input = torch.cat([nc, edge], dim=1)
+        
+        down_block_res_samples, mid_block_res_sample = self.controlnet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=text_embeddings,
+            controlnet_cond=control_input,
+            return_dict=False,
+        )
+        
+        noise_pred = self.unet(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=text_embeddings,
+            down_block_additional_residuals=down_block_res_samples,
+            mid_block_additional_residual=mid_block_res_sample,
+        ).sample
+        
+        loss_mse = F.mse_loss(noise_pred, noise)
         
         with torch.no_grad():
-            prompt_embeds = self.text_encoder(text_input_ids)[0]
+            pred_latent = self.scheduler.step(noise_pred, timesteps[0], noisy_latents).pred_original_sample
+            pred_image = self.decode_latents(pred_latent)
+            nc_image = (nc + 1) / 2
         
-        return prompt_embeds
+        pred_hu = pred_image * 2 - 1
+        nc_hu = nc_image * 2 - 1
+        
+        loss_structure = self.structure_loss(pred_hu, nc_hu)
+        
+        total_loss = loss_mse + self.args.structure_weight * loss_structure
+        
+        return total_loss, {
+            'mse': loss_mse.item(),
+            'structure': loss_structure.item(),
+            'total': total_loss.item()
+        }
     
     def train_epoch(self, epoch):
         self.controlnet.train()
         self.unet.train()
-        
-        total_loss = 0
-        valid_batches = 0
+        epoch_losses = []
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
         for batch in pbar:
-            control_images = batch['control_images'].to(self.device, dtype=torch.float32)
-            target_images = batch['target_images'].to(self.device, dtype=torch.float32)
-            prompts = batch['prompts']
+            loss, loss_dict = self.train_step(batch)
             
-            # ✅ Canny Edge 추출 (NC 이미지 대신 사용)
-            control_edges = get_canny_edge(control_images)
-            
-            # Encode target images (CE)
-            with torch.no_grad():
-                target_latents = self.vae.encode(target_images).latent_dist.sample()
-                target_latents = target_latents * self.vae.config.scaling_factor
-            
-            # Text embeddings
-            encoder_hidden_states = self.encode_prompt(prompts)
-            
-            # Add noise to target
-            noise = torch.randn_like(target_latents)
-            bsz = target_latents.shape[0]
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.num_train_timesteps,
-                (bsz,), device=target_latents.device
-            ).long()
-            
-            noisy_latents = self.noise_scheduler.add_noise(target_latents, noise, timesteps)
-            
-            # ✅ ControlNet forward - Canny Edge를 control로 사용
-            down_block_res_samples, mid_block_res_sample = self.controlnet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                controlnet_cond=control_edges,
-                conditioning_scale=1.0,
-                return_dict=False
-            )
-            
-            # UNet forward with ControlNet conditioning
-            model_pred = self.unet(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=encoder_hidden_states,
-                down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample
-            ).sample
-            
-            # Loss
-            loss = F.mse_loss(model_pred, noise, reduction="mean")
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"⚠️  Skipping batch with NaN/Inf loss")
-                continue
-            
-            # Backward
             self.optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.controlnet.parameters()) + list(self.unet.parameters()), 
-                1.0
-            )
+            torch.nn.utils.clip_grad_norm_(self.controlnet.parameters(), max_norm=1.0)
+            if self.args.use_lora:
+                torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, self.unet.parameters()), max_norm=1.0)
             self.optimizer.step()
             
-            total_loss += loss.item()
-            valid_batches += 1
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            epoch_losses.append(loss.item())
+            pbar.set_postfix(loss=loss.item())
         
-        avg_loss = total_loss / max(valid_batches, 1)
+        avg_loss = np.mean(epoch_losses)
         self.train_losses.append(avg_loss)
+        self.scheduler_lr.step()
+        
         return avg_loss
-    
     @torch.no_grad()
-    def validate(self, epoch):
+    def generate_sample(self, nc, edge, prompt, num_steps=50):
         self.controlnet.eval()
         self.unet.eval()
         
-        total_loss = 0
-        valid_batches = 0
+        text_embeddings = self.encode_prompt([prompt])
         
-        # Keep track of last batch for sample generation
-        last_batch = None
-        last_control_images = None
+        control_input = torch.cat([nc, edge], dim=1)
         
-        for batch in tqdm(self.val_loader, desc="Validating"):
-            control_images = batch['control_images'].to(self.device, dtype=torch.float32)
-            target_images = batch['target_images'].to(self.device, dtype=torch.float32)
-            prompts = batch['prompts']
-            
-            # ✅ Canny Edge 추출
-            control_edges = get_canny_edge(control_images)
-            
-            target_latents = self.vae.encode(target_images).latent_dist.sample()
-            target_latents = target_latents * self.vae.config.scaling_factor
-            
-            encoder_hidden_states = self.encode_prompt(prompts)
-            
-            noise = torch.randn_like(target_latents)
-            timesteps = torch.randint(
-                0, self.noise_scheduler.config.num_train_timesteps,
-                (target_latents.shape[0],), device=target_latents.device
-            ).long()
-            noisy_latents = self.noise_scheduler.add_noise(target_latents, noise, timesteps)
-            
-            # ✅ ControlNet with Canny Edge
+        latents = torch.randn((1, 4, self.args.image_size // 8, self.args.image_size // 8),
+                             device=self.device)
+        
+        self.scheduler.set_timesteps(num_steps)
+        for t in self.scheduler.timesteps:
             down_block_res_samples, mid_block_res_sample = self.controlnet(
-                noisy_latents, timesteps, encoder_hidden_states,
-                controlnet_cond=control_edges,
-                conditioning_scale=1.0,
-                return_dict=False
+                latents,
+                t,
+                encoder_hidden_states=text_embeddings,
+                controlnet_cond=control_input,
+                return_dict=False,
             )
             
-            model_pred = self.unet(
-                noisy_latents, timesteps, encoder_hidden_states,
-                down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample
-            ).sample
-            
-            loss = F.mse_loss(model_pred, noise, reduction="mean")
-            
-            if not (torch.isnan(loss) or torch.isinf(loss)):
-                total_loss += loss.item()
-                valid_batches += 1
-            
-            # Keep last batch for sample generation
-            last_batch = batch
-            last_control_images = control_images
-        
-        avg_loss = total_loss / max(valid_batches, 1)
-        self.val_losses.append(avg_loss)
-        
-        # Save best model
-        if avg_loss < self.best_val_loss:
-            self.best_val_loss = avg_loss
-            self.save_checkpoint('best')
-            
-            # Generate sample
-            if last_batch is not None and last_control_images is not None:
-                self.generate_sample(epoch, last_batch, last_control_images)
-            
-            print(f"✓ Best model saved (val_loss: {avg_loss:.4f})")
-        
-        return avg_loss
-    
-    @torch.no_grad()
-    def generate_sample(self, epoch, batch, control_images):
-        """샘플 생성 - Canny Edge control로 CE style 생성"""
-        self.controlnet.eval()
-        self.unet.eval()
-        
-        # 첫 번째 샘플만 사용
-        control_image = control_images[:1].to(self.device, dtype=torch.float32)
-        target_image = batch['target_images'][:1].to(self.device, dtype=torch.float32)
-        prompt = batch['prompts'][:1]
-        
-        # ✅ Canny Edge 추출
-        control_edge = get_canny_edge(control_image)
-        
-        # Text embedding
-        encoder_hidden_states = self.encode_prompt(prompt)
-        
-        # DDIM scheduler for sampling
-        ddim_scheduler = DDIMScheduler.from_pretrained(
-            "stabilityai/stable-diffusion-2-1-base", subfolder="scheduler"
-        )
-        ddim_scheduler.set_timesteps(50)
-        
-        # Random latent
-        latents = torch.randn(
-            1, 4, self.args.image_size // 8, self.args.image_size // 8,
-            device=self.device, dtype=torch.float32
-        )
-        
-        # Denoising loop
-        for t in tqdm(ddim_scheduler.timesteps, desc="Generating", leave=False):
-            # ✅ ControlNet with Canny Edge
-            down_block_res_samples, mid_block_res_sample = self.controlnet(
-                latents, t, encoder_hidden_states,
-                controlnet_cond=control_edge,
-                conditioning_scale=1.0,
-                return_dict=False
-            )
-            
-            # UNet prediction
             noise_pred = self.unet(
-                latents, t, encoder_hidden_states,
+                latents,
+                t,
+                encoder_hidden_states=text_embeddings,
                 down_block_additional_residuals=down_block_res_samples,
-                mid_block_additional_residual=mid_block_res_sample
+                mid_block_additional_residual=mid_block_res_sample,
             ).sample
             
-            latents = ddim_scheduler.step(noise_pred, t, latents).prev_sample
+            latents = self.scheduler.step(noise_pred, t, latents).prev_sample
         
-        # Decode
-        latents = 1 / self.vae.config.scaling_factor * latents
-        generated_image = self.vae.decode(latents).sample
-        
-        # Save comparison
-        import matplotlib.pyplot as plt
-        
-        # Denormalize
-        control_np = (control_image[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
-        control_edge_np = (control_edge[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
-        generated_np = (generated_image[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
-        target_np = (target_image[0, 0].cpu().numpy() / 2 + 0.5).clip(0, 1)
-        
-        # ✅ 4개 이미지 표시
-        fig, axes = plt.subplots(1, 4, figsize=(24, 6))
-        
-        axes[0].imshow(control_np, cmap='gray', vmin=0, vmax=1)
-        axes[0].set_title('Input NC', fontsize=14, fontweight='bold')
-        axes[0].axis('off')
-        
-        axes[1].imshow(control_edge_np, cmap='gray', vmin=0, vmax=1)
-        axes[1].set_title('Canny Edge (Control)', fontsize=14, fontweight='bold')
-        axes[1].axis('off')
-        
-        axes[2].imshow(generated_np, cmap='gray', vmin=0, vmax=1)
-        axes[2].set_title('Generated CE-style', fontsize=14, fontweight='bold')
-        axes[2].axis('off')
-        
-        axes[3].imshow(target_np, cmap='gray', vmin=0, vmax=1)
-        axes[3].set_title('Target CE', fontsize=14, fontweight='bold')
-        axes[3].axis('off')
-        
-        plt.suptitle(f'Best Model - Epoch {epoch+1} (Canny Edge Control)', fontsize=16, fontweight='bold')
-        plt.tight_layout()
-        
-        save_path = self.exp_dir / 'samples' / f'best_epoch_{epoch+1:03d}.png'
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  Sample saved: {save_path.name}")
+        image = self.decode_latents(latents)
+        return image
     
-    def save_checkpoint(self, name):
-        """ControlNet + UNet LoRA 저장"""
-        save_dir = self.exp_dir / 'checkpoints' / name
-        save_dir.mkdir(parents=True, exist_ok=True)
+    def save_samples(self, epoch):
+        batch = next(iter(self.train_loader))
+        nc = batch['nc'][:4].to(self.device)
+        ce = batch['ce'][:4].to(self.device)
+        edge = batch['edge'][:4].to(self.device)
+        prompt = batch['prompt'][0]
         
-        # ControlNet
-        self.controlnet.save_pretrained(save_dir / 'controlnet')
+        fake_ce = []
+        for i in range(4):
+            fake = self.generate_sample(nc[i:i+1], edge[i:i+1], prompt, num_steps=20)
+            fake_ce.append(fake)
+        fake_ce = torch.cat(fake_ce, dim=0)
         
-        # UNet LoRA
-        self.unet.save_pretrained(save_dir / 'unet_lora')
+        psnr_vals = []
+        ssim_vals = []
+        for i in range(4):
+            fake_np = fake_ce[i].mean(0).cpu().numpy()
+            real_np = ((ce[i].mean(0).cpu().numpy() + 1) / 2)
+            psnr_vals.append(psnr_metric(real_np, fake_np, data_range=1.0))
+            ssim_vals.append(ssim_metric(real_np, fake_np, data_range=1.0))
         
-        # Training state
-        torch.save({
+        avg_psnr = np.mean(psnr_vals)
+        avg_ssim = np.mean(ssim_vals)
+        
+        fig, axes = plt.subplots(4, 4, figsize=(16, 16))
+        fig.suptitle(f'Epoch {epoch+1} | PSNR: {avg_psnr:.2f} | SSIM: {avg_ssim:.4f}', fontsize=14)
+        
+        for i in range(4):
+            axes[i, 0].imshow(nc[i].mean(0).cpu().numpy(), cmap='gray', vmin=-1, vmax=1)
+            axes[i, 0].set_title('NC Input')
+            axes[i, 0].axis('off')
+            
+            axes[i, 1].imshow(edge[i].mean(0).cpu().numpy(), cmap='gray', vmin=-1, vmax=1)
+            axes[i, 1].set_title('Edge Map')
+            axes[i, 1].axis('off')
+            
+            axes[i, 2].imshow(fake_ce[i].mean(0).cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+            axes[i, 2].set_title(f'Fake CE (PSNR: {psnr_vals[i]:.2f})')
+            axes[i, 2].axis('off')
+            
+            axes[i, 3].imshow((ce[i].mean(0).cpu().numpy() + 1) / 2, cmap='gray', vmin=0, vmax=1)
+            axes[i, 3].set_title('Real CE')
+            axes[i, 3].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(self.samples_dir / f'epoch_{epoch+1:03d}.png', dpi=100, bbox_inches='tight')
+        plt.close()
+    
+    def save_checkpoint(self, epoch, is_best=False):
+        checkpoint = {
+            'epoch': epoch,
+            'controlnet_state_dict': self.controlnet.state_dict(),
+            'unet_state_dict': self.unet.state_dict() if self.args.use_lora else None,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler_lr.state_dict(),
+            'best_loss': self.best_loss,
             'train_losses': self.train_losses,
-            'val_losses': self.val_losses,
-            'best_val_loss': self.best_val_loss
-        }, save_dir / 'training_state.pth')
+        }
+        
+        torch.save(checkpoint, self.ckpt_dir / f'epoch_{epoch+1:03d}.pth')
+        
+        if is_best:
+            torch.save(checkpoint, self.ckpt_dir / 'best.pth')
+            self.controlnet.save_pretrained(self.ckpt_dir / 'best_controlnet')
     
     def train(self):
-        print(f"\n{'='*80}")
-        print("NC to CE with ControlNet + LoRA (Canny Edge Control)")
-        print(f"{'='*80}\n")
-        
-        for epoch in range(self.args.epochs):
-            train_loss = self.train_epoch(epoch)
-            val_loss = self.validate(epoch)
-            self.lr_scheduler.step()
+        for epoch in range(self.start_epoch, self.args.epochs):
+            avg_loss = self.train_epoch(epoch)
             
-            current_lr = self.optimizer.param_groups[0]['lr']
-            print(f"\nEpoch {epoch+1}/{self.args.epochs}")
-            print(f"  Train Loss: {train_loss:.4f}")
-            print(f"  Val Loss:   {val_loss:.4f}")
-            print(f"  LR:         {current_lr:.2e}")
+            if (epoch + 1) % self.args.sample_interval == 0:
+                self.save_samples(epoch)
             
-            # Save checkpoint every 10 epochs
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(f'epoch_{epoch+1:03d}')
-        
-        print("\n✓ Training complete!")
+            is_best = avg_loss < self.best_loss
+            if is_best:
+                self.best_loss = avg_loss
+            
+            if (epoch + 1) % self.args.save_interval == 0 or is_best:
+                self.save_checkpoint(epoch, is_best)
 
 
-# ============================================================
-# Main
-# ============================================================
 def main():
-    parser = argparse.ArgumentParser(description='NC to CE with ControlNet (Canny Edge)')
+    parser = argparse.ArgumentParser()
     
-    parser.add_argument('--root', default=r'E:\LD-CT SR')
-    parser.add_argument('--pairs-csv', default='Data/pairs.csv')
-    parser.add_argument('--exp-dir', default='Outputs/experiments/controlnet_canny')
+    parser.add_argument('--root', type=str, required=True)
+    parser.add_argument('--pairs-csv', type=str, default='Data/pseudo_pairs.csv')
+    parser.add_argument('--exp-dir', type=str, required=True)
+    parser.add_argument('--resume', type=str, default='')
     
+    parser.add_argument('--use-lora', action='store_true', default=True)
     parser.add_argument('--lora-rank', type=int, default=8)
     parser.add_argument('--lora-alpha', type=int, default=16)
     parser.add_argument('--image-size', type=int, default=512)
-    parser.add_argument('--num-slices', type=int, default=5)
+    parser.add_argument('--num-inference-steps', type=int, default=50)
     
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--num-workers', type=int, default=4)
     
+    parser.add_argument('--structure-weight', type=float, default=0.1)
+    
+    parser.add_argument('--sample-interval', type=int, default=5)
+    parser.add_argument('--save-interval', type=int, default=10)
+    
     args = parser.parse_args()
     
-    # Seed
-    random.seed(42)
-    np.random.seed(42)
     torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+    np.random.seed(42)
+    random.seed(42)
     
-    # Train
     trainer = ControlNetTrainer(args)
     trainer.train()
 
