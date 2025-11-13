@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-NAFNet Supervised Training Script with Pretrained Model Support
-Pseudo-pairs를 이용한 supervised learning + 사전학습 모델 fine-tuning
+NAFNet Noise2Noise Training Script
+Self-supervised denoising using Noise2Noise pairs
+Stage 1: NC denoising (구조 보존하며 노이즈만 제거)
 """
 
 import torch
@@ -156,15 +157,15 @@ class NAFNet(nn.Module):
         return x
 
 
-class PseudoPairDataset(Dataset):
-    """Pseudo-pairs CSV로부터 학습 데이터셋 생성"""
+class Noise2NoiseDataset(Dataset):
+    """Noise2Noise CSV로부터 self-supervised denoising 데이터셋 생성"""
     def __init__(self, csv_path, patch_size=256, augment=True):
         self.csv_path = Path(csv_path)
         self.pairs_df = pd.read_csv(csv_path)
         self.patch_size = patch_size
         self.augment = augment
         
-        print(f"Loaded {len(self.pairs_df)} pseudo-pairs from {csv_path}")
+        print(f"Loaded {len(self.pairs_df)} Noise2Noise pairs from {csv_path}")
     
     def __len__(self):
         return len(self.pairs_df)
@@ -172,53 +173,52 @@ class PseudoPairDataset(Dataset):
     def __getitem__(self, idx):
         row = self.pairs_df.iloc[idx]
         
-        # Load NC and CE volumes
+        # Load NC volume
         import SimpleITK as sitk
         nc_img = sitk.ReadImage(row['nc_path'])
         nc_arr = sitk.GetArrayFromImage(nc_img).astype(np.float32)
-        nc_slice = nc_arr[int(row['nc_slice_idx'])]
         
-        ce_img = sitk.ReadImage(row['ce_path'])
-        ce_arr = sitk.GetArrayFromImage(ce_img).astype(np.float32)
-        ce_slice = ce_arr[int(row['ce_slice_idx'])]
+        # Get two noisy slices
+        slice1 = nc_arr[int(row['slice1_idx'])]
+        slice2 = nc_arr[int(row['slice2_idx'])]
         
         # Resize if needed
-        if ce_slice.shape != nc_slice.shape:
+        if slice2.shape != slice1.shape:
             from skimage.transform import resize
-            ce_slice = resize(ce_slice, nc_slice.shape, 
-                            order=1, preserve_range=True, anti_aliasing=True)
+            slice2 = resize(slice2, slice1.shape, 
+                          order=1, preserve_range=True, anti_aliasing=True)
         
         # Random crop to patch_size
-        H, W = nc_slice.shape
+        H, W = slice1.shape
         if H > self.patch_size and W > self.patch_size:
             top = np.random.randint(0, H - self.patch_size)
             left = np.random.randint(0, W - self.patch_size)
-            nc_slice = nc_slice[top:top+self.patch_size, left:left+self.patch_size]
-            ce_slice = ce_slice[top:top+self.patch_size, left:left+self.patch_size]
+            slice1 = slice1[top:top+self.patch_size, left:left+self.patch_size]
+            slice2 = slice2[top:top+self.patch_size, left:left+self.patch_size]
         
         # Augmentation
         if self.augment:
             # Random flip
             if np.random.rand() > 0.5:
-                nc_slice = np.fliplr(nc_slice)
-                ce_slice = np.fliplr(ce_slice)
+                slice1 = np.fliplr(slice1)
+                slice2 = np.fliplr(slice2)
             if np.random.rand() > 0.5:
-                nc_slice = np.flipud(nc_slice)
-                ce_slice = np.flipud(ce_slice)
+                slice1 = np.flipud(slice1)
+                slice2 = np.flipud(slice2)
             # Random rotation (90, 180, 270)
             k = np.random.randint(0, 4)
-            nc_slice = np.rot90(nc_slice, k)
-            ce_slice = np.rot90(ce_slice, k)
+            slice1 = np.rot90(slice1, k)
+            slice2 = np.rot90(slice2, k)
         
         # Convert to tensor (add channel dimension)
-        nc_slice = torch.from_numpy(nc_slice.copy()).unsqueeze(0)  # [1, H, W]
-        ce_slice = torch.from_numpy(ce_slice.copy()).unsqueeze(0)  # [1, H, W]
+        slice1 = torch.from_numpy(slice1.copy()).unsqueeze(0)  # [1, H, W]
+        slice2 = torch.from_numpy(slice2.copy()).unsqueeze(0)  # [1, H, W]
         
         # Convert grayscale to RGB (repeat channel)
-        nc_slice = nc_slice.repeat(3, 1, 1)
-        ce_slice = ce_slice.repeat(3, 1, 1)
+        slice1 = slice1.repeat(3, 1, 1)
+        slice2 = slice2.repeat(3, 1, 1)
         
-        return nc_slice, ce_slice
+        return slice1, slice2
 
 
 def calculate_psnr(img1, img2):
@@ -277,18 +277,18 @@ def load_pretrained_model(model, pretrained_path, device):
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
-    """1 epoch 학습"""
+    """1 epoch 학습 (Noise2Noise)"""
     model.train()
     total_loss = 0
     total_psnr = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-    for nc, ce in pbar:
-        nc, ce = nc.to(device), ce.to(device)
+    for noisy1, noisy2 in pbar:
+        noisy1, noisy2 = noisy1.to(device), noisy2.to(device)
         
-        # Forward
-        output = model(nc)
-        loss = criterion(output, ce)
+        # Forward: noisy1 → denoise → compare with noisy2
+        denoised = model(noisy1)
+        loss = criterion(denoised, noisy2)
         
         # Backward
         optimizer.zero_grad()
@@ -297,7 +297,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
         
         # Metrics
         with torch.no_grad():
-            psnr = calculate_psnr(output, ce)
+            psnr = calculate_psnr(denoised, noisy2)
         
         total_loss += loss.item()
         total_psnr += psnr.item()
@@ -314,7 +314,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch):
 
 
 def validate(model, dataloader, criterion, device, epoch=None, sample_dir=None):
-    """Validation"""
+    """Validation (Noise2Noise)"""
     model.eval()
     total_loss = 0
     total_psnr = 0
@@ -325,37 +325,37 @@ def validate(model, dataloader, criterion, device, epoch=None, sample_dir=None):
     max_samples = 3
     
     with torch.no_grad():
-        for batch_idx, (nc, ce) in enumerate(tqdm(dataloader, desc="Validating")):
-            nc, ce = nc.to(device), ce.to(device)
+        for batch_idx, (noisy1, noisy2) in enumerate(tqdm(dataloader, desc="Validating")):
+            noisy1, noisy2 = noisy1.to(device), noisy2.to(device)
             
-            output = model(nc)
-            loss = criterion(output, ce)
-            psnr = calculate_psnr(output, ce)
+            denoised = model(noisy1)
+            loss = criterion(denoised, noisy2)
+            psnr = calculate_psnr(denoised, noisy2)
             
             total_loss += loss.item()
             total_psnr += psnr.item()
             
             # Save sample images
             if save_samples and saved_count < max_samples and batch_idx == 0:
-                for i in range(min(max_samples - saved_count, nc.size(0))):
+                for i in range(min(max_samples - saved_count, noisy1.size(0))):
                     # Convert to numpy and save
-                    nc_img = nc[i].cpu().numpy()[0]  # Take first channel
-                    ce_img = ce[i].cpu().numpy()[0]
-                    out_img = output[i].cpu().numpy()[0]
+                    noisy1_img = noisy1[i].cpu().numpy()[0]  # Take first channel
+                    noisy2_img = noisy2[i].cpu().numpy()[0]
+                    denoised_img = denoised[i].cpu().numpy()[0]
                     
                     import matplotlib.pyplot as plt
                     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                     
-                    axes[0].imshow(nc_img, cmap='gray', vmin=0, vmax=1)
-                    axes[0].set_title('Input (NC)', fontsize=12, fontweight='bold')
+                    axes[0].imshow(noisy1_img, cmap='gray', vmin=0, vmax=1)
+                    axes[0].set_title('Input (Noisy 1)', fontsize=12, fontweight='bold')
                     axes[0].axis('off')
                     
-                    axes[1].imshow(out_img, cmap='gray', vmin=0, vmax=1)
-                    axes[1].set_title('Output', fontsize=12, fontweight='bold')
+                    axes[1].imshow(denoised_img, cmap='gray', vmin=0, vmax=1)
+                    axes[1].set_title('Denoised', fontsize=12, fontweight='bold')
                     axes[1].axis('off')
                     
-                    axes[2].imshow(ce_img, cmap='gray', vmin=0, vmax=1)
-                    axes[2].set_title('Target (CE)', fontsize=12, fontweight='bold')
+                    axes[2].imshow(noisy2_img, cmap='gray', vmin=0, vmax=1)
+                    axes[2].set_title('Target (Noisy 2)', fontsize=12, fontweight='bold')
                     axes[2].axis('off')
                     
                     plt.tight_layout()
@@ -404,7 +404,7 @@ def train(args):
     
     # 데이터셋 생성
     print("\nLoading datasets...")
-    train_dataset = PseudoPairDataset(
+    train_dataset = Noise2NoiseDataset(
         args.train_csv,
         patch_size=args.patch_size,
         augment=True
@@ -413,7 +413,7 @@ def train(args):
     # Validation dataset (if provided)
     val_dataloader = None
     if args.val_csv:
-        val_dataset = PseudoPairDataset(
+        val_dataset = Noise2NoiseDataset(
             args.val_csv,
             patch_size=args.patch_size,
             augment=False
@@ -455,7 +455,7 @@ def train(args):
     
     # 학습 시작
     print(f"\n{'='*80}")
-    print("Starting Training")
+    print("Starting Noise2Noise Training (Self-supervised Denoising)")
     print(f"{'='*80}")
     print(f"Train samples: {len(train_dataset)}")
     if val_dataloader:
@@ -463,6 +463,8 @@ def train(args):
     print(f"Batch size: {args.batch_size}")
     print(f"Epochs: {args.epochs}")
     print(f"Learning rate: {args.lr}")
+    print(f"Strategy: Self-supervised (Noise2Noise)")
+    print(f"Goal: Denoise NC-CT while preserving structure")
     print(f"{'='*80}\n")
     
     best_psnr = 0
@@ -585,16 +587,16 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='NAFNet Supervised Training with Pretrained Model')
+    parser = argparse.ArgumentParser(description='NAFNet Noise2Noise Training (Self-supervised Denoising)')
     
     # Data
     parser.add_argument('--train_csv', type=str, required=True,
-                       help='Path to training pseudo-pairs CSV')
+                       help='Path to training Noise2Noise pairs CSV')
     parser.add_argument('--val_csv', type=str, default=None,
-                       help='Path to validation pseudo-pairs CSV (optional)')
+                       help='Path to validation Noise2Noise pairs CSV (optional)')
     parser.add_argument('--output_dir', type=str, default='Outputs',
                        help='Output directory for experiments')
-    parser.add_argument('--exp_name', type=str, default='nafnet_nc2ce',
+    parser.add_argument('--exp_name', type=str, default='nafnet_noise2noise',
                        help='Experiment name (creates subdirectory in output_dir)')
     
     # Pretrained model

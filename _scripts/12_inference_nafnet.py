@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-NAFNet Inference Script
-학습된 NAFNet 모델로 테스트 이미지 denoising 수행
+NAFNet Denoising Inference Script
+학습된 Noise2Noise 모델로 NC-CT denoising 수행
+Stage 1 결과: Clean NC-CT 생성
 """
 
 import torch
@@ -13,6 +14,7 @@ from PIL import Image
 import argparse
 from tqdm import tqdm
 import yaml
+import pandas as pd
 
 
 class NAFBlock(nn.Module):
@@ -153,24 +155,36 @@ class NAFNet(nn.Module):
 
 
 class InferenceDataset(Dataset):
-    """Inference용 데이터셋"""
-    def __init__(self, image_dir):
-        self.image_dir = Path(image_dir)
-        self.image_files = sorted(list(self.image_dir.glob('*.png')) + 
-                                 list(self.image_dir.glob('*.jpg')) + 
-                                 list(self.image_dir.glob('*.jpeg')))
-        print(f"Found {len(self.image_files)} images")
+    """Inference용 데이터셋 - 3D CT volumes 처리"""
+    def __init__(self, csv_path, root_dir):
+        self.csv_path = Path(csv_path)
+        self.root_dir = Path(root_dir)
+        self.pairs_df = pd.read_csv(csv_path)
+        
+        # Get unique NC volumes
+        self.nc_volumes = self.pairs_df['input_nc_norm'].unique()
+        print(f"Found {len(self.nc_volumes)} NC volumes to process")
     
     def __len__(self):
-        return len(self.image_files)
+        return len(self.nc_volumes)
     
     def __getitem__(self, idx):
-        img_path = self.image_files[idx]
-        img = Image.open(img_path).convert('RGB')
-        img = np.array(img).astype(np.float32) / 255.0
-        img = torch.from_numpy(img).permute(2, 0, 1)  # HWC -> CHW
+        nc_path = Path(self.nc_volumes[idx])
         
-        return img, img_path.name
+        # Load full volume
+        import SimpleITK as sitk
+        nc_img = sitk.ReadImage(str(nc_path))
+        nc_arr = sitk.GetArrayFromImage(nc_img).astype(np.float32)
+        
+        # Get patient ID from path
+        patient_id = nc_path.stem.split('_')[0]
+        
+        return {
+            'volume': nc_arr,
+            'path': str(nc_path),
+            'patient_id': patient_id,
+            'sitk_image': nc_img  # Keep original for saving with metadata
+        }
 
 
 def load_model(checkpoint_path, device):
@@ -211,47 +225,78 @@ def load_model(checkpoint_path, device):
     return model
 
 
-def save_image(tensor, path):
-    """텐서를 이미지로 저장"""
-    img = tensor.cpu().numpy()
-    img = np.clip(img * 255, 0, 255).astype(np.uint8)
-    img = np.transpose(img, (1, 2, 0))  # CHW -> HWC
-    Image.fromarray(img).save(path)
-
-
 def inference(model, dataloader, output_dir, device):
-    """Inference 수행"""
+    """Inference 수행 - 3D volumes을 slice-by-slice로 처리"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"\nStarting inference...")
+    print(f"\nStarting denoising inference...")
     print(f"Output directory: {output_dir}")
     
-    with torch.no_grad():
-        for noisy_img, filenames in tqdm(dataloader, desc="Processing"):
-            noisy_img = noisy_img.to(device)
-            
-            # Denoising
-            denoised_img = model(noisy_img)
-            
-            # 배치의 각 이미지 저장
-            for i, filename in enumerate(filenames):
-                output_path = output_dir / filename
-                save_image(denoised_img[i], output_path)
+    import SimpleITK as sitk
     
-    print(f"\nInference completed! Results saved to {output_dir}")
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Processing volumes"):
+            # Batch size는 1로 가정 (volumes은 크기가 다를 수 있음)
+            volume = batch['volume'][0].numpy()  # [D, H, W]
+            patient_id = batch['patient_id'][0]
+            original_path = batch['path'][0]
+            sitk_image = batch['sitk_image']
+            
+            D, H, W = volume.shape
+            denoised_volume = np.zeros_like(volume)
+            
+            # Process each slice
+            for slice_idx in tqdm(range(D), desc=f"  [{patient_id}]", leave=False):
+                # Prepare slice
+                slice_2d = volume[slice_idx]  # [H, W]
+                
+                # Convert to tensor [1, 3, H, W] (batch=1, RGB channels)
+                slice_tensor = torch.from_numpy(slice_2d).unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                slice_tensor = slice_tensor.repeat(1, 3, 1, 1)  # [1, 3, H, W]
+                slice_tensor = slice_tensor.to(device)
+                
+                # Denoise
+                denoised_slice = model(slice_tensor)
+                
+                # Extract first channel and convert back to numpy
+                denoised_slice = denoised_slice[0, 0].cpu().numpy()  # [H, W]
+                denoised_volume[slice_idx] = denoised_slice
+            
+            # Save denoised volume as NIfTI with original metadata
+            output_filename = f"{patient_id}_denoised.nii.gz"
+            output_path = output_dir / output_filename
+            
+            # Create SimpleITK image with denoised data but original metadata
+            denoised_sitk = sitk.GetImageFromArray(denoised_volume.astype(np.float32))
+            
+            # Copy metadata from original
+            if len(sitk_image) > 0:
+                original_img = sitk_image[0]
+                denoised_sitk.SetSpacing(original_img.GetSpacing())
+                denoised_sitk.SetOrigin(original_img.GetOrigin())
+                denoised_sitk.SetDirection(original_img.GetDirection())
+            
+            sitk.WriteImage(denoised_sitk, str(output_path))
+            
+            print(f"  ✓ Saved: {output_filename} ({D} slices)")
+    
+    print(f"\n{'='*80}")
+    print("Denoising completed!")
+    print(f"Results saved to: {output_dir}")
+    print(f"{'='*80}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='NAFNet Inference')
+    parser = argparse.ArgumentParser(description='NAFNet Denoising Inference')
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
-    parser.add_argument('--input_dir', type=str, required=True,
-                       help='Directory containing noisy images')
-    parser.add_argument('--output_dir', type=str, default='results/denoised',
-                       help='Directory to save denoised images')
-    parser.add_argument('--batch_size', type=int, default=1,
-                       help='Batch size for inference')
+    parser.add_argument('--pairs_csv', type=str, required=True,
+                       help='Path to pairs.csv containing NC volume paths')
+    parser.add_argument('--root_dir', type=str, default='E:\\LD-CT SR',
+                       help='Root directory')
+    parser.add_argument('--output_dir', type=str, default='Data/denoised_nc',
+                       help='Directory to save denoised volumes')
     parser.add_argument('--device', type=str, default='cuda',
                        choices=['cuda', 'cpu'], help='Device to use')
     
@@ -265,17 +310,20 @@ def main():
     model = load_model(args.checkpoint, device)
     
     # 데이터셋 및 데이터로더 생성
-    dataset = InferenceDataset(args.input_dir)
+    dataset = InferenceDataset(args.pairs_csv, args.root_dir)
+    
+    # Batch size는 1로 고정 (volumes은 크기가 다를 수 있음)
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=1,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True if device.type == 'cuda' else False
+        num_workers=0,  # SimpleITK는 multiprocessing과 충돌 가능
+        pin_memory=False
     )
     
     # Inference 수행
-    inference(model, dataloader, args.output_dir, device)
+    output_dir = Path(args.root_dir) / args.output_dir
+    inference(model, dataloader, output_dir, device)
 
 
 if __name__ == '__main__':
