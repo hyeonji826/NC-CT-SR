@@ -1,6 +1,17 @@
+#!/usr/bin/env python3
 """
 03_seg_guided_finetune.py
+Phase 2: Segmentation-Guided Fine-Tuning (Advanced)
 
+주요 개선:
+✅ 조영 스타일 가중치 스케줄러 (Warmup → Strong → Fine-tune)
+✅ 학습률 Warmup + Cosine Annealing
+✅ Weight Decay 스케줄러
+✅ Validation Set 분리
+✅ Early Stopping
+✅ Gradient Accumulation
+✅ Mixed Precision Training
+✅ 과적합 방지 (Dropout, Label Smoothing)
 """
 
 import torch
@@ -416,8 +427,7 @@ class AdvancedTrainer:
         # Model
         print("\n모델 로딩...")
         self.model = StructurePreservingStyleTransfer(
-            base_channels=args.base_channels,
-            dropout_rate=args.dropout
+            base_channels=args.base_channels
         )
         
         # Load Phase 1

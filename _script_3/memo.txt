@@ -29,9 +29,4 @@ python _script_3/02_train_nc_to_ce.py \
     --anatomy-weight 2.0
 
 
-python _script_3/04_seg_guided_finetune.py \
-  --exp-dir E:\LD-CT SR\experiments\nc_to_ce_phase2_advanced \
-  --epochs 200 \
-  --batch-size 8 \
-  --use-amp \
-  --patience 20
+python _script_3/04_seg_guided_finetune.py --exp-dir "E:\LD-CT SR\experiments\nc_to_ce_phase2" --epochs 200 --batch-size 8 --use-amp --patience 20
