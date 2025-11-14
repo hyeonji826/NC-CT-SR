@@ -1,0 +1,17 @@
+python _scripts_2/04_train_denoiser.py \
+  --train-csv "E:\LD-CT SR\Data2\pairs\train_pairs.csv" \
+  --val-csv "E:\LD-CT SR\Data2\pairs\val_pairs.csv" \
+  --pretrained "E:\LD-CT SR\Weights\NAFNet-SIDD-width32.pth" \
+  --exp-dir "E:\LD-CT SR\Outputs\experiments\synthetic_denoiser" \
+  --epochs 50 \
+  --batch-size 4
+
+
+
+python _scripts_2/05_train_enhancer.py \
+  --train-csv "E:\LD-CT SR\Data2\pairs\train_pairs.csv" \
+  --val-csv "E:\LD-CT SR\Data2\pairs\val_pairs.csv" \
+  --pretrained-denoiser "E:\LD-CT SR\Outputs\experiments\synthetic_denoiser\ckpt\best.pth" \
+  --exp-dir "E:\LD-CT SR\Outputs\experiments\quality_enhancer" \
+  --epochs 30 \
+  --batch-size 4
