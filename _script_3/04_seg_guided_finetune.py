@@ -1,17 +1,7 @@
-#!/usr/bin/env python3
 """
 03_seg_guided_finetune.py
 Phase 2: Segmentation-Guided Fine-Tuning (Advanced)
 
-주요 개선:
-✅ 조영 스타일 가중치 스케줄러 (Warmup → Strong → Fine-tune)
-✅ 학습률 Warmup + Cosine Annealing
-✅ Weight Decay 스케줄러
-✅ Validation Set 분리
-✅ Early Stopping
-✅ Gradient Accumulation
-✅ Mixed Precision Training
-✅ 과적합 방지 (Dropout, Label Smoothing)
 """
 
 import torch
@@ -161,25 +151,44 @@ class EarlyStopping:
 class WeightedNCCEDataset(Dataset):
     """NC + CE + Weight Map Dataset"""
     def __init__(self, nc_dir, ce_dir, weight_dir, image_size=256, augment=True, 
-                 train_ratio=0.85, is_train=True, seed=42):
+                 split='train', split_info_path=None, train_ratio=0.85, seed=42):
+        """
+        Args:
+            split: 'train', 'val', or 'test'
+            split_info_path: split_info.json 경로 (있으면 사용, 없으면 자동 분할)
+        """
         self.nc_dir = Path(nc_dir)
         self.ce_dir = Path(ce_dir)
         self.weight_dir = Path(weight_dir)
         self.image_size = image_size
-        self.augment = augment and is_train
+        self.augment = augment and (split == 'train')
         
-        # NC 환자 수집
-        nc_patients = sorted([p for p in self.nc_dir.iterdir() if p.is_dir()])
-        
-        # Train/Val split
-        random.seed(seed)
-        random.shuffle(nc_patients)
-        split_idx = int(len(nc_patients) * train_ratio)
-        
-        if is_train:
-            nc_patients = nc_patients[:split_idx]
+        # Load split info
+        if split_info_path and Path(split_info_path).exists():
+            # Use pre-defined split
+            import json
+            with open(split_info_path, 'r') as f:
+                split_info = json.load(f)
+            
+            patient_ids = split_info[split]['ids']
+            nc_patients = [self.nc_dir / pid for pid in patient_ids if (self.nc_dir / pid).is_dir()]
         else:
-            nc_patients = nc_patients[split_idx:]
+            # Auto split
+            nc_patients = sorted([p for p in self.nc_dir.iterdir() if p.is_dir()])
+            
+            random.seed(seed)
+            random.shuffle(nc_patients)
+            
+            if split == 'train':
+                split_idx = int(len(nc_patients) * train_ratio)
+                nc_patients = nc_patients[:split_idx]
+            elif split == 'val':
+                split_idx = int(len(nc_patients) * train_ratio)
+                nc_patients = nc_patients[split_idx:]
+            else:  # test
+                # Test는 Val과 동일하게 처리 (split_info 없을 때)
+                split_idx = int(len(nc_patients) * train_ratio)
+                nc_patients = nc_patients[split_idx:]
         
         # NC 슬라이스 수집
         self.nc_slices = []
@@ -217,7 +226,7 @@ class WeightedNCCEDataset(Dataset):
                         'slice_idx': slice_idx
                     })
         
-        split_name = "Train" if is_train else "Val"
+        split_name = split.capitalize()
         print(f"{split_name} NC slices: {len(self.nc_slices)}")
         print(f"CE slices (shared): {len(self.ce_slices)}")
     
@@ -509,8 +518,9 @@ class AdvancedTrainer:
             weight_dir=args.weight_dir,
             image_size=args.image_size,
             augment=True,
+            split='train',
+            split_info_path=args.split_info,
             train_ratio=args.train_ratio,
-            is_train=True,
             seed=args.seed
         )
         
@@ -520,8 +530,9 @@ class AdvancedTrainer:
             weight_dir=args.weight_dir,
             image_size=args.image_size,
             augment=False,
+            split='val',
+            split_info_path=args.split_info,
             train_ratio=args.train_ratio,
-            is_train=False,
             seed=args.seed
         )
         
@@ -877,6 +888,9 @@ def main():
                        default=r'E:\LD-CT SR\Data\nii_preproc_norm\CE')
     parser.add_argument('--weight-dir', type=str,
                        default=r'E:\LD-CT SR\Data\weight_maps')
+    parser.add_argument('--split-info', type=str,
+                       default=r'E:\LD-CT SR\Data\split_info.json',
+                       help='Train/Val/Test split info (optional)')
     parser.add_argument('--load-checkpoint', type=str,
                        default=r'E:\LD-CT SR\experiments\nc_to_ce_phase1\checkpoints\best.pth')
     parser.add_argument('--exp-dir', type=str, required=True)
