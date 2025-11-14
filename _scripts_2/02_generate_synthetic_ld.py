@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
 02_generate_synthetic_ld.py
 NC (표준선량) → Synthetic LD (저선량) 변환
-물리적 노이즈 모델: Poisson + Gaussian
+개선된 물리적 CT 노이즈 모델
 """
 
 import numpy as np
@@ -11,112 +10,168 @@ import SimpleITK as sitk
 from tqdm import tqdm
 import argparse
 import matplotlib.pyplot as plt
+import cv2
+from scipy.ndimage import gaussian_filter
 
 
-class CTNoiseSimulator:
+class ImprovedCTNoiseSimulator:
     """
-    CT 저선량 노이즈 시뮬레이터
+    개선된 CT 저선량 노이즈 시뮬레이터
     
-    물리적 근거:
-    1. Poisson noise: X-ray photon counting 과정에서 발생
-    2. Gaussian noise: 전자 노이즈 (detector, readout)
-    
-    피폭량 감소 → photon count 감소 → 노이즈 증가
+    실제 CT 물리학 기반:
+    1. Quantum noise (Poisson) - photon counting
+    2. Electronic noise (Gaussian) - detector readout
+    3. Correlated noise - low-frequency artifacts
+    4. Streak artifacts - beam hardening simulation
     """
     
     def __init__(self, dose_reduction_factor=12, seed=42):
-        """
-        Args:
-            dose_reduction_factor: 피폭량 감소 비율 (12 = 1/12배)
-            seed: 랜덤 시드
-        """
         self.dose_factor = dose_reduction_factor
         self.seed = seed
         np.random.seed(seed)
         
-        # 노이즈 파라미터 (경험적 값)
-        self.poisson_scale = 0.1  # Poisson 강도
-        self.gaussian_std = 0.02  # Gaussian 표준편차
+        # 노이즈 파라미터 (실제 CT 기반 조정)
+        self.quantum_scale = 0.15  # Quantum noise 강도
+        self.electronic_std = 0.015  # Electronic noise
+        self.correlated_sigma = 1.5  # Correlated noise blur
+        self.correlated_strength = 0.02  # Correlated noise 강도
         
-    def add_poisson_noise(self, image):
+    def add_quantum_noise(self, image):
         """
-        Poisson 노이즈 추가
+        Quantum (Poisson) noise
         
-        저선량: photon count ↓ → signal-dependent noise ↑
+        실제 CT: photon count ∝ e^(-μx)
+        저선량: 더 적은 photon → 더 큰 variance
         """
-        # 음수 방지
-        image_shifted = image + 1.0  # [0, 1] → [1, 2]
+        # HU space로 변환 (CT 물리학 적용)
+        # [0, 1] → [-1000, 1000] HU (approximate)
+        hu = (image - 0.5) * 2000
         
-        # Dose reduction 시뮬레이션
-        # 낮은 선량 = 낮은 photon count = 높은 noise
-        photon_count = image_shifted / self.dose_factor
+        # Exponential attenuation 시뮬레이션
+        # I = I0 * e^(-μx)
+        mu = 0.02  # Typical attenuation coefficient
+        I0 = 10000 / self.dose_factor  # Incident photon count (dose-dependent)
         
-        # Poisson sampling
-        noisy = np.random.poisson(photon_count * 1000) / 1000.0
+        # Linear attenuation coefficient from HU
+        # μ ∝ HU + 1000
+        mu_eff = (hu + 1000) / 1000 * mu
         
-        # 원래 범위로 복원
-        noisy = noisy * self.dose_factor - 1.0
+        # Transmitted photon count
+        transmitted = I0 * np.exp(-mu_eff)
+        transmitted = np.maximum(transmitted, 1)  # Avoid zero
         
-        return noisy
+        # Poisson noise
+        noisy_transmitted = np.random.poisson(transmitted)
+        
+        # Back to HU
+        noisy_mu = -np.log(noisy_transmitted / I0)
+        noisy_hu = noisy_mu / mu * 1000 - 1000
+        
+        # Clip and normalize back to [0, 1]
+        noisy_hu = np.clip(noisy_hu, -1000, 1000)
+        noisy_image = noisy_hu / 2000 + 0.5
+        
+        return noisy_image
     
-    def add_gaussian_noise(self, image):
+    def add_electronic_noise(self, image):
         """
-        Gaussian 노이즈 추가
-        
-        전자 노이즈는 signal-independent
+        Electronic (Gaussian) noise
+        Detector readout 과정의 노이즈
         """
-        noise = np.random.normal(0, self.gaussian_std, image.shape)
+        noise = np.random.normal(0, self.electronic_std, image.shape)
         return image + noise
+    
+    def add_correlated_noise(self, image):
+        """
+        Correlated noise
+        실제 CT에서 인접 픽셀은 상관관계 있음
+        """
+        # Low-frequency noise 생성
+        low_freq_noise = np.random.normal(0, self.correlated_strength, image.shape)
+        
+        # Gaussian blur로 상관관계 부여
+        correlated_noise = gaussian_filter(low_freq_noise, sigma=self.correlated_sigma)
+        
+        return image + correlated_noise
+    
+    def add_streak_artifacts(self, image, num_streaks=3):
+        """
+        Streak artifacts (선형 아티팩트)
+        뼈, metal 주변에서 발생하는 beam hardening 시뮬레이션
+        """
+        h, w = image.shape
+        artifact_image = image.copy()
+        
+        # 고밀도 영역 찾기 (뼈 등)
+        high_density_mask = image > 0.7
+        
+        if high_density_mask.sum() > 100:  # 충분한 고밀도 영역이 있으면
+            # 고밀도 영역에서 랜덤하게 streak 시작점 선택
+            high_density_coords = np.argwhere(high_density_mask)
+            
+            for _ in range(num_streaks):
+                if len(high_density_coords) == 0:
+                    break
+                
+                # 랜덤 시작점
+                start_idx = np.random.randint(len(high_density_coords))
+                start_y, start_x = high_density_coords[start_idx]
+                
+                # 랜덤 방향
+                angle = np.random.uniform(0, 2 * np.pi)
+                
+                # Streak 생성 (가느다란 선)
+                length = np.random.randint(50, 150)
+                intensity = np.random.uniform(-0.02, 0.02)
+                
+                for i in range(length):
+                    y = int(start_y + i * np.sin(angle))
+                    x = int(start_x + i * np.cos(angle))
+                    
+                    if 0 <= y < h and 0 <= x < w:
+                        # Gaussian falloff
+                        falloff = np.exp(-i / (length * 0.3))
+                        artifact_image[y, x] += intensity * falloff
+        
+        return np.clip(artifact_image, 0, 1)
     
     def simulate_low_dose(self, image):
         """
-        전체 저선량 시뮬레이션
-        
-        Args:
-            image: 표준선량 CT (normalized [0, 1])
-        
-        Returns:
-            noisy_image: 저선량 CT
+        전체 저선량 시뮬레이션 파이프라인
         """
-        # Step 1: Poisson noise (photon counting)
-        noisy = self.add_poisson_noise(image)
+        # Step 1: Quantum noise (가장 중요)
+        noisy = self.add_quantum_noise(image)
         
-        # Step 2: Gaussian noise (electronic)
-        noisy = self.add_gaussian_noise(noisy)
+        # Step 2: Electronic noise
+        noisy = self.add_electronic_noise(noisy)
         
-        # Clip to valid range
+        # Step 3: Correlated noise
+        noisy = self.add_correlated_noise(noisy)
+        
+        # Step 4: Streak artifacts (occasional)
+        if np.random.random() > 0.7:  # 30% 확률
+            noisy = self.add_streak_artifacts(noisy, num_streaks=np.random.randint(1, 4))
+        
+        # Final clip
         noisy = np.clip(noisy, 0, 1)
         
         return noisy
 
 
 def process_patient(nc_path, output_path, simulator, sample_dir=None, visualize=False):
-    """
-    환자 1명의 NC → Synthetic LD 변환
-    
-    Args:
-        nc_path: NC_norm.nii.gz 경로
-        output_path: 출력 경로
-        simulator: CTNoiseSimulator 인스턴스
-        sample_dir: 샘플 저장 경로
-        visualize: 시각화 여부
-    """
-    # Load NC
+    """환자 1명 처리"""
     img = sitk.ReadImage(str(nc_path))
-    arr = sitk.GetArrayFromImage(img)  # (Z, H, W)
+    arr = sitk.GetArrayFromImage(img)
     
-    # Simulate LD
     noisy_arr = np.zeros_like(arr)
     for z in range(arr.shape[0]):
         noisy_arr[z] = simulator.simulate_low_dose(arr[z])
     
-    # Save
     output_path.parent.mkdir(parents=True, exist_ok=True)
     noisy_img = sitk.GetImageFromArray(noisy_arr)
     noisy_img.CopyInformation(img)
     sitk.WriteImage(noisy_img, str(output_path))
     
-    # Visualize (optional)
     if visualize and sample_dir is not None:
         sample_dir = Path(sample_dir)
         sample_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +179,6 @@ def process_patient(nc_path, output_path, simulator, sample_dir=None, visualize=
         patient_id = output_path.parent.name
         num_slices = arr.shape[0]
         
-        # 여러 슬라이스 비교 (4개)
         slice_indices = [
             num_slices // 4,
             num_slices // 2 - 5,
@@ -132,20 +186,20 @@ def process_patient(nc_path, output_path, simulator, sample_dir=None, visualize=
             3 * num_slices // 4
         ]
         
-        fig, axes = plt.subplots(4, 3, figsize=(15, 20))
-        fig.suptitle(f'Patient {patient_id} - Synthetic LD Generation\n'
+        fig, axes = plt.subplots(4, 4, figsize=(18, 20))
+        fig.suptitle(f'Patient {patient_id} - Realistic CT Noise Simulation\n'
                     f'Dose Reduction: 1/{simulator.dose_factor}x', 
                     fontsize=16, fontweight='bold')
         
         for row, slice_idx in enumerate(slice_indices):
             # Original
             axes[row, 0].imshow(arr[slice_idx], cmap='gray', vmin=0, vmax=1)
-            axes[row, 0].set_title(f'Slice {slice_idx}: Original NC (Standard Dose)')
+            axes[row, 0].set_title(f'Slice {slice_idx}: Original NC')
             axes[row, 0].axis('off')
             
             # Synthetic LD
             axes[row, 1].imshow(noisy_arr[slice_idx], cmap='gray', vmin=0, vmax=1)
-            axes[row, 1].set_title(f'Synthetic LD (1/{simulator.dose_factor}x dose)')
+            axes[row, 1].set_title(f'Synthetic LD (Realistic)')
             axes[row, 1].axis('off')
             
             # Noise Map
@@ -153,11 +207,18 @@ def process_patient(nc_path, output_path, simulator, sample_dir=None, visualize=
             im = axes[row, 2].imshow(diff, cmap='hot', vmin=0, vmax=0.15)
             axes[row, 2].set_title(f'Noise Map (mean: {diff.mean():.4f})')
             axes[row, 2].axis('off')
+            
+            # Noise histogram
+            axes[row, 3].hist(diff.flatten(), bins=50, alpha=0.7, edgecolor='black')
+            axes[row, 3].set_title(f'Noise Distribution')
+            axes[row, 3].set_xlabel('Noise Level')
+            axes[row, 3].set_ylabel('Frequency')
+            axes[row, 3].grid(True, alpha=0.3)
         
         plt.colorbar(im, ax=axes[:, 2], fraction=0.046, pad=0.04)
         plt.tight_layout()
         
-        save_path = sample_dir / f'{patient_id}_comparison.png'
+        save_path = sample_dir / f'{patient_id}_realistic_noise.png'
         plt.savefig(save_path, dpi=100, bbox_inches='tight')
         plt.close()
         
@@ -167,23 +228,17 @@ def process_patient(nc_path, output_path, simulator, sample_dir=None, visualize=
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate Synthetic Low-Dose CT')
+    parser = argparse.ArgumentParser(description='Generate Realistic Synthetic Low-Dose CT')
     
     parser.add_argument('--input-dir', type=str, 
-                       default=r'E:\LD-CT SR\Data\nii_preproc_norm\NC',
-                       help='NC 데이터 경로')
+                       default=r'E:\LD-CT SR\Data\nii_preproc_norm\NC')
     parser.add_argument('--output-dir', type=str,
-                       default=r'E:\LD-CT SR\Data2\synthetic_ld\NC',
-                       help='Synthetic LD 출력 경로')
+                       default=r'E:\LD-CT SR\Data2\synthetic_ld\NC')
     parser.add_argument('--sample-dir', type=str,
-                       default=r'E:\LD-CT SR\Data2\samples\synthetic_ld',
-                       help='샘플 비교 이미지 저장 경로')
-    parser.add_argument('--dose-reduction', type=int, default=12,
-                       help='피폭량 감소 비율 (12 = 1/12배)')
-    parser.add_argument('--visualize-samples', type=int, default=10,
-                       help='시각화할 샘플 수')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='랜덤 시드')
+                       default=r'E:\LD-CT SR\Data2\samples\synthetic_ld')
+    parser.add_argument('--dose-reduction', type=int, default=12)
+    parser.add_argument('--visualize-samples', type=int, default=10)
+    parser.add_argument('--seed', type=int, default=42)
     
     args = parser.parse_args()
     
@@ -192,62 +247,56 @@ def main():
     sample_dir = Path(args.sample_dir)
     
     print("="*80)
-    print("Synthetic Low-Dose CT 생성")
+    print("Realistic Synthetic Low-Dose CT 생성")
     print("="*80)
     print(f"입력: {input_dir}")
     print(f"출력: {output_dir}")
     print(f"샘플: {sample_dir}")
     print(f"피폭량 감소: 1/{args.dose_reduction}x")
+    print("\n물리적 노이즈 모델:")
+    print("  - Quantum noise (Poisson)")
+    print("  - Electronic noise (Gaussian)")
+    print("  - Correlated noise (Low-frequency)")
+    print("  - Streak artifacts (Beam hardening)")
     print("="*80)
     
-    # 노이즈 시뮬레이터 초기화
-    simulator = CTNoiseSimulator(
+    simulator = ImprovedCTNoiseSimulator(
         dose_reduction_factor=args.dose_reduction,
         seed=args.seed
     )
     
-    # 환자 목록
     patient_dirs = sorted([p for p in input_dir.iterdir() if p.is_dir()])
     print(f"\n총 환자 수: {len(patient_dirs)}")
     
-    # 처리
     visualize_count = 0
     for patient_dir in tqdm(patient_dirs, desc="Processing"):
         patient_id = patient_dir.name
         nc_path = patient_dir / 'NC_norm.nii.gz'
         
         if not nc_path.exists():
-            print(f"Missing: {nc_path}")
             continue
         
-        # 출력 경로
         output_path = output_dir / patient_id / 'NC_synthetic_ld.nii.gz'
-        
-        # 시각화 여부
         visualize = visualize_count < args.visualize_samples
         
-        # 처리
         clean, noisy = process_patient(nc_path, output_path, simulator, sample_dir, visualize)
         
         if visualize:
             visualize_count += 1
             
-            # 노이즈 통계
             if clean is not None:
                 noise = noisy - clean
                 print(f"\n환자 {patient_id} 노이즈 통계:")
                 print(f"  Clean mean: {clean.mean():.4f}, std: {clean.std():.4f}")
                 print(f"  Noisy mean: {noisy.mean():.4f}, std: {noisy.std():.4f}")
                 print(f"  Noise mean: {noise.mean():.4f}, std: {noise.std():.4f}")
+                print(f"  SNR (estimate): {clean.mean() / noise.std():.2f}")
     
     print("\n" + "="*80)
     print("완료!")
     print(f"출력 경로: {output_dir}")
+    print(f"샘플 경로: {sample_dir}")
     print("="*80)
-    
-    # 요약 통계
-    print("\n[통계 요약]")
-    print(f"처리된 환자 수: {len(list(output_dir.glob('*/NC_synthetic_ld.nii.gz')))}")
 
 
 if __name__ == '__main__':

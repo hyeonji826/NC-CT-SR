@@ -14,9 +14,11 @@
 # Allowlist: code directory
 # ============================
 !/_scripts/
-!/_scripts_2/
 !/_scripts/**/*.py
+!/_scripts_2/
 !/_scripts_2/**/*.py
+!/_script_3/
+!/_script_3/**/*.py
 
 # Optional: allow external library code
 # !/SwinIR/**

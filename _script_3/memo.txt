@@ -1,0 +1,37 @@
+python _script_3/02_train_nc_to_ce.py \
+    --nc-dir "E:\LD-CT SR\Data\nii_preproc_norm\NC" \
+    --ce-dir "E:\LD-CT SR\Data\nii_preproc_norm\CE" \
+    --exp-dir "E:\LD-CT SR\experiments\nc_to_ce_phase1" \
+    --epochs 100 \
+    --batch-size 4 \
+    --image-size 256 \
+    --content-weight 7.0 \
+    --style-weight 50.0 \
+    --perceptual-weight 5.0 \
+    --anatomy-weight 3.0
+
+python 02_train_nc_to_ce.py \
+    --exp-dir "E:\LD-CT SR\experiments\nc_to_ce_phase1" \
+    --epochs 100 \
+    --batch-size 4 \
+    --content-weight 5.0 \    
+    --style-weight 50.0 \      
+    --perceptual-weight 2.0 \
+    --anatomy-weight 2.0
+
+python _script_3/02_train_nc_to_ce.py \
+    --exp-dir "E:\LD-CT SR\experiments\nc_to_ce_phase1_v2" \
+    --epochs 100 \
+    --batch-size 4 \
+    --content-weight 5.0 \      
+    --style-weight 50.0 \        
+    --perceptual-weight 2.0 \
+    --anatomy-weight 2.0
+
+
+python _script_3/04_seg_guided_finetune.py \
+  --exp-dir E:\LD-CT SR\experiments\nc_to_ce_phase2_advanced \
+  --epochs 200 \
+  --batch-size 8 \
+  --use-amp \
+  --patience 20
