@@ -17,8 +17,12 @@
 !/_scripts/**/*.py
 !/_scripts_2/
 !/_scripts_2/**/*.py
-!/_script_3/
-!/_script_3/**/*.py
+!/_scripts_3/
+!/_scripts_3/**/*.py
+!/_scripts_4_wavelet/
+!/_scripts_4_wavelet/**/*.py
+
+
 
 # Optional: allow external library code
 # !/SwinIR/**
