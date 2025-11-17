@@ -635,6 +635,7 @@ def main():
     parser.add_argument('--weight-dir', type=str, required=True,
                        help='Weight map 디렉토리')
     parser.add_argument('--split-info', type=str,
+                       default=r'E:\LD-CT SR\Data\split_info.json',
                        help='split_info.json 경로 (Test set 필터링)')
     parser.add_argument('--split', type=str, default='test',
                        choices=['train', 'val', 'test'],

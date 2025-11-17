@@ -29,4 +29,19 @@ python _script_3/02_train_nc_to_ce.py \
     --anatomy-weight 2.0
 
 
-python _script_3/04_seg_guided_finetune.py --exp-dir "E:\LD-CT SR\experiments\nc_to_ce_phase2" --epochs 200 --batch-size 8 --use-amp --patience 20
+python _script_3/04_seg_guided_finetune.py --exp-dir "E:\LD-CT SR\experiments\nc_to_ce_phase2" --epochs 200 --batch-size 8 --use-amp --patience 20 --style-weight 30
+
+# 단 한 줄로!
+python 05_auto_inference_pipeline.py \
+  --dicom-dir NEW_DICOM_FOLDER \
+  --checkpoint best.pth \
+  --output-dir OUTPUT
+
+python _script_3/06_test_evaluation.py \
+  --nc-dir "E:\LD-CT SR\Data\nii_preproc_norm\NC" \
+  --ce-dir "E:\LD-CT SR\Data\nii_preproc_norm\CE" \
+  --seg-dir "E:\LD-CT SR\Data\segmentation" \
+  --weight-dir "E:\LD-CT SR\Data\weight_maps" \
+  --checkpoint "E:\LD-CT SR\experiments\nc_to_ce_phase2\checkpoints\best.pth" \
+  --output-dir "E:\LD-CT SR\Results\test_evaluation" \
+  --visualize-count 10

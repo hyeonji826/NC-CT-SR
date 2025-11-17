@@ -1,7 +1,15 @@
 """
-03_seg_guided_finetune.py
+04_seg_guided_finetune.py
 Phase 2: Segmentation-Guided Fine-Tuning (Advanced)
 
+  조영 스타일 가중치 스케줄러 (Warmup → Strong → Fine-tune)
+  학습률 Warmup + Cosine Annealing
+  Weight Decay 스케줄러
+  Validation Set 분리
+  Early Stopping
+  Gradient Accumulation
+  Mixed Precision Training
+ 과적합 방지 (Dropout, Label Smoothing)
 """
 
 import torch
@@ -38,36 +46,45 @@ class StyleWeightScheduler:
     """
     조영 스타일 가중치 스케줄러
     
-    Phase 1 (Warmup): 부드럽게 시작 (0 → 50%)
-    Phase 2 (Strong): 강한 학습 (50% → 80%)
-    Phase 3 (Fine-tune): 세밀하게 조정 (80% → 100%)
+    Phase 1 (Warmup): 매우 부드럽게 시작 (0 → 20%)
+    Phase 2 (Ramp): 점진적 증가 (20% → 80%)
+    Phase 3 (Strong): 최대 강도 (80% → 100%)
+    Phase 4 (Fine-tune): 약간 감소 (100% → 90%)
     """
-    def __init__(self, base_weight, total_epochs, warmup_ratio=0.2, strong_ratio=0.5):
+    def __init__(self, base_weight, total_epochs, 
+                 warmup_ratio=0.3, ramp_ratio=0.5, strong_ratio=0.8):
         self.base_weight = base_weight
         self.total_epochs = total_epochs
         self.warmup_epochs = int(total_epochs * warmup_ratio)
-        self.strong_end_epoch = int(total_epochs * strong_ratio)
+        self.ramp_epochs = int(total_epochs * ramp_ratio)
+        self.strong_epochs = int(total_epochs * strong_ratio)
         
         print(f"\n📊 Style Weight Schedule:")
-        print(f"  Warmup (0→50%): epochs 0-{self.warmup_epochs}")
-        print(f"  Strong (50%→100%): epochs {self.warmup_epochs}-{self.strong_end_epoch}")
-        print(f"  Fine-tune (100%→80%): epochs {self.strong_end_epoch}-{total_epochs}")
+        print(f"  Warmup (0→20%): epochs 0-{self.warmup_epochs}")
+        print(f"  Ramp (20%→80%): epochs {self.warmup_epochs}-{self.ramp_epochs}")
+        print(f"  Strong (80%→100%): epochs {self.ramp_epochs}-{self.strong_epochs}")
+        print(f"  Fine-tune (100%→90%): epochs {self.strong_epochs}-{total_epochs}")
     
     def get_weight(self, epoch):
         if epoch < self.warmup_epochs:
-            # Warmup: 0 → 50%
+            # Warmup: 0 → 20% (매우 천천히)
             ratio = epoch / self.warmup_epochs
-            return self.base_weight * (0.5 * ratio)
+            return self.base_weight * (0.2 * ratio)
         
-        elif epoch < self.strong_end_epoch:
-            # Strong: 50% → 100%
-            progress = (epoch - self.warmup_epochs) / (self.strong_end_epoch - self.warmup_epochs)
-            return self.base_weight * (0.5 + 0.5 * progress)
+        elif epoch < self.ramp_epochs:
+            # Ramp: 20% → 80% (점진적)
+            progress = (epoch - self.warmup_epochs) / (self.ramp_epochs - self.warmup_epochs)
+            return self.base_weight * (0.2 + 0.6 * progress)
+        
+        elif epoch < self.strong_epochs:
+            # Strong: 80% → 100% (본격 학습)
+            progress = (epoch - self.ramp_epochs) / (self.strong_epochs - self.ramp_epochs)
+            return self.base_weight * (0.8 + 0.2 * progress)
         
         else:
-            # Fine-tune: 100% → 80% (살짝 낮춰서 과적합 방지)
-            progress = (epoch - self.strong_end_epoch) / (self.total_epochs - self.strong_end_epoch)
-            return self.base_weight * (1.0 - 0.2 * progress)
+            # Fine-tune: 100% → 90% (과적합 방지)
+            progress = (epoch - self.strong_epochs) / (self.total_epochs - self.strong_epochs)
+            return self.base_weight * (1.0 - 0.1 * progress)
 
 
 class WeightDecayScheduler:
@@ -490,8 +507,9 @@ class AdvancedTrainer:
         self.style_weight_scheduler = StyleWeightScheduler(
             base_weight=args.style_weight,
             total_epochs=args.epochs,
-            warmup_ratio=0.2,
-            strong_ratio=0.5
+            warmup_ratio=0.3,   # 30% warmup
+            ramp_ratio=0.5,     # 50% ramp
+            strong_ratio=0.8    # 80% strong
         )
         
         self.wd_scheduler = WeightDecayScheduler(
@@ -570,7 +588,7 @@ class AdvancedTrainer:
         print(f"Loading Phase 1: {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        print("✅ Phase 1 loaded!")
+        print("  Phase 1 loaded!")
     
     def train_epoch(self, epoch):
         self.model.train()
@@ -870,7 +888,7 @@ class AdvancedTrainer:
             self.save_history()
         
         print("\n" + "="*80)
-        print("✅ 학습 완료!")
+        print("  학습 완료!")
         print(f"Best Val Loss: {self.best_val_loss:.6f}")
         print(f"저장 경로: {self.exp_dir}")
         print("="*80)
@@ -916,7 +934,8 @@ def main():
     
     # Loss
     parser.add_argument('--content-weight', type=float, default=10.0)
-    parser.add_argument('--style-weight', type=float, default=50.0)
+    parser.add_argument('--style-weight', type=float, default=30.0,
+                       help='Base style weight (스케줄러로 조절됨)')
     parser.add_argument('--perceptual-weight', type=float, default=3.0)
     parser.add_argument('--tv-weight', type=float, default=0.1)
     parser.add_argument('--label-smoothing', type=float, default=0.05)
