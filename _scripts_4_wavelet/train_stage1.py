@@ -1,0 +1,382 @@
+# E:\LD-CT SR\_scripts_4_wavelet\train_stage1.py
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import autocast, GradScaler
+from pathlib import Path
+import sys
+import os
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+import time
+
+# Add SwinIR to path
+sys.path.insert(0, r'E:\LD-CT SR\_externals\SwinIR')
+from models.network_swinir import SwinIR
+
+from dataset import CTDenoiseDataset
+from losses import CombinedLoss
+from utils import (load_config, save_checkpoint, load_checkpoint, save_sample_images, 
+                   cleanup_old_checkpoints, EarlyStopping, WarmupScheduler)
+
+def train_stage1():
+    print("="*80)
+    print("🚀 Stage 1: Pretrain on External Low-Dose → Full-Dose Dataset")
+    print("="*80)
+    
+    # Load config with absolute path
+    script_dir = Path(__file__).parent
+    config_path = script_dir / 'config.yaml'
+    config = load_config(config_path)
+    
+    # Device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"\n✅ Device: {device}")
+    if torch.cuda.is_available():
+        print(f"   GPU: {torch.cuda.get_device_name(0)}")
+        print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    
+    # Create output directories
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    exp_dir = Path(config['data']['output_dir']) / f'stage1_pretrain_{timestamp}'
+    ckpt_dir = exp_dir / 'checkpoints'
+    log_dir = exp_dir / 'logs'
+    sample_dir = exp_dir / 'samples'
+    
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    
+    # TensorBoard
+    writer = SummaryWriter(log_dir)
+    print(f"\n📊 TensorBoard: tensorboard --logdir={log_dir}")
+    
+    # Dataset
+    print("\n📊 Preparing dataset...")
+    full_dataset = CTDenoiseDataset(
+        low_dose_dir=config['data']['low_dose_dir'],
+        full_dose_dir=config['data']['full_dose_dir'],
+        hu_window=config['preprocessing']['hu_window'],
+        patch_size=config['preprocessing']['patch_size'],
+        config_aug=config['training']['augmentation'],
+        mode='train'
+    )
+    
+    # Split train/val
+    val_size = int(len(full_dataset) * config['training']['val_split'])
+    train_size = len(full_dataset) - val_size
+    train_dataset, val_dataset = random_split(
+        full_dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['training']['batch_size'],
+        shuffle=True,
+        num_workers=config['training']['num_workers'],
+        pin_memory=True,
+        persistent_workers=True if config['training']['num_workers'] > 0 else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    print(f"   Train samples: {len(train_dataset)}")
+    print(f"   Val samples: {len(val_dataset)}")
+    print(f"   Train batches per epoch: {len(train_loader)}")
+    
+    # Model
+    print("\n🏗️  Building model...")
+    model = SwinIR(
+        upscale=config['model']['upscale'],
+        in_chans=config['model']['in_chans'],
+        img_size=config['model']['img_size'],
+        window_size=config['model']['window_size'],
+        img_range=config['model']['img_range'],
+        depths=config['model']['depths'],
+        embed_dim=config['model']['embed_dim'],
+        num_heads=config['model']['num_heads'],
+        mlp_ratio=config['model']['mlp_ratio'],
+        upsampler=config['model']['upsampler'],
+        resi_connection=config['model']['resi_connection']
+    ).to(device)
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"   Total parameters: {total_params:,}")
+    print(f"   Trainable parameters: {trainable_params:,}")
+    
+    # Load pretrained weights
+    pretrained_path = config['model']['pretrained']
+    if Path(pretrained_path).exists():
+        print(f"   Loading pretrained: {pretrained_path}")
+        try:
+            pretrained_dict = torch.load(pretrained_path, map_location=device)
+            
+            if 'params' in pretrained_dict:
+                pretrained_dict = pretrained_dict['params']
+            elif 'model_state_dict' in pretrained_dict:
+                pretrained_dict = pretrained_dict['model_state_dict']
+            
+            model_dict = model.state_dict()
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() 
+                              if k in model_dict and v.shape == model_dict[k].shape}
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict, strict=False)
+            print(f"   ✅ Loaded {len(pretrained_dict)}/{len(model_dict)} layers")
+        except Exception as e:
+            print(f"   ⚠️  Could not load pretrained weights: {e}")
+    
+    # Loss
+    criterion = CombinedLoss(
+        l1_weight=config['training']['loss_weights']['l1'],
+        ssim_weight=config['training']['loss_weights']['ssim'],
+        wavelet_weight=config['training']['loss_weights']['wavelet']
+    ).to(device)
+    
+    # Optimizer
+    if config['training']['optimizer'] == 'AdamW':
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config['training']['learning_rate'],
+            betas=config['training']['betas'],
+            weight_decay=config['training']['weight_decay']
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=config['training']['learning_rate'],
+            betas=config['training']['betas'],
+            weight_decay=config['training']['weight_decay']
+        )
+    
+    # Scheduler
+    if config['training']['scheduler'] == 'CosineAnnealingWarmRestarts':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=config['training']['T_0'],
+            T_mult=config['training']['T_mult'],
+            eta_min=config['training']['eta_min']
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config['training']['num_epochs'],
+            eta_min=config['training']['eta_min']
+        )
+    
+    # Warmup
+    warmup = WarmupScheduler(
+        optimizer,
+        warmup_epochs=config['training']['warmup_epochs'],
+        warmup_lr=config['training']['warmup_lr'],
+        base_lr=config['training']['learning_rate']
+    )
+    
+    # Early Stopping
+    early_stopping = EarlyStopping(
+        patience=config['training']['early_stopping']['patience'],
+        min_delta=config['training']['early_stopping']['min_delta']
+    )
+    
+    # Mixed Precision
+    use_amp = config['training']['use_amp']
+    from torch.amp import GradScaler as AmpGradScaler
+    scaler = AmpGradScaler('cuda') if use_amp else None
+    
+    # Resume
+    start_epoch = 1
+    best_val_loss = float('inf')
+    if config['training']['resume']:
+        resume_path = Path(config['training']['resume'])
+        if resume_path.exists():
+            start_epoch, _ = load_checkpoint(resume_path, model, optimizer, scheduler)
+            start_epoch += 1
+            print(f"✅ Resumed from epoch {start_epoch-1}")
+    
+    # Training loop
+    print("\n" + "="*80)
+    print("🚀 Starting training...")
+    print("="*80 + "\n")
+    
+    global_step = 0
+    
+    for epoch in range(start_epoch, config['training']['num_epochs'] + 1):
+        model.train()
+        train_losses = []
+        train_loss_details = {'l1': [], 'ssim': [], 'wavelet': []}
+        
+        # Warmup
+        if warmup.is_warmup():
+            warmup.step()
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config['training']['num_epochs']}")
+        
+        for batch_idx, (low, full) in enumerate(pbar):
+            low = low.to(device, non_blocking=True)
+            full = full.to(device, non_blocking=True)
+            
+            # Forward with AMP
+            optimizer.zero_grad()
+            
+            if use_amp:
+                with autocast():
+                    pred = model(low)
+                    pred = torch.clamp(pred, 0, 1)
+                    loss, loss_dict = criterion(pred, full)
+                
+                scaler.scale(loss).backward()
+                
+                # Gradient clipping
+                if config['training']['gradient_clip'] > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 
+                                                   config['training']['gradient_clip'])
+                
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                pred = model(low)
+                pred = torch.clamp(pred, 0, 1)
+                loss, loss_dict = criterion(pred, full)
+                
+                loss.backward()
+                
+                if config['training']['gradient_clip'] > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 
+                                                   config['training']['gradient_clip'])
+                
+                optimizer.step()
+            
+            train_losses.append(loss.item())
+            for key in train_loss_details:
+                train_loss_details[key].append(loss_dict[key])
+            
+            # TensorBoard logging
+            global_step += 1
+            writer.add_scalar('Train/loss_total', loss.item(), global_step)
+            writer.add_scalar('Train/loss_l1', loss_dict['l1'], global_step)
+            writer.add_scalar('Train/loss_ssim', loss_dict['ssim'], global_step)
+            writer.add_scalar('Train/loss_wavelet', loss_dict['wavelet'], global_step)
+            writer.add_scalar('Train/lr', optimizer.param_groups[0]['lr'], global_step)
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'l1': f"{loss_dict['l1']:.4f}",
+                'ssim': f"{loss_dict['ssim']:.4f}",
+                'wav': f"{loss_dict['wavelet']:.4f}",
+                'lr': f"{optimizer.param_groups[0]['lr']:.6f}"
+            })
+        
+        if not warmup.is_warmup():
+            scheduler.step()
+        
+        avg_train_loss = sum(train_losses) / len(train_losses)
+        avg_train_details = {k: sum(v)/len(v) for k, v in train_loss_details.items()}
+        
+        # Validation
+        model.eval()
+        val_losses = []
+        val_loss_details = {'l1': [], 'ssim': [], 'wavelet': []}
+        
+        with torch.no_grad():
+            for low, full in tqdm(val_loader, desc="Validation", leave=False):
+                low = low.to(device, non_blocking=True)
+                full = full.to(device, non_blocking=True)
+                
+                if use_amp:
+                    with autocast():
+                        pred = model(low)
+                        pred = torch.clamp(pred, 0, 1)  # ← 추가
+                        loss, loss_dict = criterion(pred, full)
+                else:
+                    pred = model(low)
+                    pred = torch.clamp(pred, 0, 1)  # ← 추가
+                    loss, loss_dict = criterion(pred, full)
+                
+                val_losses.append(loss.item())
+                for key in val_loss_details:
+                    val_loss_details[key].append(loss_dict[key])
+        
+        avg_val_loss = sum(val_losses) / len(val_losses)
+        avg_val_details = {k: sum(v)/len(v) for k, v in val_loss_details.items()}
+        
+        # TensorBoard epoch summary
+        writer.add_scalar('Epoch/train_loss', avg_train_loss, epoch)
+        writer.add_scalar('Epoch/val_loss', avg_val_loss, epoch)
+        
+        # Print summary
+        print(f"\n{'='*80}")
+        print(f"📊 Epoch {epoch} Summary:")
+        print(f"{'='*80}")
+        print(f"Train Loss: {avg_train_loss:.4f} | L1: {avg_train_details['l1']:.4f} | SSIM: {avg_train_details['ssim']:.4f} | Wav: {avg_train_details['wavelet']:.4f}")
+        print(f"Val Loss:   {avg_val_loss:.4f} | L1: {avg_val_details['l1']:.4f} | SSIM: {avg_val_details['ssim']:.4f} | Wav: {avg_val_details['wavelet']:.4f}")
+        print(f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+        print(f"{'='*80}\n")
+        
+        # Save checkpoint
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
+        
+        if epoch % config['training']['save_interval'] == 0 or is_best:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, avg_val_loss,
+                ckpt_dir / f"model_epoch_{epoch}.pth",
+                is_best=is_best
+            )
+            
+            # Cleanup old checkpoints
+            cleanup_old_checkpoints(ckpt_dir, config['training']['keep_last_n'])
+        
+        # Save sample images
+        if epoch % config['training']['sample_interval'] == 0:
+            model.eval()
+            with torch.no_grad():
+                low_sample, full_sample = next(iter(val_loader))
+                low_sample = low_sample.to(device)
+                full_sample = full_sample.to(device)
+                
+                if use_amp:
+                    with autocast():
+                        pred_sample = model(low_sample)
+                        pred_sample = torch.clamp(pred_sample, 0, 1)
+                else:
+                    pred_sample = model(low_sample)
+                    pred_sample = torch.clamp(pred_sample, 0, 1)
+                
+                save_sample_images(
+                    low_sample, pred_sample, full_sample,
+                    sample_dir / f"epoch_{epoch}.png",
+                    epoch
+                )
+        
+        # Early Stopping
+        if early_stopping(avg_val_loss):
+            print(f"\n🛑 Early stopping triggered at epoch {epoch}")
+            print(f"   Best val loss: {best_val_loss:.4f}")
+            break
+    
+    writer.close()
+    
+    print("\n" + "="*80)
+    print("✅ Training completed!")
+    print("="*80)
+    print(f"📁 Experiment directory: {exp_dir}")
+    print(f"📁 Checkpoints: {ckpt_dir}")
+    print(f"📁 Samples: {sample_dir}")
+    print(f"📊 Best val loss: {best_val_loss:.4f}")
+    print(f"📊 TensorBoard: tensorboard --logdir={log_dir}")
+
+if __name__ == '__main__':
+    train_stage1()
