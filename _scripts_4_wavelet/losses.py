@@ -1,3 +1,5 @@
+# E:\LD-CT SR\_scripts_4_wavelet\losses.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,20 +13,22 @@ class WaveletLoss(nn.Module):
     
     핵심 개선:
     1. Soft Thresholding 적용 (논문의 SoT 방식)
-    2. Multi-level decomposition (2-level)
+    2. Multi-level decomposition (3-level로 강화)
     3. Adaptive threshold per level
+    4. Blurring 방지 강화
     """
-    def __init__(self, wavelet='haar', threshold=50, levels=2, normalize_threshold=True):
+    def __init__(self, wavelet='haar', threshold=50, levels=3, normalize_threshold=True):
         super().__init__()
         self.wavelet = wavelet
         self.threshold = threshold  # 논문에서 제안한 최적값: 50
-        self.levels = levels
+        self.levels = levels  # 3-level로 더 세밀하게
         self.normalize_threshold = normalize_threshold
         
         print(f"📊 WaveletLoss Initialized:")
         print(f"   Wavelet: {wavelet}")
         print(f"   Threshold: {threshold}")
         print(f"   Levels: {levels}")
+        print(f"   → Blurring 방지 강화 모드")
     
     def soft_threshold(self, coeffs, threshold):
         """
@@ -185,32 +189,79 @@ class CombinedLoss(nn.Module):
     """
     L1 + SSIM + Wavelet (with Soft Thresholding)
     
-    논문 기반 개선:
+    논문 기반 개선 + Blurring 방지 강화:
     - Wavelet Loss에 Soft Thresholding 적용
     - Multi-level DWT로 다양한 주파수 대역 처리
     - Adaptive threshold로 레벨별 최적화
+    - SSIM으로 구조 보존 강화
+    
+    NEW: Learnable Loss Weights (Uncertainty-based)
+    - learn_weights=True: weight가 자동으로 학습됨
+    - learn_weights=False: 고정 weight (기존 방식)
     """
     def __init__(self, l1_weight=1.0, ssim_weight=0.5, wavelet_weight=0.1, 
-                 wavelet_threshold=50):
+                 wavelet_threshold=50, wavelet_levels=3, learn_weights=False):
         super().__init__()
-        self.l1_weight = l1_weight
-        self.ssim_weight = ssim_weight
-        self.wavelet_weight = wavelet_weight
+        
+        self.learn_weights = learn_weights
         
         self.l1_loss = nn.L1Loss()
         self.ssim_loss = SSIMLoss()
         self.wavelet_loss = WaveletLoss(
             wavelet='haar',
             threshold=wavelet_threshold,  # 논문의 최적값: 50
-            levels=2,
+            levels=wavelet_levels,  # 3-level로 강화
             normalize_threshold=True
         )
         
-        print(f"\n📊 CombinedLoss Configuration:")
-        print(f"   L1 weight: {l1_weight}")
-        print(f"   SSIM weight: {ssim_weight}")
-        print(f"   Wavelet weight: {wavelet_weight}")
-        print(f"   Wavelet threshold: {wavelet_threshold}")
+        if learn_weights:
+            # Learnable weights (uncertainty-based)
+            # Reference: Kendall et al., CVPR 2018
+            # log_var = log(1/weight) → weight가 커지면 log_var 작아짐
+            self.log_var_l1 = nn.Parameter(torch.zeros(1))
+            self.log_var_ssim = nn.Parameter(torch.log(torch.tensor(l1_weight / ssim_weight)))
+            self.log_var_wavelet = nn.Parameter(torch.log(torch.tensor(l1_weight / wavelet_weight)))
+            
+            print(f"\n📊 CombinedLoss (Learnable Weights - 자동 최적화!)")
+            print(f"   초기 L1 weight: {l1_weight:.2f}")
+            print(f"   초기 SSIM weight: {ssim_weight:.2f}")
+            print(f"   초기 Wavelet weight: {wavelet_weight:.2f}")
+            print(f"   Wavelet threshold: {wavelet_threshold}")
+            print(f"   Wavelet levels: {wavelet_levels}")
+            print(f"   → Weight가 validation loss 보고 자동 조정됩니다!")
+        else:
+            # Fixed weights (기존 방식)
+            self.l1_weight = l1_weight
+            self.ssim_weight = ssim_weight
+            self.wavelet_weight = wavelet_weight
+            
+            print(f"\n📊 CombinedLoss Configuration (Blurring 방지 모드):")
+            print(f"   L1 weight: {l1_weight} (고정)")
+            print(f"   SSIM weight: {ssim_weight} (구조 보존)")
+            print(f"   Wavelet weight: {wavelet_weight} (Edge 보존)")
+            print(f"   Wavelet threshold: {wavelet_threshold}")
+            print(f"   Wavelet levels: {wavelet_levels}")
+            print(f"   → ClariPI 대비 차별화: Sharp Edge 유지!")
+    
+    def get_current_weights(self):
+        """현재 effective weight 반환 (learnable일 때만 의미있음)"""
+        if self.learn_weights:
+            # weight = 1 / (2 * exp(log_var))
+            w_l1 = 1.0 / (2 * torch.exp(self.log_var_l1))
+            w_ssim = 1.0 / (2 * torch.exp(self.log_var_ssim))
+            w_wavelet = 1.0 / (2 * torch.exp(self.log_var_wavelet))
+            
+            return {
+                'l1': w_l1.item(),
+                'ssim': w_ssim.item(),
+                'wavelet': w_wavelet.item()
+            }
+        else:
+            return {
+                'l1': self.l1_weight,
+                'ssim': self.ssim_weight,
+                'wavelet': self.wavelet_weight
+            }
     
     def forward(self, pred, target):
         # Clamp predictions to [0, 1]
@@ -228,16 +279,10 @@ class CombinedLoss(nn.Module):
         l1 = self.l1_loss(pred, target)
         
         # SSIM loss
-        if self.ssim_weight > 0:
-            ssim = self.ssim_loss(pred, target)
-        else:
-            ssim = torch.tensor(0.0, device=pred.device)
+        ssim = self.ssim_loss(pred, target)
         
         # Wavelet loss with Soft Thresholding
-        if self.wavelet_weight > 0:
-            wavelet = self.wavelet_loss(pred, target)
-        else:
-            wavelet = torch.tensor(0.0, device=pred.device)
+        wavelet = self.wavelet_loss(pred, target)
         
         # Check individual losses
         if torch.isnan(l1):
@@ -247,13 +292,41 @@ class CombinedLoss(nn.Module):
         if torch.isnan(wavelet):
             wavelet = torch.tensor(0.0, device=pred.device, requires_grad=True)
         
-        total = (self.l1_weight * l1 + 
-                 self.ssim_weight * ssim + 
-                 self.wavelet_weight * wavelet)
-        
-        return total, {
-            'l1': l1.item(),
-            'ssim': ssim.item(),
-            'wavelet': wavelet.item(),
-            'total': total.item()
-        }
+        if self.learn_weights:
+            # Uncertainty-weighted loss
+            # loss = Σ (loss_i * exp(-log_var_i) + log_var_i)
+            precision_l1 = torch.exp(-self.log_var_l1)
+            precision_ssim = torch.exp(-self.log_var_ssim)
+            precision_wavelet = torch.exp(-self.log_var_wavelet)
+            
+            total = (precision_l1 * l1 + self.log_var_l1 +
+                     precision_ssim * ssim + self.log_var_ssim +
+                     precision_wavelet * wavelet + self.log_var_wavelet)
+            
+            # Get effective weights for logging
+            weights = self.get_current_weights()
+            
+            return total, {
+                'l1': l1.item(),
+                'ssim': ssim.item(),
+                'wavelet': wavelet.item(),
+                'total': total.item(),
+                'weight_l1': weights['l1'],
+                'weight_ssim': weights['ssim'],
+                'weight_wavelet': weights['wavelet']
+            }
+        else:
+            # Fixed weights (기존 방식)
+            total = (self.l1_weight * l1 + 
+                     self.ssim_weight * ssim + 
+                     self.wavelet_weight * wavelet)
+            
+            return total, {
+                'l1': l1.item(),
+                'ssim': ssim.item(),
+                'wavelet': wavelet.item(),
+                'total': total.item(),
+                'weight_l1': self.l1_weight,
+                'weight_ssim': self.ssim_weight,
+                'weight_wavelet': self.wavelet_weight
+            }

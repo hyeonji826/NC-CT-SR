@@ -15,15 +15,17 @@ from models.network_swinir import SwinIR
 
 from dataset import CTDenoiseDataset
 from losses import CombinedLoss
-from utils import (load_config, save_checkpoint, load_checkpoint, save_sample_images, 
-                   cleanup_old_checkpoints, EarlyStopping, WarmupScheduler)
+from utils import (
+    load_config, save_checkpoint, load_checkpoint, save_sample_images,
+    cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
+)
 
 def train_stage1():
     print("="*80)
     print("🚀 Stage 1: Pretrain on External Low-Dose → Full-Dose Dataset")
     print("="*80)
     
-    # Load config with absolute path
+    # Load config
     script_dir = Path(__file__).parent
     config_path = script_dir / 'config.yaml'
     config = load_config(config_path)
@@ -35,7 +37,7 @@ def train_stage1():
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
     
-    # Create output directories
+    # Output dirs
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     exp_dir = Path(config['data']['output_dir']) / f'stage1_pretrain_{timestamp}'
     ckpt_dir = exp_dir / 'checkpoints'
@@ -46,7 +48,6 @@ def train_stage1():
     log_dir.mkdir(parents=True, exist_ok=True)
     sample_dir.mkdir(parents=True, exist_ok=True)
     
-    # TensorBoard
     writer = SummaryWriter(log_dir)
     print(f"\n📊 TensorBoard: tensorboard --logdir={log_dir}")
     
@@ -61,11 +62,10 @@ def train_stage1():
         mode='train'
     )
     
-    # Split train/val
     val_size = int(len(full_dataset) * config['training']['val_split'])
     train_size = len(full_dataset) - val_size
     train_dataset, val_dataset = random_split(
-        full_dataset, 
+        full_dataset,
         [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
@@ -107,57 +107,80 @@ def train_stage1():
         resi_connection=config['model']['resi_connection']
     ).to(device)
     
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"   Total parameters: {total_params:,}")
     print(f"   Trainable parameters: {trainable_params:,}")
     
-    # Load pretrained weights
+    # -------------------------------------------------------------------------
+    # ⭐ FIXED ⭐ pretrained_path 자동 보정
+    # -------------------------------------------------------------------------
     pretrained_path = config['model']['pretrained']
-    if Path(pretrained_path).exists():
-        print(f"   Loading pretrained: {pretrained_path}")
+
+    if pretrained_path is None or pretrained_path.strip() == "":
+        pretrained_path = r"E:\LD-CT SR\Weights\001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+        print(f"   ⚠️ Config pretrained path empty → Using default:\n      {pretrained_path}")
+
+    pretrained_path = Path(pretrained_path)
+
+    print(f"   Loading pretrained:\n      {pretrained_path}")
+
+    if pretrained_path.exists():
         try:
             pretrained_dict = torch.load(pretrained_path, map_location=device)
-            
             if 'params' in pretrained_dict:
                 pretrained_dict = pretrained_dict['params']
             elif 'model_state_dict' in pretrained_dict:
                 pretrained_dict = pretrained_dict['model_state_dict']
-            
+
             model_dict = model.state_dict()
-            pretrained_dict = {k: v for k, v in pretrained_dict.items() 
-                              if k in model_dict and v.shape == model_dict[k].shape}
+            pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                               if k in model_dict and v.shape == model_dict[k].shape}
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict, strict=False)
-            print(f"   ✅ Loaded {len(pretrained_dict)}/{len(model_dict)} layers")
+            print(f"   ✅ Loaded {len(pretrained_dict)} pretrained layers.")
         except Exception as e:
-            print(f"   ⚠️  Could not load pretrained weights: {e}")
+            print(f"   ⚠️ Failed to load pretrained: {e}")
+    else:
+        print(f"   ⚠️  Pretrained path NOT found. Skipping pretrained load.")
+    # -------------------------------------------------------------------------
     
-    # Loss
+    # Loss (Learnable)
+    learn_weights = config['training'].get('learn_weights', False)
+
     criterion = CombinedLoss(
         l1_weight=config['training']['loss_weights']['l1'],
         ssim_weight=config['training']['loss_weights']['ssim'],
         wavelet_weight=config['training']['loss_weights']['wavelet'],
-        wavelet_threshold=config['training'].get('wavelet_threshold', 50)  # ← 이 줄 추가
+        wavelet_threshold=config['training'].get('wavelet_threshold', 50),
+        learn_weights=learn_weights
     ).to(device)
     
-    # Optimizer
+    # Optimizer ---------------------------------------------------------------
+    if learn_weights:
+        params_to_optimize = [
+            {'params': model.parameters(), 'lr': config['training']['learning_rate']},
+            {'params': criterion.parameters(), 'lr': 0.01}
+        ]
+    else:
+        params_to_optimize = model.parameters()
+
     if config['training']['optimizer'] == 'AdamW':
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            params_to_optimize,
             lr=config['training']['learning_rate'],
             betas=config['training']['betas'],
             weight_decay=config['training']['weight_decay']
         )
     else:
         optimizer = torch.optim.Adam(
-            model.parameters(),
+            params_to_optimize,
             lr=config['training']['learning_rate'],
             betas=config['training']['betas'],
             weight_decay=config['training']['weight_decay']
         )
-    
+    # -------------------------------------------------------------------------
+
     # Scheduler
     if config['training']['scheduler'] == 'CosineAnnealingWarmRestarts':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -173,7 +196,6 @@ def train_stage1():
             eta_min=config['training']['eta_min']
         )
     
-    # Warmup
     warmup = WarmupScheduler(
         optimizer,
         warmup_epochs=config['training']['warmup_epochs'],
@@ -181,7 +203,6 @@ def train_stage1():
         base_lr=config['training']['learning_rate']
     )
     
-    # Early Stopping
     early_stopping = EarlyStopping(
         patience=config['training']['early_stopping']['patience'],
         min_delta=config['training']['early_stopping']['min_delta']
@@ -201,8 +222,8 @@ def train_stage1():
             start_epoch, _ = load_checkpoint(resume_path, model, optimizer, scheduler)
             start_epoch += 1
             print(f"✅ Resumed from epoch {start_epoch-1}")
-    
-    # Training loop
+
+    # Training Loop ============================================================
     print("\n" + "="*80)
     print("🚀 Starting training...")
     print("="*80 + "\n")
@@ -214,7 +235,6 @@ def train_stage1():
         train_losses = []
         train_loss_details = {'l1': [], 'ssim': [], 'wavelet': []}
         
-        # Warmup
         if warmup.is_warmup():
             warmup.step()
         
@@ -224,7 +244,6 @@ def train_stage1():
             low = low.to(device, non_blocking=True)
             full = full.to(device, non_blocking=True)
             
-            # Forward with AMP
             optimizer.zero_grad()
             
             if use_amp:
@@ -235,10 +254,9 @@ def train_stage1():
                 
                 scaler.scale(loss).backward()
                 
-                # Gradient clipping
                 if config['training']['gradient_clip'] > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 
+                    torch.nn.utils.clip_grad_norm_(model.parameters(),
                                                    config['training']['gradient_clip'])
                 
                 scaler.step(optimizer)
@@ -251,7 +269,7 @@ def train_stage1():
                 loss.backward()
                 
                 if config['training']['gradient_clip'] > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 
+                    torch.nn.utils.clip_grad_norm_(model.parameters(),
                                                    config['training']['gradient_clip'])
                 
                 optimizer.step()
@@ -260,15 +278,18 @@ def train_stage1():
             for key in train_loss_details:
                 train_loss_details[key].append(loss_dict[key])
             
-            # TensorBoard logging
+            # TensorBoard
             global_step += 1
             writer.add_scalar('Train/loss_total', loss.item(), global_step)
             writer.add_scalar('Train/loss_l1', loss_dict['l1'], global_step)
             writer.add_scalar('Train/loss_ssim', loss_dict['ssim'], global_step)
             writer.add_scalar('Train/loss_wavelet', loss_dict['wavelet'], global_step)
-            writer.add_scalar('Train/lr', optimizer.param_groups[0]['lr'], global_step)
-            
-            # Update progress bar
+
+            # ⭐ learnable weight logging
+            if learn_weights:
+                writer.add_scalar('Train/weight_ssim', loss_dict['weight_ssim'], global_step)
+                writer.add_scalar('Train/weight_wavelet', loss_dict['weight_wavelet'], global_step)
+
             pbar.set_postfix({
                 'loss': f"{loss.item():.4f}",
                 'l1': f"{loss_dict['l1']:.4f}",
@@ -283,7 +304,7 @@ def train_stage1():
         avg_train_loss = sum(train_losses) / len(train_losses)
         avg_train_details = {k: sum(v)/len(v) for k, v in train_loss_details.items()}
         
-        # Validation
+        # Validation -----------------------------------------------------------
         model.eval()
         val_losses = []
         val_loss_details = {'l1': [], 'ssim': [], 'wavelet': []}
@@ -293,14 +314,9 @@ def train_stage1():
                 low = low.to(device, non_blocking=True)
                 full = full.to(device, non_blocking=True)
                 
-                if use_amp:
-                    with autocast():
-                        pred = model(low)
-                        pred = torch.clamp(pred, 0, 1)  # ← 추가
-                        loss, loss_dict = criterion(pred, full)
-                else:
+                with autocast() if use_amp else torch.no_grad():
                     pred = model(low)
-                    pred = torch.clamp(pred, 0, 1)  # ← 추가
+                    pred = torch.clamp(pred, 0, 1)
                     loss, loss_dict = criterion(pred, full)
                 
                 val_losses.append(loss.item())
@@ -310,11 +326,9 @@ def train_stage1():
         avg_val_loss = sum(val_losses) / len(val_losses)
         avg_val_details = {k: sum(v)/len(v) for k, v in val_loss_details.items()}
         
-        # TensorBoard epoch summary
         writer.add_scalar('Epoch/train_loss', avg_train_loss, epoch)
         writer.add_scalar('Epoch/val_loss', avg_val_loss, epoch)
         
-        # Print summary
         print(f"\n{'='*80}")
         print(f"📊 Epoch {epoch} Summary:")
         print(f"{'='*80}")
@@ -334,11 +348,8 @@ def train_stage1():
                 ckpt_dir / f"model_epoch_{epoch}.pth",
                 is_best=is_best
             )
-            
-            # Cleanup old checkpoints
             cleanup_old_checkpoints(ckpt_dir, config['training']['keep_last_n'])
         
-        # Save sample images
         if epoch % config['training']['sample_interval'] == 0:
             model.eval()
             with torch.no_grad():
@@ -346,11 +357,7 @@ def train_stage1():
                 low_sample = low_sample.to(device)
                 full_sample = full_sample.to(device)
                 
-                if use_amp:
-                    with autocast():
-                        pred_sample = model(low_sample)
-                        pred_sample = torch.clamp(pred_sample, 0, 1)
-                else:
+                with autocast() if use_amp else torch.no_grad():
                     pred_sample = model(low_sample)
                     pred_sample = torch.clamp(pred_sample, 0, 1)
                 
@@ -360,7 +367,6 @@ def train_stage1():
                     epoch
                 )
         
-        # Early Stopping
         if early_stopping(avg_val_loss):
             print(f"\n🛑 Early stopping triggered at epoch {epoch}")
             print(f"   Best val loss: {best_val_loss:.4f}")
@@ -376,6 +382,7 @@ def train_stage1():
     print(f"📁 Samples: {sample_dir}")
     print(f"📊 Best val loss: {best_val_loss:.4f}")
     print(f"📊 TensorBoard: tensorboard --logdir={log_dir}")
+
 
 if __name__ == '__main__':
     train_stage1()
