@@ -1,5 +1,3 @@
-# E:\LD-CT SR\_scripts_4_wavelet\losses.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,70 +5,125 @@ import pywt
 import numpy as np
 
 class WaveletLoss(nn.Module):
-    """Wavelet-based high-frequency loss (Fixed for stability)"""
-    def __init__(self, wavelet='haar'):
+    """
+    논문 기반 Wavelet Loss with Soft Thresholding
+    Reference: "복부 CT 영상의 화질 개선 방법에 대한 연구" (2023)
+    
+    핵심 개선:
+    1. Soft Thresholding 적용 (논문의 SoT 방식)
+    2. Multi-level decomposition (2-level)
+    3. Adaptive threshold per level
+    """
+    def __init__(self, wavelet='haar', threshold=50, levels=2, normalize_threshold=True):
         super().__init__()
         self.wavelet = wavelet
+        self.threshold = threshold  # 논문에서 제안한 최적값: 50
+        self.levels = levels
+        self.normalize_threshold = normalize_threshold
+        
+        print(f"📊 WaveletLoss Initialized:")
+        print(f"   Wavelet: {wavelet}")
+        print(f"   Threshold: {threshold}")
+        print(f"   Levels: {levels}")
+    
+    def soft_threshold(self, coeffs, threshold):
+        """
+        Soft Thresholding (SoT) - 논문의 수식 (2)
+        
+        w'(i) = 0           if |w(i)| < T
+              = w(i) - T   if w(i) ≥ T  
+              = w(i) + T   if w(i) ≤ -T
+        
+        효과: 임계값보다 작은 계수(노이즈)는 0으로, 큰 계수(신호)는 수축
+        """
+        return np.sign(coeffs) * np.maximum(np.abs(coeffs) - threshold, 0)
     
     def forward(self, pred, target):
         """
-        pred, target: [B, 1, H, W]
+        pred, target: [B, 1, H, W] - normalized to [0, 1]
         """
         batch_size = pred.size(0)
         device = pred.device
-        total_loss = 0
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        valid_samples = 0
         
         for i in range(batch_size):
-            # Move to CPU for wavelet (PyWavelets doesn't support GPU)
+            # Move to CPU for pywt
             pred_np = pred[i, 0].detach().cpu().numpy()
             target_np = target[i, 0].detach().cpu().numpy()
             
-            # Check for nan/inf
+            # Sanity checks
             if np.isnan(pred_np).any() or np.isnan(target_np).any():
-                print("⚠️ Warning: NaN detected in wavelet input")
                 continue
-            
             if np.isinf(pred_np).any() or np.isinf(target_np).any():
-                print("⚠️ Warning: Inf detected in wavelet input")
                 continue
             
             try:
-                # 2D Wavelet decomposition
-                coeffs_pred = pywt.dwt2(pred_np, self.wavelet)
-                coeffs_target = pywt.dwt2(target_np, self.wavelet)
+                # Multi-level DWT decomposition
+                coeffs_pred = pywt.wavedec2(pred_np, self.wavelet, level=self.levels)
+                coeffs_target = pywt.wavedec2(target_np, self.wavelet, level=self.levels)
                 
-                # LL, (LH, HL, HH)
-                cA_pred, (cH_pred, cV_pred, cD_pred) = coeffs_pred
-                cA_target, (cH_target, cV_target, cD_target) = coeffs_target
+                # coeffs = [cA_n, (cH_n, cV_n, cD_n), ..., (cH_1, cV_1, cD_1)]
                 
-                # Convert to tensors
-                cH_pred_t = torch.from_numpy(cH_pred).float().to(device)
-                cH_target_t = torch.from_numpy(cH_target).float().to(device)
-                cV_pred_t = torch.from_numpy(cV_pred).float().to(device)
-                cV_target_t = torch.from_numpy(cV_target).float().to(device)
-                cD_pred_t = torch.from_numpy(cD_pred).float().to(device)
-                cD_target_t = torch.from_numpy(cD_target).float().to(device)
+                level_loss = 0
                 
-                # High-frequency loss (LH + HL + HH)
-                loss_h = F.l1_loss(cH_pred_t, cH_target_t)
-                loss_v = F.l1_loss(cV_pred_t, cV_target_t)
-                loss_d = F.l1_loss(cD_pred_t, cD_target_t)
+                for level_idx in range(1, len(coeffs_pred)):  # Skip approximation (cA)
+                    cH_pred, cV_pred, cD_pred = coeffs_pred[level_idx]
+                    cH_target, cV_target, cD_target = coeffs_target[level_idx]
+                    
+                    # Adaptive threshold per level
+                    # Higher levels (coarser) get lower threshold
+                    level_threshold = self.threshold / (2 ** (level_idx - 1))
+                    
+                    # Normalize threshold to match [0, 1] range if needed
+                    if self.normalize_threshold:
+                        # Input is [0, 1], so scale threshold accordingly
+                        level_threshold = level_threshold / 255.0
+                    
+                    # Apply Soft Thresholding to high-frequency components
+                    cH_pred_t = self.soft_threshold(cH_pred, level_threshold)
+                    cV_pred_t = self.soft_threshold(cV_pred, level_threshold)
+                    cD_pred_t = self.soft_threshold(cD_pred, level_threshold)
+                    
+                    cH_target_t = self.soft_threshold(cH_target, level_threshold)
+                    cV_target_t = self.soft_threshold(cV_target, level_threshold)
+                    cD_target_t = self.soft_threshold(cD_target, level_threshold)
+                    
+                    # Convert to tensors
+                    cH_pred_tensor = torch.from_numpy(cH_pred_t).float().to(device)
+                    cH_target_tensor = torch.from_numpy(cH_target_t).float().to(device)
+                    
+                    cV_pred_tensor = torch.from_numpy(cV_pred_t).float().to(device)
+                    cV_target_tensor = torch.from_numpy(cV_target_t).float().to(device)
+                    
+                    cD_pred_tensor = torch.from_numpy(cD_pred_t).float().to(device)
+                    cD_target_tensor = torch.from_numpy(cD_target_t).float().to(device)
+                    
+                    # Compute L1 loss on thresholded coefficients
+                    loss_h = F.l1_loss(cH_pred_tensor, cH_target_tensor)
+                    loss_v = F.l1_loss(cV_pred_tensor, cV_target_tensor)
+                    loss_d = F.l1_loss(cD_pred_tensor, cD_target_tensor)
+                    
+                    # Check for NaN
+                    if torch.isnan(loss_h) or torch.isnan(loss_v) or torch.isnan(loss_d):
+                        continue
+                    
+                    # Weight by level (finer levels get higher weight)
+                    level_weight = 1.0 / level_idx
+                    level_loss = level_loss + level_weight * (loss_h + loss_v + loss_d) / 3.0
                 
-                # Check for nan
-                if torch.isnan(loss_h) or torch.isnan(loss_v) or torch.isnan(loss_d):
-                    print("⚠️ Warning: NaN in wavelet loss computation")
-                    continue
-                
-                total_loss += (loss_h + loss_v + loss_d) / 3.0
+                total_loss = total_loss + level_loss
+                valid_samples += 1
                 
             except Exception as e:
-                print(f"⚠️ Wavelet error: {e}")
+                print(f"⚠️ Wavelet error in sample {i}: {e}")
                 continue
         
-        if batch_size == 0:
+        if valid_samples == 0:
             return torch.tensor(0.0, device=device, requires_grad=True)
         
-        return total_loss / batch_size
+        return total_loss / valid_samples
 
 
 class SSIMLoss(nn.Module):
@@ -129,8 +182,16 @@ class SSIMLoss(nn.Module):
 
 
 class CombinedLoss(nn.Module):
-    """L1 + SSIM + Wavelet (with stability checks)"""
-    def __init__(self, l1_weight=1.0, ssim_weight=0.5, wavelet_weight=0.1):
+    """
+    L1 + SSIM + Wavelet (with Soft Thresholding)
+    
+    논문 기반 개선:
+    - Wavelet Loss에 Soft Thresholding 적용
+    - Multi-level DWT로 다양한 주파수 대역 처리
+    - Adaptive threshold로 레벨별 최적화
+    """
+    def __init__(self, l1_weight=1.0, ssim_weight=0.5, wavelet_weight=0.1, 
+                 wavelet_threshold=50):
         super().__init__()
         self.l1_weight = l1_weight
         self.ssim_weight = ssim_weight
@@ -138,7 +199,18 @@ class CombinedLoss(nn.Module):
         
         self.l1_loss = nn.L1Loss()
         self.ssim_loss = SSIMLoss()
-        self.wavelet_loss = WaveletLoss()
+        self.wavelet_loss = WaveletLoss(
+            wavelet='haar',
+            threshold=wavelet_threshold,  # 논문의 최적값: 50
+            levels=2,
+            normalize_threshold=True
+        )
+        
+        print(f"\n📊 CombinedLoss Configuration:")
+        print(f"   L1 weight: {l1_weight}")
+        print(f"   SSIM weight: {ssim_weight}")
+        print(f"   Wavelet weight: {wavelet_weight}")
+        print(f"   Wavelet threshold: {wavelet_threshold}")
     
     def forward(self, pred, target):
         # Clamp predictions to [0, 1]
@@ -152,16 +224,16 @@ class CombinedLoss(nn.Module):
                 'wavelet': float('inf'), 'total': float('inf')
             }
         
-        # L1 loss
+        # L1 loss (always active)
         l1 = self.l1_loss(pred, target)
         
-        # SSIM loss (with weight check)
+        # SSIM loss
         if self.ssim_weight > 0:
             ssim = self.ssim_loss(pred, target)
         else:
             ssim = torch.tensor(0.0, device=pred.device)
         
-        # Wavelet loss (with weight check)
+        # Wavelet loss with Soft Thresholding
         if self.wavelet_weight > 0:
             wavelet = self.wavelet_loss(pred, target)
         else:

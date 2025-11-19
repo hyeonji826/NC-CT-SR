@@ -1,5 +1,3 @@
-# E:\LD-CT SR\_scripts_4_wavelet\train_stage1.py
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
@@ -140,7 +138,8 @@ def train_stage1():
     criterion = CombinedLoss(
         l1_weight=config['training']['loss_weights']['l1'],
         ssim_weight=config['training']['loss_weights']['ssim'],
-        wavelet_weight=config['training']['loss_weights']['wavelet']
+        wavelet_weight=config['training']['loss_weights']['wavelet'],
+        wavelet_threshold=config['training'].get('wavelet_threshold', 50)  # ← 이 줄 추가
     ).to(device)
     
     # Optimizer

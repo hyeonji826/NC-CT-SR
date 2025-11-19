@@ -1,5 +1,3 @@
-# E:\LD-CT SR\_scripts_4_wavelet\dataset.py
-
 import torch
 import numpy as np
 import nibabel as nib
@@ -36,19 +34,10 @@ class CTDenoiseDataset(Dataset):
         
         print(f"[{mode}] Found {len(self.pairs)} paired volumes")
         
-        # Pre-load all volumes
-        self.volumes = []
-        print(f"Loading volumes into memory...")
-        for low_f, full_f in self.pairs:
-            low_nii = nib.load(str(low_f))
-            full_nii = nib.load(str(full_f))
-            
-            low_vol = low_nii.get_fdata()
-            full_vol = full_nii.get_fdata()
-            
-            self.volumes.append((low_vol, full_vol))
-        
-        print(f"Loaded {len(self.volumes)} volumes")
+        # ========== 개선: On-the-fly 로딩 (메모리 절약!) ==========
+        # Pre-load 하지 않고 파일 경로만 저장
+        # self.volumes = [] 제거
+        # ========================================================
     
     def normalize_hu(self, img):
         """HU clipping and normalization to [0, 1]"""
@@ -136,12 +125,23 @@ class CTDenoiseDataset(Dataset):
     
     def __len__(self):
         # More samples per volume for better training
-        return len(self.volumes) * 100 if self.mode == 'train' else len(self.volumes) * 10
+        return len(self.pairs) * 100 if self.mode == 'train' else len(self.pairs) * 10
     
     def __getitem__(self, idx):
+        # ========== 개선: On-the-fly 로딩 ==========
+        # 필요할 때만 파일 로드 (메모리 효율적)
+        
         # Select volume
-        vol_idx = idx % len(self.volumes)
-        low_vol, full_vol = self.volumes[vol_idx]
+        vol_idx = idx % len(self.pairs)
+        low_file, full_file = self.pairs[vol_idx]
+        
+        # Load volumes on-the-fly
+        low_nii = nib.load(str(low_file))
+        full_nii = nib.load(str(full_file))
+        
+        low_vol = low_nii.get_fdata()
+        full_vol = full_nii.get_fdata()
+        # ==========================================
         
         # Random crop with validation
         low_patch, full_patch = self.random_crop(low_vol, full_vol)
