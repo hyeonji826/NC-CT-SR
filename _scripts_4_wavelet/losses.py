@@ -330,3 +330,247 @@ class CombinedLoss(nn.Module):
                 'weight_ssim': self.ssim_weight,
                 'weight_wavelet': self.wavelet_weight
             }
+
+# ============================================================================
+# Self-Supervised Loss (Ground Truth 불필요!)
+# NC-CT 데이터를 위한 Self-Supervised Learning
+# ============================================================================
+
+class WaveletSparsityLoss(nn.Module):
+    """
+    Target 없이 사용 가능한 Wavelet Loss
+    
+    핵심 원리:
+    - 깨끗한 이미지의 wavelet 계수는 sparse (희소)해야 함
+    - 작은 계수(노이즈)는 0에 가까워야 함
+    - 큰 계수(edge, 구조)는 유지
+    
+    → Soft Thresholding을 loss로 직접 학습!
+    
+    NO GROUND TRUTH NEEDED!
+    """
+    def __init__(self, threshold=50, wavelet='haar', levels=3, normalize_threshold=True):
+        super().__init__()
+        self.threshold = threshold
+        self.wavelet = wavelet
+        self.levels = levels
+        self.normalize_threshold = normalize_threshold
+        
+        print(f"📊 WaveletSparsityLoss Initialized (Self-Supervised!):")
+        print(f"   Wavelet: {wavelet}")
+        print(f"   Threshold: {threshold}")
+        print(f"   Levels: {levels}")
+        print(f"   → Ground Truth 불필요!")
+        
+    def soft_threshold(self, coeffs, threshold):
+        """Soft thresholding function"""
+        return np.sign(coeffs) * np.maximum(np.abs(coeffs) - threshold, 0)
+    
+    def forward(self, pred):
+        """
+        pred: [B, 1, H, W] - normalized to [0, 1]
+        
+        NO TARGET NEEDED!
+        """
+        batch_size = pred.size(0)
+        device = pred.device
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        
+        valid_samples = 0
+        
+        for i in range(batch_size):
+            pred_np = pred[i, 0].detach().cpu().numpy()
+            
+            # Sanity checks
+            if np.isnan(pred_np).any() or np.isinf(pred_np).any():
+                continue
+            
+            try:
+                # DWT decomposition
+                coeffs_pred = pywt.wavedec2(pred_np, self.wavelet, level=self.levels)
+                
+                level_loss = 0
+                
+                for level_idx in range(1, len(coeffs_pred)):  # Skip approximation
+                    cH_pred, cV_pred, cD_pred = coeffs_pred[level_idx]
+                    
+                    # Adaptive threshold per level
+                    level_threshold = self.threshold / (2 ** (level_idx - 1))
+                    
+                    # Normalize threshold
+                    if self.normalize_threshold:
+                        level_threshold = level_threshold / 255.0
+                    
+                    # Soft threshold - 이게 "target"이 됨!
+                    cH_target = self.soft_threshold(cH_pred, level_threshold)
+                    cV_target = self.soft_threshold(cV_pred, level_threshold)
+                    cD_target = self.soft_threshold(cD_pred, level_threshold)
+                    
+                    # Convert to tensors
+                    cH_pred_tensor = torch.from_numpy(cH_pred).float().to(device)
+                    cH_target_tensor = torch.from_numpy(cH_target).float().to(device)
+                    
+                    cV_pred_tensor = torch.from_numpy(cV_pred).float().to(device)
+                    cV_target_tensor = torch.from_numpy(cV_target).float().to(device)
+                    
+                    cD_pred_tensor = torch.from_numpy(cD_pred).float().to(device)
+                    cD_target_tensor = torch.from_numpy(cD_target).float().to(device)
+                    
+                    # Loss: 현재 계수가 thresholded version과 비슷하도록
+                    loss_h = F.l1_loss(cH_pred_tensor, cH_target_tensor.detach())
+                    loss_v = F.l1_loss(cV_pred_tensor, cV_target_tensor.detach())
+                    loss_d = F.l1_loss(cD_pred_tensor, cD_target_tensor.detach())
+                    
+                    if torch.isnan(loss_h) or torch.isnan(loss_v) or torch.isnan(loss_d):
+                        continue
+                    
+                    # Weight by level
+                    level_weight = 1.0 / level_idx
+                    level_loss = level_loss + level_weight * (loss_h + loss_v + loss_d) / 3.0
+                
+                total_loss = total_loss + level_loss
+                valid_samples += 1
+                
+            except Exception as e:
+                print(f"⚠️ Wavelet sparsity error in sample {i}: {e}")
+                continue
+        
+        if valid_samples == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        return total_loss / valid_samples
+
+
+class Noise2VoidLoss(nn.Module):
+    """
+    Noise2Void style reconstruction loss
+    
+    핵심 원리:
+    - Random하게 선택된 픽셀만 loss 계산
+    - Blind spot network와 함께 사용하면 self-supervised
+    - 하지만 일반 network에서도 regularization 효과
+    """
+    def __init__(self, mask_ratio=0.02):
+        super().__init__()
+        self.mask_ratio = mask_ratio
+        
+        print(f"📊 Noise2VoidLoss Initialized:")
+        print(f"   Mask ratio: {mask_ratio}")
+        
+    def forward(self, pred, noisy_input):
+        """
+        pred: 모델 출력
+        noisy_input: 노이즈 입력 (target 아님! 같은 노이즈 이미지)
+        
+        원리: Random pixel에서만 reconstruction 학습
+        → Self-supervised denoising
+        """
+        # Random mask 생성
+        mask = torch.rand_like(pred) < self.mask_ratio
+        
+        # Masked 위치에서만 loss 계산
+        if mask.sum() == 0:
+            # No masked pixels
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        loss = F.l1_loss(pred[mask], noisy_input[mask])
+        
+        return loss
+
+
+class SelfSupervisedCombinedLoss(nn.Module):
+    """
+    NC-CT를 위한 Self-Supervised Combined Loss
+    
+    NO GROUND TRUTH NEEDED!
+    
+    구성:
+    1. Noise2Void: reconstruction (regularization)
+    2. Wavelet Sparsity: soft thresholding prior
+    3. Total Variation: smoothness
+    
+    이 조합으로 ground truth 없이도 denoising 학습 가능!
+    """
+    def __init__(self, 
+                 n2v_weight=1.0,
+                 wavelet_weight=0.2, 
+                 tv_weight=0.01,
+                 wavelet_threshold=50,
+                 wavelet_levels=3):
+        super().__init__()
+        
+        self.n2v_weight = n2v_weight
+        self.wavelet_weight = wavelet_weight
+        self.tv_weight = tv_weight
+        
+        self.n2v_loss = Noise2VoidLoss(mask_ratio=0.02)
+        self.wavelet_loss = WaveletSparsityLoss(
+            threshold=wavelet_threshold,
+            levels=wavelet_levels,
+            normalize_threshold=True
+        )
+        
+        print(f"\n🎯 SelfSupervisedCombinedLoss Configuration:")
+        print(f"   N2V weight: {n2v_weight}")
+        print(f"   Wavelet sparsity weight: {wavelet_weight}")
+        print(f"   TV weight: {tv_weight}")
+        print(f"   → Ground Truth 불필요!")
+        print(f"   → NC-CT에서 바로 사용 가능!")
+        
+    def total_variation_loss(self, pred):
+        """Total Variation for smoothness"""
+        diff_h = torch.abs(pred[:, :, 1:, :] - pred[:, :, :-1, :])
+        diff_v = torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1])
+        return torch.mean(diff_h) + torch.mean(diff_v)
+    
+    def forward(self, pred, noisy_input):
+        """
+        pred: 모델 출력
+        noisy_input: 노이즈 입력 (ground truth 아님!)
+        
+        Returns: total_loss, loss_dict
+        """
+        # Clamp predictions
+        pred = torch.clamp(pred, 0, 1)
+        
+        # Check for nan/inf
+        if torch.isnan(pred).any() or torch.isinf(pred).any():
+            print("⚠️ Warning: NaN/Inf in prediction!")
+            return torch.tensor(float('inf'), device=pred.device), {
+                'n2v': float('inf'),
+                'wavelet_sparsity': float('inf'),
+                'tv': float('inf'),
+                'total': float('inf')
+            }
+        
+        # 1. Noise2Void reconstruction
+        n2v = self.n2v_loss(pred, noisy_input)
+        
+        # 2. Wavelet sparsity (NO target!)
+        wavelet = self.wavelet_loss(pred)
+        
+        # 3. Total variation
+        tv = self.total_variation_loss(pred)
+        
+        # Check individual losses
+        if torch.isnan(n2v):
+            n2v = torch.tensor(0.0, device=pred.device, requires_grad=True)
+        if torch.isnan(wavelet):
+            wavelet = torch.tensor(0.0, device=pred.device, requires_grad=True)
+        if torch.isnan(tv):
+            tv = torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        # Combined
+        total = (self.n2v_weight * n2v + 
+                 self.wavelet_weight * wavelet + 
+                 self.tv_weight * tv)
+        
+        return total, {
+            'n2v': n2v.item(),
+            'wavelet_sparsity': wavelet.item(),
+            'tv': tv.item(),
+            'total': total.item(),
+            'weight_n2v': self.n2v_weight,
+            'weight_wavelet': self.wavelet_weight,
+            'weight_tv': self.tv_weight
+        }

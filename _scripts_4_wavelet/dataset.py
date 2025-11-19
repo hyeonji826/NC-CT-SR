@@ -9,34 +9,45 @@ from scipy.ndimage import rotate
 class CTDenoiseDataset(Dataset):
     def __init__(self, low_dose_dir, full_dose_dir, 
                  hu_window=(-160, 240), patch_size=128, 
-                 config_aug=None, mode='train'):
+                 config_aug=None, mode='train', self_supervised=False):
         
         self.low_dose_dir = Path(low_dose_dir)
         self.full_dose_dir = Path(full_dose_dir)
         self.hu_window = hu_window
         self.patch_size = patch_size
         self.mode = mode
+        self.self_supervised = self_supervised
         
         # Augmentation config
         self.aug_config = config_aug if config_aug and mode == 'train' else {}
         
-        # Get paired files
-        low_files = sorted(list(self.low_dose_dir.glob("*.nii.gz")))
-        full_files = sorted(list(self.full_dose_dir.glob("*.nii.gz")))
+        # Get files
+        if self_supervised:
+            # Self-supervised: single directory (noisy data only)
+            print(f"[{mode}] Self-Supervised Mode: Loading from {self.low_dose_dir}")
+            noisy_files = sorted(list(self.low_dose_dir.glob("*.nii.gz")))
+            # Same file for both low and full (will use same noisy data)
+            self.pairs = [(f, f) for f in noisy_files]
+            print(f"[{mode}] Found {len(self.pairs)} noisy volumes (GT 불필요!)")
+        else:
+            # Supervised: paired low-dose and full-dose
+            print(f"[{mode}] Supervised Mode: Pairing low-dose and full-dose")
+            low_files = sorted(list(self.low_dose_dir.glob("*.nii.gz")))
+            full_files = sorted(list(self.full_dose_dir.glob("*.nii.gz")))
+            
+            # Match by patient ID
+            self.pairs = []
+            for lf in low_files:
+                patient_id = lf.stem.split('_')[0]
+                matching_full = [f for f in full_files if patient_id in f.stem]
+                if matching_full:
+                    self.pairs.append((lf, matching_full[0]))
+            
+            print(f"[{mode}] Found {len(self.pairs)} paired volumes")
         
-        # Match by patient ID
-        self.pairs = []
-        for lf in low_files:
-            patient_id = lf.stem.split('_')[0]
-            matching_full = [f for f in full_files if patient_id in f.stem]
-            if matching_full:
-                self.pairs.append((lf, matching_full[0]))
-        
-        print(f"[{mode}] Found {len(self.pairs)} paired volumes")
-        
-        # ========== 개선: On-the-fly 로딩 (메모리 절약!) ==========
-        # Pre-load 하지 않고 파일 경로만 저장
-        # self.volumes = [] 제거
+        # ========== ê°œì„ : On-the-fly ë¡œë”© (ë©”ëª¨ë¦¬ ì ˆì•½!) ==========
+        # Pre-load í•˜ì§€ ì•Šê³  íŒŒì¼ ê²½ë¡œë§Œ ì €ìž¥
+        # self.volumes = [] ì œê±°
         # ========================================================
     
     def normalize_hu(self, img):
@@ -46,10 +57,10 @@ class CTDenoiseDataset(Dataset):
         
         # Check for nan/inf
         if np.isnan(img).any():
-            print("⚠️ Warning: NaN in normalized image!")
+            print("âš ï¸ Warning: NaN in normalized image!")
             img = np.nan_to_num(img, 0)
         if np.isinf(img).any():
-            print("⚠️ Warning: Inf in normalized image!")
+            print("âš ï¸ Warning: Inf in normalized image!")
             img = np.nan_to_num(img, 0)
         
         return img.astype(np.float32)
@@ -128,8 +139,8 @@ class CTDenoiseDataset(Dataset):
         return len(self.pairs) * 100 if self.mode == 'train' else len(self.pairs) * 10
     
     def __getitem__(self, idx):
-        # ========== 개선: On-the-fly 로딩 ==========
-        # 필요할 때만 파일 로드 (메모리 효율적)
+        # ========== ê°œì„ : On-the-fly ë¡œë”© ==========
+        # í•„ìš”í•  ë•Œë§Œ íŒŒì¼ ë¡œë“œ (ë©”ëª¨ë¦¬ íš¨ìœ¨ì )
         
         # Select volume
         vol_idx = idx % len(self.pairs)
