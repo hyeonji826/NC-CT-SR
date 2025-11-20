@@ -1,4 +1,4 @@
-# losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity (Exact Implementation)
+# losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,7 @@ class Neighbor2NeighborLoss(nn.Module):
     2. Each sub-image has INDEPENDENT noise (critical!)
     3. Use one as input (g1), another as target (g2)
     4. Loss = ||f(g1) - g2||^2 + gamma * ||f(g1) - g1||^2
-       - First term: reconstruction with independent noise → denoises
+       - First term: reconstruction with independent noise -> denoises
        - Second term: regularization to prevent identity mapping
     
     Implementation Details:
@@ -33,10 +33,10 @@ class Neighbor2NeighborLoss(nn.Module):
     def __init__(self, gamma=2.0):
         super().__init__()
         self.gamma = gamma
-        print(f"\n📐 Neighbor2Neighbor Loss:")
-        print(f"   γ (gamma) = {gamma}")
+        print(f"\nNeighbor2Neighbor Loss:")
+        print(f"   gamma = {gamma}")
         print(f"   Loss = L_rec + {gamma} * L_reg")
-        print(f"   → Prevents identity mapping while denoising")
+        print(f"   Prevents identity mapping while denoising")
     
     def generate_subimages_checkerboard(self, noisy):
         """
@@ -53,7 +53,7 @@ class Neighbor2NeighborLoss(nn.Module):
         """
         B, C, H, W = noisy.shape
         
-        # Ensure even dimensions for clean 2x2 subsampling
+        # Ensure even dimensions
         if H % 2 != 0:
             noisy = noisy[:, :, :-1, :]
             H = H - 1
@@ -61,15 +61,11 @@ class Neighbor2NeighborLoss(nn.Module):
             noisy = noisy[:, :, :, :-1]
             W = W - 1
         
-        # Extract 4 checkerboard positions
-        # Position 0: (even rows, even cols) - (0::2, 0::2)
-        # Position 3: (odd rows, odd cols)   - (1::2, 1::2)
-        
+        # Extract checkerboard positions
         pos_0 = noisy[:, :, 0::2, 0::2]  # [B, C, H/2, W/2]
         pos_3 = noisy[:, :, 1::2, 1::2]  # [B, C, H/2, W/2]
         
-        # Upsample to original size
-        # Use bilinear for smooth upsampling (maintains gradient flow)
+        # Upsample to original size (bilinear for gradient flow)
         g1 = F.interpolate(pos_0, size=(H, W), mode='bilinear', align_corners=False)
         g2 = F.interpolate(pos_3, size=(H, W), mode='bilinear', align_corners=False)
         
@@ -84,8 +80,8 @@ class Neighbor2NeighborLoss(nn.Module):
             noisy_input: [B, C, H, W] - noisy CT image
             
         Returns:
-            total_loss: scalar
-            loss_dict: dictionary with loss components
+            total_loss: scalar tensor with gradients
+            loss_dict: dictionary with loss components (detached scalars)
         """
         # Generate spatially-disjoint subsamples
         g1, g2 = self.generate_subimages_checkerboard(noisy_input)
@@ -99,11 +95,10 @@ class Neighbor2NeighborLoss(nn.Module):
         rec_loss = F.mse_loss(output, g2)
         
         # L_reg: regularization loss (output vs g1)
-        # Prevents the network from learning identity mapping
-        # Without this, model could just output = g1 (no denoising)
+        # Prevents identity mapping
         reg_loss = F.mse_loss(output, g1)
         
-        # Total N2N loss
+        # Total N2N loss (keep gradient!)
         total = rec_loss + self.gamma * reg_loss
         
         return total, {
@@ -123,12 +118,12 @@ class WaveletSparsityPrior(nn.Module):
     Key Idea:
     - Natural images have SPARSE wavelet coefficients
     - Noise creates NON-SPARSE (dense) high-frequency coefficients
-    - Encourage sparsity → removes noise while preserving edges
+    - Encourage sparsity -> removes noise while preserving edges
     
     Method:
     1. DWT decomposition (multi-level)
     2. Soft thresholding on detail coefficients
-    3. L1 penalty to encourage actual coeffs → threshold coeffs
+    3. L1 penalty to encourage actual coeffs -> threshold coeffs
     
     Critical for Self-Supervised:
     - Acts as regularization (prevents overfitting to noise)
@@ -139,16 +134,16 @@ class WaveletSparsityPrior(nn.Module):
     def __init__(self, threshold=50, wavelet='haar', levels=3):
         super().__init__()
         
-        # Normalize threshold to [0, 1] range (images are normalized)
+        # Normalize threshold to [0, 1] range
         self.threshold = threshold / 255.0
         self.wavelet = wavelet
         self.levels = levels
         
-        print(f"\n🌊 Wavelet Sparsity Prior:")
-        print(f"   Threshold: {threshold} HU → {self.threshold:.4f} (normalized)")
+        print(f"\nWavelet Sparsity Prior:")
+        print(f"   Threshold: {threshold} HU -> {self.threshold:.4f} (normalized)")
         print(f"   Wavelet: {wavelet}")
         print(f"   Levels: {levels}")
-        print(f"   → Encourages sparse high-freq coefficients (removes noise)")
+        print(f"   Encourages sparse high-freq coefficients (removes noise)")
         
     def soft_threshold(self, coeffs, threshold):
         """
@@ -158,8 +153,8 @@ class WaveletSparsityPrior(nn.Module):
             T_soft(x) = sign(x) * max(|x| - threshold, 0)
         
         Effect:
-            - Small coeffs (< threshold): → 0 (assumed to be noise)
-            - Large coeffs (> threshold): → shrunk but preserved (signal)
+            - Small coeffs (< threshold): -> 0 (assumed to be noise)
+            - Large coeffs (> threshold): -> shrunk but preserved (signal)
         """
         return np.sign(coeffs) * np.maximum(np.abs(coeffs) - threshold, 0)
     
@@ -189,25 +184,22 @@ class WaveletSparsityPrior(nn.Module):
             try:
                 # Multi-level DWT
                 coeffs = pywt.wavedec2(pred_np, self.wavelet, level=self.levels)
-                # coeffs = [cA_n, (cH_n, cV_n, cD_n), ..., (cH_1, cV_1, cD_1)]
                 
                 level_loss = 0
                 
                 # Only penalize detail coefficients (high-frequency)
-                # Skip cA (approximation/low-frequency) to preserve structure
                 for level_idx in range(1, len(coeffs)):
                     cH, cV, cD = coeffs[level_idx]
                     
                     # Adaptive threshold per level
-                    # Coarser levels (higher idx) → lower threshold
                     level_threshold = self.threshold / (2 ** (level_idx - 1))
                     
-                    # Compute sparse target (what coeffs SHOULD be)
+                    # Compute sparse target
                     cH_sparse = self.soft_threshold(cH, level_threshold)
                     cV_sparse = self.soft_threshold(cV, level_threshold)
                     cD_sparse = self.soft_threshold(cD, level_threshold)
                     
-                    # Convert to tensors (with gradient tracking for actual coeffs)
+                    # Convert to tensors
                     cH_tensor = torch.from_numpy(cH).float().to(device)
                     cV_tensor = torch.from_numpy(cV).float().to(device)
                     cD_tensor = torch.from_numpy(cD).float().to(device)
@@ -217,7 +209,6 @@ class WaveletSparsityPrior(nn.Module):
                     cD_sparse_tensor = torch.from_numpy(cD_sparse).float().to(device).detach()
                     
                     # L1 sparsity penalty
-                    # Encourages actual coeffs → sparse coeffs
                     loss_h = F.l1_loss(cH_tensor, cH_sparse_tensor)
                     loss_v = F.l1_loss(cV_tensor, cV_sparse_tensor)
                     loss_d = F.l1_loss(cD_tensor, cD_sparse_tensor)
@@ -226,15 +217,14 @@ class WaveletSparsityPrior(nn.Module):
                     if torch.isnan(loss_h) or torch.isnan(loss_v) or torch.isnan(loss_d):
                         continue
                     
-                    # Weight finer levels more (they have more noise)
+                    # Weight finer levels more
                     level_weight = 1.0 / level_idx
                     level_loss = level_loss + level_weight * (loss_h + loss_v + loss_d) / 3.0
                 
                 total_loss = total_loss + level_loss
                 valid_samples += 1
                 
-            except Exception as e:
-                # Wavelet decomposition can fail on edge cases
+            except Exception:
                 continue
         
         if valid_samples == 0:
@@ -261,11 +251,11 @@ class CombinedN2NWaveletLoss(nn.Module):
     - Wavelet weight: 0.05~0.1 (light regularization)
     
     Why this balance?
-    - Too high wavelet → oversmoothing (loses N2N benefit)
-    - Too low wavelet → overfitting to noise patterns
-    - 0.05~0.1 is empirically optimal (논문 기반)
+    - Too high wavelet -> oversmoothing (loses N2N benefit)
+    - Too low wavelet -> overfitting to noise patterns
+    - 0.05~0.1 is empirically optimal
     
-    WARNING: N2N 논리를 깨뜨리지 않기 위해 wavelet은 약하게!
+    WARNING: Keep wavelet weak to preserve N2N logic!
     """
     
     def __init__(self,
@@ -283,16 +273,15 @@ class CombinedN2NWaveletLoss(nn.Module):
         # Wavelet sparsity (regularization)
         self.wavelet_loss = WaveletSparsityPrior(
             threshold=wavelet_threshold,
-            wavelet=wavelet,
+            wavelet='haar',
             levels=wavelet_levels
         )
         
-        print(f"\n⚖️  Combined Loss Balancing:")
+        print(f"\nCombined Loss Balancing:")
         print(f"   N2N weight: 1.0 (MAIN - reconstruction)")
         print(f"   Wavelet weight: {wavelet_weight} (REGULARIZATION)")
-        print(f"   ")
-        print(f"   Balance ratio: 1 : {wavelet_weight}")
-        print(f"   → N2N logic preserved, wavelet prevents overfitting")
+        print(f"   Balance ratio target: ~{1.0/wavelet_weight:.1f}:1")
+        print(f"   N2N logic preserved, wavelet prevents overfitting")
         
     def forward(self, model, noisy_input):
         """
@@ -303,15 +292,13 @@ class CombinedN2NWaveletLoss(nn.Module):
             noisy_input: [B, C, H, W] - noisy input
             
         Returns:
-            total_loss: scalar
-            loss_dict: detailed loss breakdown
+            total_loss: scalar tensor with gradients
+            loss_dict: detailed loss breakdown (detached scalars)
         """
         # N2N loss (main denoising mechanism)
         n2n_total, n2n_dict = self.n2n_loss(model, noisy_input)
         
         # Get model output for wavelet loss
-        # Note: We need to pass through model again for gradient tracking
-        # This is necessary because wavelet loss needs gradients w.r.t. output
         with torch.no_grad():
             g1, _ = self.n2n_loss.generate_subimages_checkerboard(noisy_input)
         output = model(g1)
@@ -324,8 +311,7 @@ class CombinedN2NWaveletLoss(nn.Module):
         if torch.isnan(wavelet):
             wavelet = torch.tensor(0.0, device=noisy_input.device, requires_grad=True)
         
-        # Combined loss
-        # CRITICAL: N2N is unweighted (1.0), wavelet is weak regularization
+        # Combined loss (keep gradient!)
         total = n2n_total + self.wavelet_weight * wavelet
         
         return total, {
@@ -340,6 +326,6 @@ class CombinedN2NWaveletLoss(nn.Module):
         }
 
 
-# For backward compatibility, keep the name
+# For backward compatibility
 Neighbor2NeighborLoss_v2 = Neighbor2NeighborLoss
 WaveletSparsityLoss = WaveletSparsityPrior
