@@ -1,5 +1,9 @@
 # train_n2n.py - Self-Supervised Training with Neighbor2Neighbor + Wavelet
 
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
@@ -20,7 +24,8 @@ from dataset_n2n import NCCTDenoiseDataset
 from losses_n2n import CombinedN2NWaveletLoss, Neighbor2NeighborLoss
 from utils import (
     load_config, save_checkpoint, load_checkpoint, save_sample_images,
-    cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
+    cleanup_old_checkpoints, EarlyStopping, WarmupScheduler,
+    calculate_psnr, calculate_ssim
 )
 
 
@@ -36,13 +41,13 @@ def train_n2n():
     """
     
     print("="*80)
-    print("🚀 Self-Supervised Training: Neighbor2Neighbor + Wavelet Sparsity")
+    print(" Self-Supervised Training: Neighbor2Neighbor + Wavelet Sparsity")
     print("="*80)
-    print("\n📋 Key Features:")
-    print("   ✓ NO paired data required (self-supervised!)")
-    print("   ✓ N2N: Main denoising mechanism")
-    print("   ✓ Wavelet: Regularization (prevents overfitting)")
-    print("   ✓ Balance: N2N >> Wavelet (20:1)")
+    print("\n Key Features:")
+    print("   [OK] NO paired data required (self-supervised!)")
+    print("   [OK] N2N: Main denoising mechanism")
+    print("   [OK] Wavelet: Regularization (prevents overfitting)")
+    print("   [OK] Balance: N2N >> Wavelet (20:1)")
     print("="*80)
     
     # Load config
@@ -56,7 +61,7 @@ def train_n2n():
     
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n✅ Device: {device}")
+    print(f"\n Device: {device}")
     if torch.cuda.is_available():
         print(f"   GPU: {torch.cuda.get_device_name(0)}")
         print(f"   VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
@@ -77,10 +82,10 @@ def train_n2n():
         yaml.dump(config, f)
     
     writer = SummaryWriter(log_dir)
-    print(f"\n📊 TensorBoard: tensorboard --logdir={log_dir}")
+    print(f"\n TensorBoard: tensorboard --logdir={log_dir}")
     
     # Dataset (NC-CT only!)
-    print("\n📂 Loading NC-CT dataset (self-supervised)...")
+    print("\nðŸ“‚ Loading NC-CT dataset (self-supervised)...")
     full_dataset = NCCTDenoiseDataset(
         nc_ct_dir=config['data']['nc_ct_dir'],
         hu_window=config['preprocessing']['hu_window'],
@@ -118,8 +123,17 @@ def train_n2n():
     print(f"   Val samples: {len(val_dataset)}")
     print(f"   Batches per epoch: {len(train_loader)}")
     
+    # Prepare fixed validation samples for consistent progress tracking
+    print("\nPreparing fixed validation samples...")
+    fixed_samples = []
+    for i, sample in enumerate(val_loader):
+        fixed_samples.append(sample)
+        if i >= 2:  # Get 3 fixed samples
+            break
+    print(f"   Fixed samples: {len(fixed_samples)} (for tracking denoising progress)")
+    
     # Model
-    print("\n🏗️  Building SwinIR model...")
+    print("\n  Building SwinIR model...")
     model = SwinIR(
         upscale=config['model']['upscale'],
         in_chans=config['model']['in_chans'],
@@ -142,7 +156,7 @@ def train_n2n():
     # Pretrained weights
     pretrained_path = config['model'].get('pretrained')
     if pretrained_path and Path(pretrained_path).exists():
-        print(f"\n📥 Loading pretrained weights:")
+        print(f"\n Loading pretrained weights:")
         print(f"   {pretrained_path}")
         try:
             pretrained_dict = torch.load(pretrained_path, map_location=device)
@@ -156,12 +170,12 @@ def train_n2n():
                              if k in model_dict and v.shape == model_dict[k].shape}
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict, strict=False)
-            print(f"   ✅ Loaded {len(pretrained_dict)}/{len(model_dict)} layers")
+            print(f"    Loaded {len(pretrained_dict)}/{len(model_dict)} layers")
         except Exception as e:
-            print(f"   ⚠️  Failed to load pretrained: {e}")
+            print(f"     Failed to load pretrained: {e}")
     
     # Loss function
-    print("\n⚖️  Setting up loss function...")
+    print("\n  Setting up loss function...")
     loss_type = config['training'].get('loss_type', 'n2n_wavelet')
     
     if loss_type == 'n2n_wavelet':
@@ -205,7 +219,7 @@ def train_n2n():
     
     # Mixed Precision
     use_amp = config['training']['use_amp']
-    scaler = GradScaler('cuda') if use_amp else None
+    scaler = GradScaler(enabled=use_amp) if use_amp else None
     
     # Resume
     start_epoch = 1
@@ -215,11 +229,11 @@ def train_n2n():
         if resume_path.exists():
             start_epoch, _ = load_checkpoint(resume_path, model, optimizer, scheduler)
             start_epoch += 1
-            print(f"✅ Resumed from epoch {start_epoch-1}")
+            print(f" Resumed from epoch {start_epoch-1}")
     
     # Training Loop
     print("\n" + "="*80)
-    print("🚀 Starting Self-Supervised Training...")
+    print(" Starting Self-Supervised Training...")
     print("="*80 + "\n")
     
     global_step = 0
@@ -349,43 +363,67 @@ def train_n2n():
             k: sum(v)/len(v) for k, v in val_loss_details.items() if len(v) > 0
         }
         
+        # Calculate PSNR and SSIM on fixed samples
+        with torch.no_grad():
+            sample_noisy = fixed_samples[0].to(device)
+            if use_amp:
+                with autocast():
+                    sample_denoised = model(sample_noisy)
+            else:
+                sample_denoised = model(sample_noisy)
+            sample_denoised = torch.clamp(sample_denoised, 0, 1)
+            
+            # Calculate metrics (denoised vs noisy)
+            val_psnr = calculate_psnr(sample_denoised, sample_noisy, data_range=1.0)
+            val_ssim = calculate_ssim(sample_denoised, sample_noisy, data_range=1.0)
+
+        
         # Log to TensorBoard
         writer.add_scalar('Epoch/train_loss', avg_train_loss, epoch)
         writer.add_scalar('Epoch/val_loss', avg_val_loss, epoch)
+        writer.add_scalar('Epoch/val_psnr', val_psnr, epoch)
+        writer.add_scalar('Epoch/val_ssim', val_ssim, epoch)
         writer.add_scalar('Epoch/learning_rate', optimizer.param_groups[0]['lr'], epoch)
         
         # Print summary
         print(f"\n{'='*80}")
-        print(f"📊 Epoch {epoch} Summary:")
+        print(f" Epoch {epoch} Summary:")
         print(f"{'='*80}")
         print(f"Train Loss: {avg_train_loss:.4f}")
         if 'n2n_total' in avg_train_details:
-            print(f"  ├─ N2N:     {avg_train_details['n2n_total']:.4f}")
-            print(f"  │   ├─ Rec: {avg_train_details['n2n_rec']:.4f}")
-            print(f"  │   └─ Reg: {avg_train_details['n2n_reg']:.4f}")
+            print(f"  |- N2N:     {avg_train_details['n2n_total']:.4f}")
+            print(f"  |   |- Rec: {avg_train_details['n2n_rec']:.4f}")
+            print(f"  |   \\- Reg: {avg_train_details['n2n_reg']:.4f}")
         if 'wavelet' in avg_train_details:
-            print(f"  └─ Wavelet: {avg_train_details['wavelet']:.4f}")
+            print(f"  \\- Wavelet: {avg_train_details['wavelet']:.4f}")
         
         print(f"\nVal Loss:   {avg_val_loss:.4f}")
         if 'n2n_total' in avg_val_details:
-            print(f"  ├─ N2N:     {avg_val_details['n2n_total']:.4f}")
+            print(f"  |- N2N:     {avg_val_details['n2n_total']:.4f}")
         if 'wavelet' in avg_val_details:
-            print(f"  └─ Wavelet: {avg_val_details['wavelet']:.4f}")
+            print(f"  \\- Wavelet: {avg_val_details['wavelet']:.4f}")
+        
+        # PSNR and SSIM (more intuitive metrics)
+        print(f"\nMetrics (denoised vs noisy):")
+        print(f"  PSNR: {val_psnr:.2f} dB")
+        print(f"  SSIM: {val_ssim:.4f}")
+        if val_ssim < 0.85:
+            print(f"    WARNING: Low SSIM - possible blur/oversmoothing!")
         
         # Balance check
         if 'balance_ratio' in avg_train_details:
             ratio = avg_train_details['balance_ratio']
-            print(f"\n⚖️  Balance Ratio: {ratio:.2f} (target: ~{target_balance:.1f})")
+            print(f"\nBalance Ratio: {ratio:.2f} (target: ~{target_balance:.1f})")
             
             if config['monitoring'].get('warn_if_imbalanced', True):
                 if ratio < target_balance * 0.5:
-                    print(f"   ⚠️  WARNING: Wavelet too strong! (ratio < {target_balance*0.5:.1f})")
+                    print(f"  WARNING: Wavelet too strong! (ratio < {target_balance*0.5:.1f})")
                     balance_warnings += 1
                 elif ratio > target_balance * 2.0:
-                    print(f"   ⚠️  WARNING: Wavelet too weak! (ratio > {target_balance*2.0:.1f})")
+                    print(f"  WARNING: Wavelet too weak! (ratio > {target_balance*2.0:.1f})")
                     balance_warnings += 1
                 else:
-                    print(f"   ✅ Balance is good!")
+                    print(f"  Balance is good!")
         
         print(f"\nLR: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"{'='*80}\n")
@@ -403,12 +441,12 @@ def train_n2n():
             )
             cleanup_old_checkpoints(ckpt_dir, config['training']['keep_last_n'])
         
-        # Save samples
+        # Save samples (use FIXED samples for consistent tracking)
         if epoch % config['training']['sample_interval'] == 0:
             model.eval()
             with torch.no_grad():
-                noisy_sample = next(iter(val_loader))
-                noisy_sample = noisy_sample.to(device)
+                # Use first fixed sample
+                noisy_sample = fixed_samples[0].to(device)
                 
                 # Get denoised output
                 if use_amp:
@@ -419,16 +457,16 @@ def train_n2n():
                 
                 denoised = torch.clamp(denoised, 0, 1)
                 
-                # Save comparison (noisy vs denoised vs difference)
+                # Save comparison
                 save_sample_images(
-                    noisy_sample, denoised, noisy_sample,  # Use noisy as "target" for visualization
+                    noisy_sample, denoised, noisy_sample,
                     sample_dir / f"epoch_{epoch}.png",
                     epoch
                 )
         
         # Early stopping
         if early_stopping(avg_val_loss):
-            print(f"\n🛑 Early stopping triggered at epoch {epoch}")
+            print(f"\n Early stopping triggered at epoch {epoch}")
             print(f"   Best val loss: {best_val_loss:.4f}")
             break
     
@@ -436,16 +474,16 @@ def train_n2n():
     
     # Final summary
     print("\n" + "="*80)
-    print("✅ Training Completed!")
+    print(" Training Completed!")
     print("="*80)
-    print(f"📁 Experiment directory: {exp_dir}")
-    print(f"📁 Checkpoints: {ckpt_dir}")
-    print(f"📁 Samples: {sample_dir}")
-    print(f"📊 Best val loss: {best_val_loss:.4f}")
-    print(f"📊 TensorBoard: tensorboard --logdir={log_dir}")
+    print(f" Experiment directory: {exp_dir}")
+    print(f" Checkpoints: {ckpt_dir}")
+    print(f" Samples: {sample_dir}")
+    print(f" Best val loss: {best_val_loss:.4f}")
+    print(f" TensorBoard: tensorboard --logdir={log_dir}")
     
     if balance_warnings > 0:
-        print(f"\n⚠️  Balance warnings: {balance_warnings}")
+        print(f"\n  Balance warnings: {balance_warnings}")
         print(f"   Consider adjusting wavelet_weight in config")
     
     print("="*80)

@@ -46,12 +46,12 @@ class NCCTDenoiseDataset(Dataset):
         if len(self.files) == 0:
             raise ValueError(f"No NIfTI files found in {self.nc_ct_dir}")
         
-        print(f"\n📁 [{mode}] NC-CT Dataset:")
+        print(f"\nðŸ“ [{mode}] NC-CT Dataset:")
         print(f"   Files found: {len(self.files)}")
         print(f"   HU window: {self.hu_window}")
         print(f"   Patch size: {patch_size}")
         print(f"   Mode: {mode}")
-        print(f"   → Self-supervised (no pairs needed!)")
+        print(f"   â†’ Self-supervised (no pairs needed!)")
     
     def normalize_hu(self, img):
         """
@@ -71,10 +71,10 @@ class NCCTDenoiseDataset(Dataset):
         
         # Safety checks
         if np.isnan(img).any():
-            print("⚠️ Warning: NaN detected, filling with 0")
+            print("âš ï¸ Warning: NaN detected, filling with 0")
             img = np.nan_to_num(img, 0)
         if np.isinf(img).any():
-            print("⚠️ Warning: Inf detected, filling with 0")
+            print("âš ï¸ Warning: Inf detected, filling with 0")
             img = np.nan_to_num(img, 0)
         
         return img.astype(np.float32)
@@ -201,7 +201,7 @@ class NCCTDenoiseDataset(Dataset):
             nii = nib.load(str(file_path))
             volume = nii.get_fdata()
         except Exception as e:
-            print(f"⚠️ Error loading {file_path}: {e}")
+            print(f"âš ï¸ Error loading {file_path}: {e}")
             # Return a dummy tensor if loading fails
             return torch.zeros(1, self.patch_size, self.patch_size)
         

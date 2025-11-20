@@ -311,7 +311,7 @@ if __name__ == '__main__':
     if len(sys.argv) > 1:
         log_file = sys.argv[1]
     else:
-        log_file = r"E:\LD-CT SR\Outputs\experiments\n2n_20251119_164931\logs\events.out.tfevents.1763538572.DESKTOP-QMNSDLC.11180.0"
+        log_file = r"E:\LD-CT SR\Outputs\n2n_experiments\n2n_wavelet_20251120_122531\logs\events.out.tfevents.1763609131.DESKTOP-QMNSDLC.21340.0"
     
     if not os.path.exists(log_file):
         print(f"Error: Log file not found: {log_file}")

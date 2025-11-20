@@ -76,7 +76,7 @@ class Neighbor2NeighborLoss(nn.Module):
         Compute N2N loss.
         
         Args:
-            model: denoising network f(·)
+            model: denoising network f(Â·)
             noisy_input: [B, C, H, W] - noisy CT image
             
         Returns:
@@ -113,7 +113,7 @@ class WaveletSparsityPrior(nn.Module):
     """
     Wavelet Sparsity Prior for Medical Image Denoising
     
-    Reference: "복부 CT 영상의 화질 개선 방법에 대한 연구" (2023)
+    Reference: "ë³µë¶€ CT ì˜ìƒì˜ í™”ì§ˆ ê°œì„  ë°©ë²•ì— ëŒ€í•œ ì—°êµ¬" (2023)
     
     Key Idea:
     - Natural images have SPARSE wavelet coefficients

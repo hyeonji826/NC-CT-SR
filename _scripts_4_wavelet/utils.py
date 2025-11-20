@@ -6,9 +6,44 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import shutil
 import warnings
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
+
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
+
+def calculate_psnr(img1, img2, data_range=1.0):
+    """Calculate PSNR between two images"""
+    if isinstance(img1, torch.Tensor):
+        img1 = img1.detach().cpu().numpy()
+    if isinstance(img2, torch.Tensor):
+        img2 = img2.detach().cpu().numpy()
+    
+    mse = np.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return float('inf')
+    
+    psnr = 10 * np.log10(data_range ** 2 / mse)
+    return psnr
+
+def calculate_ssim(img1, img2, data_range=1.0):
+    """Calculate SSIM between two images"""
+    if isinstance(img1, torch.Tensor):
+        img1 = img1.detach().cpu().numpy()
+    if isinstance(img2, torch.Tensor):
+        img2 = img2.detach().cpu().numpy()
+    
+    # Handle batch dimension
+    if img1.ndim == 4:
+        ssim_values = []
+        for i in range(img1.shape[0]):
+            s = ssim(img1[i, 0], img2[i, 0], data_range=data_range)
+            ssim_values.append(s)
+        return np.mean(ssim_values)
+    else:
+        return ssim(img1[0], img2[0], data_range=data_range)
+
 
 def load_config(config_path):
     """Load YAML config with absolute path support"""
