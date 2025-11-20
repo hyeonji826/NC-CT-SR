@@ -24,8 +24,7 @@ from dataset_n2n import NCCTDenoiseDataset
 from losses_n2n import CombinedN2NWaveletLoss, Neighbor2NeighborLoss
 from utils import (
     load_config, save_checkpoint, load_checkpoint, save_sample_images,
-    cleanup_old_checkpoints, EarlyStopping, WarmupScheduler,
-    calculate_psnr, calculate_ssim
+    cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
 )
 
 
@@ -94,11 +93,14 @@ def train_n2n():
         mode='train'
     )
     
+    # 8:1:1 split (train:val:test)
     val_size = int(len(full_dataset) * config['training']['val_split'])
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(
+    test_size = int(len(full_dataset) * config['training'].get('test_split', 0.1))
+    train_size = len(full_dataset) - val_size - test_size
+    
+    train_dataset, val_dataset, test_dataset = random_split(
         full_dataset,
-        [train_size, val_size],
+        [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42)
     )
     
@@ -119,9 +121,18 @@ def train_n2n():
         pin_memory=True
     )
     
-    print(f"   Train samples: {len(train_dataset)}")
-    print(f"   Val samples: {len(val_dataset)}")
+    print(f"   Train samples: {len(train_dataset)} (80%)")
+    print(f"   Val samples: {len(val_dataset)} (10%)")
+    print(f"   Test samples: {len(test_dataset)} (10%)")
     print(f"   Batches per epoch: {len(train_loader)}")
+    
+    # Save test set indices for later inference
+    test_indices_path = exp_dir / 'test_indices.txt'
+    with open(test_indices_path, 'w') as f:
+        for idx in test_dataset.indices:
+            file_idx = idx % len(full_dataset.files)
+            f.write(f"{full_dataset.files[file_idx]}\n")
+    print(f"   Test set file list saved: {test_indices_path}")
     
     # Prepare fixed validation samples for consistent progress tracking
     print("\nPreparing fixed validation samples...")
@@ -362,27 +373,11 @@ def train_n2n():
         avg_val_details = {
             k: sum(v)/len(v) for k, v in val_loss_details.items() if len(v) > 0
         }
-        
-        # Calculate PSNR and SSIM on fixed samples
-        with torch.no_grad():
-            sample_noisy = fixed_samples[0].to(device)
-            if use_amp:
-                with autocast():
-                    sample_denoised = model(sample_noisy)
-            else:
-                sample_denoised = model(sample_noisy)
-            sample_denoised = torch.clamp(sample_denoised, 0, 1)
-            
-            # Calculate metrics (denoised vs noisy)
-            val_psnr = calculate_psnr(sample_denoised, sample_noisy, data_range=1.0)
-            val_ssim = calculate_ssim(sample_denoised, sample_noisy, data_range=1.0)
 
         
         # Log to TensorBoard
         writer.add_scalar('Epoch/train_loss', avg_train_loss, epoch)
         writer.add_scalar('Epoch/val_loss', avg_val_loss, epoch)
-        writer.add_scalar('Epoch/val_psnr', val_psnr, epoch)
-        writer.add_scalar('Epoch/val_ssim', val_ssim, epoch)
         writer.add_scalar('Epoch/learning_rate', optimizer.param_groups[0]['lr'], epoch)
         
         # Print summary
@@ -402,14 +397,6 @@ def train_n2n():
             print(f"  |- N2N:     {avg_val_details['n2n_total']:.4f}")
         if 'wavelet' in avg_val_details:
             print(f"  \\- Wavelet: {avg_val_details['wavelet']:.4f}")
-        
-        # PSNR and SSIM (more intuitive metrics)
-        print(f"\nMetrics (denoised vs noisy):")
-        print(f"  PSNR: {val_psnr:.2f} dB")
-        print(f"  SSIM: {val_ssim:.4f}")
-        if val_ssim < 0.85:
-            print(f"    WARNING: Low SSIM - possible blur/oversmoothing!")
-        
         # Balance check
         if 'balance_ratio' in avg_train_details:
             ratio = avg_train_details['balance_ratio']
