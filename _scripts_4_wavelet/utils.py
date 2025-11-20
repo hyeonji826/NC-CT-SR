@@ -5,6 +5,10 @@ import yaml
 from pathlib import Path
 import matplotlib.pyplot as plt
 import shutil
+import warnings
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
 def load_config(config_path):
     """Load YAML config with absolute path support"""
@@ -20,7 +24,7 @@ def load_config(config_path):
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    print(f"âœ… Loaded config from: {config_path}")
+    print(f"Loaded config from: {config_path}")
     return config
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, is_best=False):
@@ -34,17 +38,17 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, is_best
     }
     
     torch.save(checkpoint, save_path)
-    print(f"âœ… Checkpoint saved: {save_path}")
+    print(f"Checkpoint saved: {save_path}")
     
     # Save best model
     if is_best:
         best_path = save_path.parent / 'best_model.pth'
         shutil.copyfile(save_path, best_path)
-        print(f"ðŸ† Best model saved: {best_path}")
+        print(f"Best model saved: {best_path}")
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     """Load checkpoint"""
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
     model.load_state_dict(checkpoint['model_state_dict'])
     
@@ -57,44 +61,24 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     epoch = checkpoint.get('epoch', 0)
     loss = checkpoint.get('loss', float('inf'))
     
-    print(f"âœ… Loaded checkpoint from epoch {epoch}, loss: {loss:.4f}")
+    print(f"Loaded checkpoint from epoch {epoch}, loss: {loss:.4f}")
     return epoch, loss
 
-def save_sample_images(input_img, pred, target, save_path, epoch):
-    """Save sample images (works for both supervised and self-supervised)"""
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+def save_sample_images(noisy_input, denoised_output, save_path, epoch):
+    """Save sample images for self-supervised learning"""
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     
-    # First sample
-    axes[0, 0].imshow(input_img[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-    axes[0, 0].set_title('Noisy Input')
-    axes[0, 0].axis('off')
+    # Noisy input
+    axes[0].imshow(noisy_input[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+    axes[0].set_title('Noisy Input (NC-CT)')
+    axes[0].axis('off')
     
-    axes[0, 1].imshow(pred[0, 0].detach().cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-    axes[0, 1].set_title('Denoised Output')
-    axes[0, 1].axis('off')
+    # Denoised output
+    axes[1].imshow(denoised_output[0, 0].detach().cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+    axes[1].set_title('Denoised Output')
+    axes[1].axis('off')
     
-    axes[0, 2].imshow(target[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-    axes[0, 2].set_title('Target')
-    axes[0, 2].axis('off')
-    
-    # Difference maps
-    diff_input = torch.abs(input_img[0, 0] - target[0, 0]).cpu().numpy()
-    diff_pred = torch.abs(pred[0, 0].detach() - target[0, 0]).cpu().numpy()
-    
-    axes[1, 0].imshow(diff_input, cmap='hot', vmin=0, vmax=0.2)
-    axes[1, 0].set_title('Input vs Target')
-    axes[1, 0].axis('off')
-    
-    axes[1, 1].imshow(diff_pred, cmap='hot', vmin=0, vmax=0.2)
-    axes[1, 1].set_title('Output vs Target')
-    axes[1, 1].axis('off')
-    
-    improvement = diff_input - diff_pred
-    axes[1, 2].imshow(improvement, cmap='RdYlGn', vmin=-0.1, vmax=0.1)
-    axes[1, 2].set_title('Improvement (green=better)')
-    axes[1, 2].axis('off')
-    
-    plt.suptitle(f'Epoch {epoch}', fontsize=16)
+    plt.suptitle(f'Epoch {epoch} - Self-Supervised Denoising', fontsize=16)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
@@ -107,7 +91,6 @@ def cleanup_old_checkpoints(ckpt_dir, keep_last_n=5):
         for old_ckpt in checkpoints[:-keep_last_n]:
             if 'best' not in old_ckpt.name:
                 old_ckpt.unlink()
-                print(f"ðŸ—‘ï¸  Removed old checkpoint: {old_ckpt.name}")
 
 class EarlyStopping:
     """Early stopping handler"""
@@ -123,7 +106,6 @@ class EarlyStopping:
             self.best_loss = val_loss
         elif val_loss > self.best_loss - self.min_delta:
             self.counter += 1
-            print(f"âš ï¸  EarlyStopping counter: {self.counter}/{self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
