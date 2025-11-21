@@ -572,14 +572,14 @@ def train_n2n():
             )
             cleanup_old_checkpoints(ckpt_dir, config['training']['keep_last_n'])
         
-        # Save samples (use FIXED samples for consistent tracking)
+        # Save samples (use FIXED samples for consistent tracking) - OPTIMIZED
         if epoch % config['training']['sample_interval'] == 0:
             model.eval()
             with torch.no_grad():
                 # Process all fixed samples as batch
                 noisy_batch = torch.cat(fixed_samples, dim=0).to(device)
                 
-                # Get denoised output
+                # Get denoised output - single forward pass
                 if use_amp:
                     with autocast():
                         denoised_batch = model(noisy_batch)
@@ -588,19 +588,19 @@ def train_n2n():
                 
                 denoised_batch = torch.clamp(denoised_batch, 0, 1)
                 
-                # Calculate per-sample metrics for visualization
+                # Calculate per-sample metrics (lightweight - wavelet only)
                 sample_metrics = []
                 for i in range(len(fixed_samples)):
-                    single_sample = noisy_batch[i:i+1]
+                    single_denoised = denoised_batch[i:i+1]
                     
-                    # Get loss with metrics
-                    _, loss_dict = criterion(model, single_sample)
+                    # Only compute wavelet noise estimation (no full criterion)
+                    _, est_noise = criterion.wavelet_loss(single_denoised)
                     
                     sample_metrics.append({
-                        'estimated_noise_hu': loss_dict.get('estimated_noise', 0) * 400,
-                        'adaptive_threshold_hu': loss_dict.get('estimated_noise', 0) * 400 * 2.5,  # k=2.5
-                        'adaptive_weight': loss_dict.get('adaptive_weight', config['training']['wavelet_weight']),
-                        'balance_ratio': loss_dict.get('balance_ratio', 0),
+                        'estimated_noise_hu': est_noise * 400,
+                        'adaptive_threshold_hu': est_noise * 400 * 2.5,
+                        'adaptive_weight': config['training']['wavelet_weight'],
+                        'balance_ratio': 0,  # Not computed per-sample
                         'label': slice_info[i]['label'],
                         'file': slice_info[i]['file'],
                         'original_noise_hu': slice_info[i]['noise_std_hu']
