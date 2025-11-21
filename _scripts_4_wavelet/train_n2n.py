@@ -27,29 +27,91 @@ from utils import (
     cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
 )
 
-def load_fixed_full_slices(nc_ct_dir, hu_window, num_slices=3):
+def load_fixed_full_slices(nc_ct_dir, hu_window):
     """
-    Load fixed full slices for visualization (no augmentation)
+    Load 2 representative slices: HIGH-NOISE + LOW-NOISE for comparison
+    
+    This allows us to verify that adaptive thresholding works correctly:
+    - High-noise slice: should use higher threshold/weight
+    - Low-noise slice: should use lower threshold/weight
     
     Returns:
-        List of [1, 1, H, W] tensors (full slices)
+        List of 2 [1, 1, H, W] tensors: [high_noise_slice, low_noise_slice]
     """
     import nibabel as nib
     import numpy as np
     from pathlib import Path
     
     nc_ct_dir = Path(nc_ct_dir)
-    files = sorted(list(nc_ct_dir.glob("*.nii.gz")))[:num_slices]
+    files = sorted(list(nc_ct_dir.glob("*.nii.gz")))
     
-    slices = []
-    for file_path in files:
-        # Load volume
-        nii = nib.load(str(file_path))
+    # Analyze multiple files to find varied noise levels
+    candidates = []
+    
+    print(f"\n🔍 Analyzing slices to find HIGH-NOISE and LOW-NOISE samples...")
+    
+    for file_idx, file_path in enumerate(files[:15]):  # Check first 15 files
+        try:
+            nii = nib.load(str(file_path))
+            volume = nii.get_fdata()
+            
+            # Check multiple slices per volume
+            D = volume.shape[2]
+            slice_indices = [D//4, D//2, 3*D//4]  # Check 3 slices per volume
+            
+            for slice_idx in slice_indices:
+                if slice_idx >= D:
+                    continue
+                
+                slice_2d = volume[:, :, slice_idx]
+                
+                # Measure noise level in tissue region
+                tissue_mask = (slice_2d > -100) & (slice_2d < 100)
+                if tissue_mask.sum() < 1000:  # Skip if too little tissue
+                    continue
+                
+                tissue_region = slice_2d[tissue_mask]
+                noise_std = tissue_region.std()
+                
+                # Store candidate
+                candidates.append({
+                    'file_path': file_path,
+                    'slice_idx': slice_idx,
+                    'noise_std': noise_std,
+                    'slice_2d': slice_2d
+                })
+        except:
+            continue
+    
+    if len(candidates) < 2:
+        print("⚠️ Warning: Not enough valid slices found, using defaults")
+        # Fallback
+        nii = nib.load(str(files[0]))
         volume = nii.get_fdata()
-        
-        # Get middle slice
-        mid_slice_idx = volume.shape[2] // 2
-        slice_2d = volume[:, :, mid_slice_idx]
+        slice_2d = volume[:, :, volume.shape[2]//2]
+        candidates = [
+            {'slice_2d': slice_2d, 'noise_std': 40, 'file_path': files[0], 'slice_idx': volume.shape[2]//2},
+            {'slice_2d': slice_2d, 'noise_std': 25, 'file_path': files[0], 'slice_idx': volume.shape[2]//2}
+        ]
+    
+    # Sort by noise level
+    candidates.sort(key=lambda x: x['noise_std'], reverse=True)
+    
+    # Select: Highest noise (HN) + Lowest noise (LN)
+    high_noise = candidates[0]  # Highest
+    low_noise = candidates[-1]   # Lowest
+    
+    print(f"✅ Selected 2 representative slices:")
+    print(f"   [HN] {high_noise['file_path'].name[:30]} slice {high_noise['slice_idx']} - Noise: {high_noise['noise_std']:.1f} HU")
+    print(f"   [LN] {low_noise['file_path'].name[:30]} slice {low_noise['slice_idx']} - Noise: {low_noise['noise_std']:.1f} HU")
+    print(f"   Noise ratio: {high_noise['noise_std'] / low_noise['noise_std']:.2f}x")
+    
+    # Prepare tensors
+    slices = []
+    slice_info = []
+    
+    for label, cand in [('HN', high_noise), ('LN', low_noise)]:
+        slice_2d = cand['slice_2d']
         
         # Normalize HU
         slice_2d = np.clip(slice_2d, hu_window[0], hu_window[1])
@@ -59,8 +121,16 @@ def load_fixed_full_slices(nc_ct_dir, hu_window, num_slices=3):
         # To tensor [1, 1, H, W]
         slice_tensor = torch.from_numpy(slice_2d).unsqueeze(0).unsqueeze(0)
         slices.append(slice_tensor)
+        
+        # Store metadata
+        slice_info.append({
+            'label': label,
+            'noise_std_hu': cand['noise_std'],
+            'file': cand['file_path'].name,
+            'slice_idx': cand['slice_idx']
+        })
     
-    return slices
+    return slices, slice_info
 
 
 
@@ -172,14 +242,13 @@ def train_n2n():
     print(f"   Test set file list saved: {test_indices_path}")
     
     # Prepare fixed validation samples for consistent progress tracking
-    print("\nPreparing fixed validation samples (full slices, no augmentation)...")
-    fixed_samples = load_fixed_full_slices(
+    print("\nPreparing fixed validation samples (HN + LN comparison)...")
+    fixed_samples, slice_info = load_fixed_full_slices(
         config['data']['nc_ct_dir'],
-        config['preprocessing']['hu_window'],
-        num_slices=3
+        config['preprocessing']['hu_window']
     )
-    print(f"   Fixed samples: {len(fixed_samples)} full slices")
-    print(f"   Size: {fixed_samples[0].shape} (no augmentation applied)")
+    print(f"   Fixed samples: {len(fixed_samples)} full slices (HN + LN)")
+    print(f"   Size: {fixed_samples[0].shape}")
     
     # Model
     print("\n  Building SwinIR model...")
@@ -479,8 +548,12 @@ def train_n2n():
         print(f"\nLR: {optimizer.param_groups[0]['lr']:.6f}")
         print(f"{'='*80}\n")
         
-        # Save checkpoint
+        # Check if best model
+        is_best = avg_val_loss < best_val_loss
+        if is_best:
+            best_val_loss = avg_val_loss
         
+        # Save checkpoint
         if epoch % config['training']['save_interval'] == 0 or is_best:
             save_checkpoint(
                 model, optimizer, scheduler, epoch, avg_val_loss,
@@ -505,12 +578,31 @@ def train_n2n():
                 
                 denoised_batch = torch.clamp(denoised_batch, 0, 1)
                 
-                # Save comparison (now shows multiple full slices)
+                # Calculate per-sample metrics for visualization
+                sample_metrics = []
+                for i in range(len(fixed_samples)):
+                    single_sample = noisy_batch[i:i+1]
+                    
+                    # Get loss with metrics
+                    _, loss_dict = criterion(model, single_sample)
+                    
+                    sample_metrics.append({
+                        'estimated_noise_hu': loss_dict.get('estimated_noise', 0) * 400,
+                        'adaptive_threshold_hu': loss_dict.get('estimated_noise', 0) * 400 * 2.5,  # k=2.5
+                        'adaptive_weight': loss_dict.get('adaptive_weight', config['training']['wavelet_weight']),
+                        'balance_ratio': loss_dict.get('balance_ratio', 0),
+                        'label': slice_info[i]['label'],
+                        'file': slice_info[i]['file'],
+                        'original_noise_hu': slice_info[i]['noise_std_hu']
+                    })
+                
+                # Save comparison with metrics
                 save_sample_images(
                     noisy_batch, 
                     denoised_batch,
                     sample_dir / f"epoch_{epoch}.png",
-                    epoch
+                    epoch,
+                    metrics=sample_metrics
                 )
         
         # Early stopping
