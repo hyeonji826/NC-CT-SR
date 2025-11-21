@@ -65,12 +65,22 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
                 
                 slice_2d = volume[:, :, slice_idx]
                 
-                # Measure noise level in tissue region
-                tissue_mask = (slice_2d > -100) & (slice_2d < 100)
+                # Use CENTER REGION ONLY (RECTANGLE) - exclude arms and equipment
+                # Horizontal: 70%, Vertical: 50% (matches abdomen shape)
+                h, w = slice_2d.shape
+                center_ratio_w = 0.55  # Horizontal
+                center_ratio_h = 0.60  # Vertical
+                margin_h = int(h * (1 - center_ratio_h) / 2)
+                margin_w = int(w * (1 - center_ratio_w) / 2)
+                
+                center_slice = slice_2d[margin_h:h-margin_h, margin_w:w-margin_w]
+                
+                # Measure noise level in tissue region (CENTER ONLY)
+                tissue_mask = (center_slice > -100) & (center_slice < 100)
                 if tissue_mask.sum() < 1000:  # Skip if too little tissue
                     continue
                 
-                tissue_region = slice_2d[tissue_mask]
+                tissue_region = center_slice[tissue_mask]
                 noise_std = tissue_region.std()
                 
                 # Store candidate

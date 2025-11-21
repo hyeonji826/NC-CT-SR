@@ -46,12 +46,12 @@ class NCCTDenoiseDataset(Dataset):
         if len(self.files) == 0:
             raise ValueError(f"No NIfTI files found in {self.nc_ct_dir}")
         
-        print(f"\nðŸ“ [{mode}] NC-CT Dataset:")
+        print(f"\nÃ°Å¸â€œÂ [{mode}] NC-CT Dataset:")
         print(f"   Files found: {len(self.files)}")
         print(f"   HU window: {self.hu_window}")
         print(f"   Patch size: {patch_size}")
         print(f"   Mode: {mode}")
-        print(f"   â†’ Self-supervised (no pairs needed!)")
+        print(f"   Ã¢â€ â€™ Self-supervised (no pairs needed!)")
     
     def normalize_hu(self, img):
         """
@@ -71,10 +71,10 @@ class NCCTDenoiseDataset(Dataset):
         
         # Safety checks
         if np.isnan(img).any():
-            print("âš ï¸ Warning: NaN detected, filling with 0")
+            print("Ã¢Å¡Â Ã¯Â¸Â Warning: NaN detected, filling with 0")
             img = np.nan_to_num(img, 0)
         if np.isinf(img).any():
-            print("âš ï¸ Warning: Inf detected, filling with 0")
+            print("Ã¢Å¡Â Ã¯Â¸Â Warning: Inf detected, filling with 0")
             img = np.nan_to_num(img, 0)
         
         return img.astype(np.float32)
@@ -103,7 +103,11 @@ class NCCTDenoiseDataset(Dataset):
     
     def random_crop(self, volume, max_attempts=10):
         """
-        Extract random valid patch from 3D volume
+        Extract random valid patch from 3D volume (CENTER REGION ONLY)
+        
+        Crops only from central 70% region to exclude:
+        - Arms (left/right edges)
+        - Medical equipment (top/bottom edges)
         
         Args:
             volume: 3D numpy array [H, W, D]
@@ -114,15 +118,38 @@ class NCCTDenoiseDataset(Dataset):
         """
         h, w, d = volume.shape
         
+        # Define center region as RECTANGLE (wider horizontally to match abdomen shape)
+        # Horizontal: 70% (wider to include full abdomen width)
+        # Vertical: 50% (narrower to exclude top/bottom background)
+        center_ratio_w = 0.55  # Horizontal
+        center_ratio_h = 0.60  # Vertical
+        margin_h = int(h * (1 - center_ratio_h) / 2)
+        margin_w = int(w * (1 - center_ratio_w) / 2)
+        
+        center_h_start = margin_h
+        center_h_end = h - margin_h
+        center_w_start = margin_w
+        center_w_end = w - margin_w
+        
         for attempt in range(max_attempts):
             # Random slice
             slice_idx = random.randint(0, d - 1)
             slice_2d = volume[:, :, slice_idx]
             
-            # Random crop if image is larger than patch_size
+            # Random crop from CENTER REGION ONLY
             if h > self.patch_size and w > self.patch_size:
-                top = random.randint(0, h - self.patch_size)
-                left = random.randint(0, w - self.patch_size)
+                # Ensure crop is within center region
+                crop_h_max = max(center_h_start, center_h_end - self.patch_size)
+                crop_w_max = max(center_w_start, center_w_end - self.patch_size)
+                
+                if crop_h_max > center_h_start and crop_w_max > center_w_start:
+                    top = random.randint(center_h_start, crop_h_max)
+                    left = random.randint(center_w_start, crop_w_max)
+                else:
+                    # Fallback: center crop
+                    top = (h - self.patch_size) // 2
+                    left = (w - self.patch_size) // 2
+                
                 patch = slice_2d[top:top+self.patch_size, left:left+self.patch_size]
             else:
                 # Center crop or pad if needed
@@ -201,7 +228,7 @@ class NCCTDenoiseDataset(Dataset):
             nii = nib.load(str(file_path))
             volume = nii.get_fdata()
         except Exception as e:
-            print(f"âš ï¸ Error loading {file_path}: {e}")
+            print(f"Ã¢Å¡Â Ã¯Â¸Â Error loading {file_path}: {e}")
             # Return a dummy tensor if loading fails
             return torch.zeros(1, self.patch_size, self.patch_size)
         

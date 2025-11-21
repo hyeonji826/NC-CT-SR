@@ -294,7 +294,7 @@ class CombinedN2NWaveletLoss(nn.Module):
                  wavelet_levels=3,
                  hu_window=(-160, 240),
                  adaptive=True,
-                 target_noise=0.1):  # Target noise level for weight scaling
+                 target_noise=0.15):  # Target noise level for weight scaling (60 HU)
         super().__init__()
         
         self.base_wavelet_weight = wavelet_weight
