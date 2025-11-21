@@ -101,17 +101,23 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
 
 def save_sample_images(noisy_input, denoised_output, save_path, epoch):
     """Save sample images for self-supervised learning"""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    # Show multiple samples if batch
+    num_samples = min(3, noisy_input.shape[0])
     
-    # Noisy input
-    axes[0].imshow(noisy_input[0, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-    axes[0].set_title('Noisy Input (NC-CT)')
-    axes[0].axis('off')
+    fig, axes = plt.subplots(num_samples, 2, figsize=(12, 6*num_samples))
+    if num_samples == 1:
+        axes = axes.reshape(1, -1)
     
-    # Denoised output
-    axes[1].imshow(denoised_output[0, 0].detach().cpu().numpy(), cmap='gray', vmin=0, vmax=1)
-    axes[1].set_title('Denoised Output')
-    axes[1].axis('off')
+    for idx in range(num_samples):
+        # Noisy input
+        axes[idx, 0].imshow(noisy_input[idx, 0].cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+        axes[idx, 0].set_title(f'Noisy Input (NC-CT) - Sample {idx+1}')
+        axes[idx, 0].axis('off')
+        
+        # Denoised output
+        axes[idx, 1].imshow(denoised_output[idx, 0].detach().cpu().numpy(), cmap='gray', vmin=0, vmax=1)
+        axes[idx, 1].set_title(f'Denoised Output - Sample {idx+1}')
+        axes[idx, 1].axis('off')
     
     plt.suptitle(f'Epoch {epoch} - Self-Supervised Denoising', fontsize=16)
     plt.tight_layout()

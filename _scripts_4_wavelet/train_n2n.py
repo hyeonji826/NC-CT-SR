@@ -27,6 +27,43 @@ from utils import (
     cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
 )
 
+def load_fixed_full_slices(nc_ct_dir, hu_window, num_slices=3):
+    """
+    Load fixed full slices for visualization (no augmentation)
+    
+    Returns:
+        List of [1, 1, H, W] tensors (full slices)
+    """
+    import nibabel as nib
+    import numpy as np
+    from pathlib import Path
+    
+    nc_ct_dir = Path(nc_ct_dir)
+    files = sorted(list(nc_ct_dir.glob("*.nii.gz")))[:num_slices]
+    
+    slices = []
+    for file_path in files:
+        # Load volume
+        nii = nib.load(str(file_path))
+        volume = nii.get_fdata()
+        
+        # Get middle slice
+        mid_slice_idx = volume.shape[2] // 2
+        slice_2d = volume[:, :, mid_slice_idx]
+        
+        # Normalize HU
+        slice_2d = np.clip(slice_2d, hu_window[0], hu_window[1])
+        slice_2d = (slice_2d - hu_window[0]) / (hu_window[1] - hu_window[0])
+        slice_2d = slice_2d.astype(np.float32)
+        
+        # To tensor [1, 1, H, W]
+        slice_tensor = torch.from_numpy(slice_2d).unsqueeze(0).unsqueeze(0)
+        slices.append(slice_tensor)
+    
+    return slices
+
+
+
 
 def train_n2n():
     """
@@ -84,7 +121,7 @@ def train_n2n():
     print(f"\n TensorBoard: tensorboard --logdir={log_dir}")
     
     # Dataset (NC-CT only!)
-    print("\nðŸ“‚ Loading NC-CT dataset (self-supervised)...")
+    print("\nÃ°Å¸â€œâ€š Loading NC-CT dataset (self-supervised)...")
     full_dataset = NCCTDenoiseDataset(
         nc_ct_dir=config['data']['nc_ct_dir'],
         hu_window=config['preprocessing']['hu_window'],
@@ -135,13 +172,14 @@ def train_n2n():
     print(f"   Test set file list saved: {test_indices_path}")
     
     # Prepare fixed validation samples for consistent progress tracking
-    print("\nPreparing fixed validation samples...")
-    fixed_samples = []
-    for i, sample in enumerate(val_loader):
-        fixed_samples.append(sample)
-        if i >= 2:  # Get 3 fixed samples
-            break
-    print(f"   Fixed samples: {len(fixed_samples)} (for tracking denoising progress)")
+    print("\nPreparing fixed validation samples (full slices, no augmentation)...")
+    fixed_samples = load_fixed_full_slices(
+        config['data']['nc_ct_dir'],
+        config['preprocessing']['hu_window'],
+        num_slices=3
+    )
+    print(f"   Fixed samples: {len(fixed_samples)} full slices")
+    print(f"   Size: {fixed_samples[0].shape} (no augmentation applied)")
     
     # Model
     print("\n  Building SwinIR model...")
@@ -194,7 +232,9 @@ def train_n2n():
             n2n_gamma=config['training']['n2n_gamma'],
             wavelet_weight=config['training']['wavelet_weight'],
             wavelet_threshold=config['training']['wavelet_threshold'],
-            wavelet_levels=config['training']['wavelet_levels']
+            wavelet_levels=config['training']['wavelet_levels'],
+            hu_window=tuple(config['preprocessing']['hu_window']),
+            adaptive=True
         ).to(device)
     else:  # n2n_only
         criterion = Neighbor2NeighborLoss(
@@ -238,9 +278,14 @@ def train_n2n():
     if config['training']['resume']:
         resume_path = Path(config['training']['resume'])
         if resume_path.exists():
-            start_epoch, _ = load_checkpoint(resume_path, model, optimizer, scheduler)
+            start_epoch, loaded_val_loss = load_checkpoint(resume_path, model, optimizer, scheduler)
             start_epoch += 1
-            print(f" Resumed from epoch {start_epoch-1}")
+            best_val_loss = loaded_val_loss
+            print(f"\n Resumed from epoch {start_epoch-1}")
+            print(f"   Best val loss: {best_val_loss:.4f}")
+        else:
+            print(f"\n WARNING: Resume path not found: {resume_path}")
+            print(f"   Starting from scratch...")
     
     # Training Loop
     print("\n" + "="*80)
@@ -258,7 +303,8 @@ def train_n2n():
         train_losses = []
         train_loss_details = {
             'n2n_rec': [], 'n2n_reg': [], 'n2n_total': [],
-            'wavelet': [], 'total': [], 'balance_ratio': []
+            'wavelet': [], 'total': [], 'balance_ratio': [],
+            'estimated_noise': [], 'adaptive_weight': []
         }
         
         if warmup.is_warmup():
@@ -323,6 +369,13 @@ def train_n2n():
             if 'balance_ratio' in loss_dict:
                 writer.add_scalar('Train/balance_ratio', loss_dict['balance_ratio'], global_step)
             
+            # Adaptive metrics (if available)
+            if 'estimated_noise' in loss_dict:
+                writer.add_scalar('Train/estimated_noise', loss_dict['estimated_noise'], global_step)
+            
+            if 'adaptive_weight' in loss_dict:
+                writer.add_scalar('Train/adaptive_weight', loss_dict['adaptive_weight'], global_step)
+            
             # Update progress bar
             pbar_dict = {
                 'loss': f"{loss.item():.4f}",
@@ -334,6 +387,8 @@ def train_n2n():
                 pbar_dict['wav'] = f"{loss_dict['wavelet_weighted']:.4f}"
             if 'balance_ratio' in loss_dict:
                 pbar_dict['bal'] = f"{loss_dict['balance_ratio']:.1f}"
+            if 'estimated_noise' in loss_dict and loss_dict['estimated_noise'] > 0:
+                pbar_dict['noise'] = f"{loss_dict['estimated_noise']*400:.1f}"  # HU scale
             
             pbar.set_postfix(pbar_dict)
         
@@ -351,7 +406,8 @@ def train_n2n():
         val_losses = []
         val_loss_details = {
             'n2n_rec': [], 'n2n_reg': [], 'n2n_total': [],
-            'wavelet': [], 'total': [], 'balance_ratio': []
+            'wavelet': [], 'total': [], 'balance_ratio': [],
+            'estimated_noise': [], 'adaptive_weight': []
         }
         
         with torch.no_grad():
@@ -397,6 +453,14 @@ def train_n2n():
             print(f"  |- N2N:     {avg_val_details['n2n_total']:.4f}")
         if 'wavelet' in avg_val_details:
             print(f"  \\- Wavelet: {avg_val_details['wavelet']:.4f}")
+        # Adaptive metrics
+        if 'estimated_noise' in avg_train_details and avg_train_details['estimated_noise'] > 0:
+            noise_hu = avg_train_details['estimated_noise'] * 400
+            print(f"\nEstimated Noise: {noise_hu:.1f} HU")
+        
+        if 'adaptive_weight' in avg_train_details:
+            print(f"Adaptive Weight: {avg_train_details['adaptive_weight']:.6f}")
+        
         # Balance check
         if 'balance_ratio' in avg_train_details:
             ratio = avg_train_details['balance_ratio']
@@ -416,9 +480,6 @@ def train_n2n():
         print(f"{'='*80}\n")
         
         # Save checkpoint
-        is_best = avg_val_loss < best_val_loss
-        if is_best:
-            best_val_loss = avg_val_loss
         
         if epoch % config['training']['save_interval'] == 0 or is_best:
             save_checkpoint(
@@ -432,21 +493,22 @@ def train_n2n():
         if epoch % config['training']['sample_interval'] == 0:
             model.eval()
             with torch.no_grad():
-                # Use first fixed sample
-                noisy_sample = fixed_samples[0].to(device)
+                # Process all fixed samples as batch
+                noisy_batch = torch.cat(fixed_samples, dim=0).to(device)
                 
                 # Get denoised output
                 if use_amp:
                     with autocast():
-                        denoised = model(noisy_sample)
+                        denoised_batch = model(noisy_batch)
                 else:
-                    denoised = model(noisy_sample)
+                    denoised_batch = model(noisy_batch)
                 
-                denoised = torch.clamp(denoised, 0, 1)
+                denoised_batch = torch.clamp(denoised_batch, 0, 1)
                 
-                # Save comparison
+                # Save comparison (now shows multiple full slices)
                 save_sample_images(
-                    noisy_sample, denoised, noisy_sample,
+                    noisy_batch, 
+                    denoised_batch,
                     sample_dir / f"epoch_{epoch}.png",
                     epoch
                 )

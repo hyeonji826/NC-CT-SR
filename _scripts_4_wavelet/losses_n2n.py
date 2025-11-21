@@ -1,4 +1,4 @@
-# losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity
+# losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity (Adaptive)
 
 import torch
 import torch.nn as nn
@@ -76,7 +76,7 @@ class Neighbor2NeighborLoss(nn.Module):
         Compute N2N loss.
         
         Args:
-            model: denoising network f(Â·)
+            model: denoising network f(·)
             noisy_input: [B, C, H, W] - noisy CT image
             
         Returns:
@@ -111,40 +111,63 @@ class Neighbor2NeighborLoss(nn.Module):
 
 class WaveletSparsityPrior(nn.Module):
     """
-    Wavelet Sparsity Prior for Medical Image Denoising
+    Wavelet Sparsity Prior for Medical Image Denoising (Adaptive)
     
-    Reference: "ë³µë¶€ CT ì˜ìƒì˜ í™”ì§ˆ ê°œì„  ë°©ë²•ì— ëŒ€í•œ ì—°êµ¬" (2023)
-    
-    Key Idea:
-    - Natural images have SPARSE wavelet coefficients
-    - Noise creates NON-SPARSE (dense) high-frequency coefficients
-    - Encourage sparsity -> removes noise while preserving edges
+    Key Improvements:
+    1. HU-based threshold normalization (not RGB 255)
+    2. Adaptive thresholding using MAD (Median Absolute Deviation)
+    3. Per-image noise estimation for handling noise imbalance
     
     Method:
-    1. DWT decomposition (multi-level)
-    2. Soft thresholding on detail coefficients
-    3. L1 penalty to encourage actual coeffs -> threshold coeffs
-    
-    Critical for Self-Supervised:
-    - Acts as regularization (prevents overfitting to noise)
-    - Preserves edges (unlike L2 smoothness penalty)
-    - Complements N2N (which can overfit without regularization)
+    1. Estimate noise level using MAD from wavelet coefficients
+    2. Adapt threshold based on estimated noise (k * sigma)
+    3. Apply soft thresholding with adapted threshold
+    4. L1 penalty to encourage sparsity
     """
     
-    def __init__(self, threshold=50, wavelet='haar', levels=3):
+    def __init__(self, threshold=40, wavelet='haar', levels=3, hu_window=(-160, 240), adaptive=True):
         super().__init__()
         
-        # Normalize threshold to [0, 1] range
-        self.threshold = threshold / 255.0
+        # HU window for correct normalization
+        self.hu_range = hu_window[1] - hu_window[0]  # 400 for (-160, 240)
+        
+        # Base threshold (will be adapted per image if adaptive=True)
+        self.base_threshold = threshold / self.hu_range  # Correct normalization
+        self.base_threshold_hu = threshold
+        
         self.wavelet = wavelet
         self.levels = levels
+        self.adaptive = adaptive
         
-        print(f"\nWavelet Sparsity Prior:")
-        print(f"   Threshold: {threshold} HU -> {self.threshold:.4f} (normalized)")
+        print(f"\nWavelet Sparsity Prior (Adaptive):")
+        print(f"   Base Threshold: {threshold} HU -> {self.base_threshold:.4f} (normalized)")
+        print(f"   HU Range: {self.hu_range} ({hu_window[0]} to {hu_window[1]})")
         print(f"   Wavelet: {wavelet}")
         print(f"   Levels: {levels}")
+        print(f"   Adaptive: {adaptive} (noise-aware thresholding)")
         print(f"   Encourages sparse high-freq coefficients (removes noise)")
+    
+    def estimate_noise_mad(self, coeffs_tuple):
+        """
+        Estimate noise level using MAD (Median Absolute Deviation)
         
+        Args:
+            coeffs_tuple: (cH, cV, cD) from finest level
+            
+        Returns:
+            sigma: estimated noise standard deviation (normalized)
+        """
+        cH, cV, cD = coeffs_tuple
+        
+        # Combine all detail coefficients from finest level
+        all_details = np.concatenate([cH.flatten(), cV.flatten(), cD.flatten()])
+        
+        # MAD estimation: sigma = median(|X|) / 0.6745
+        mad = np.median(np.abs(all_details))
+        sigma = mad / 0.6745
+        
+        return sigma
+    
     def soft_threshold(self, coeffs, threshold):
         """
         Soft Thresholding Operator (SoT)
@@ -160,19 +183,21 @@ class WaveletSparsityPrior(nn.Module):
     
     def forward(self, pred):
         """
-        Compute wavelet sparsity loss.
+        Compute wavelet sparsity loss with adaptive thresholding.
         
         Args:
             pred: [B, C, H, W] - model output (denoised)
             
         Returns:
             loss: L1 distance between coeffs and sparse target
+            estimated_noise: average estimated noise level (for monitoring)
         """
         batch_size = pred.size(0)
         device = pred.device
         total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         valid_samples = 0
+        noise_levels = []
         
         for i in range(batch_size):
             pred_np = pred[i, 0].detach().cpu().numpy()
@@ -185,14 +210,25 @@ class WaveletSparsityPrior(nn.Module):
                 # Multi-level DWT
                 coeffs = pywt.wavedec2(pred_np, self.wavelet, level=self.levels)
                 
+                # Estimate noise level from finest level (adaptive)
+                if self.adaptive and len(coeffs) > 1:
+                    sigma = self.estimate_noise_mad(coeffs[1])
+                    noise_levels.append(sigma)
+                    
+                    # Adapt threshold: k * sigma (k=2.0~3.0 empirically good)
+                    adaptive_threshold = max(sigma * 2.5, self.base_threshold * 0.5)  # Floor at 50% of base
+                    adaptive_threshold = min(adaptive_threshold, self.base_threshold * 2.0)  # Ceiling at 200% of base
+                else:
+                    adaptive_threshold = self.base_threshold
+                
                 level_loss = 0
                 
                 # Only penalize detail coefficients (high-frequency)
                 for level_idx in range(1, len(coeffs)):
                     cH, cV, cD = coeffs[level_idx]
                     
-                    # Adaptive threshold per level
-                    level_threshold = self.threshold / (2 ** (level_idx - 1))
+                    # Scale threshold per level
+                    level_threshold = adaptive_threshold / (2 ** (level_idx - 1))
                     
                     # Compute sparse target
                     cH_sparse = self.soft_threshold(cH, level_threshold)
@@ -228,44 +264,42 @@ class WaveletSparsityPrior(nn.Module):
                 continue
         
         if valid_samples == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            return torch.tensor(0.0, device=device, requires_grad=True), 0.0
         
-        return total_loss / valid_samples
+        # Average noise level for monitoring
+        avg_noise = np.mean(noise_levels) if noise_levels else 0.0
+        
+        return total_loss / valid_samples, avg_noise
 
 
 class CombinedN2NWaveletLoss(nn.Module):
     """
-    Combined Loss: Neighbor2Neighbor + Wavelet Sparsity
+    Combined Loss: Neighbor2Neighbor + Wavelet Sparsity (Adaptive)
+    
+    New Features:
+    1. Noise-aware weighting: dynamically adjusts wavelet weight based on noise level
+    2. Adaptive thresholding: per-image threshold adaptation
+    3. Handles noise imbalance across dataset
     
     Philosophy:
-    1. N2N: Main denoising mechanism (self-supervised)
-       - Uses independent noise observations
-       - Can overfit without regularization
-    
-    2. Wavelet: Regularization (prevents overfitting to noise)
-       - Encourages natural image statistics (sparsity)
-       - Preserves edges while removing noise
-    
-    Balancing (CRITICAL!):
-    - N2N weight: 1.0 (main loss - DO NOT CHANGE)
-    - Wavelet weight: 0.05~0.1 (light regularization)
-    
-    Why this balance?
-    - Too high wavelet -> oversmoothing (loses N2N benefit)
-    - Too low wavelet -> overfitting to noise patterns
-    - 0.05~0.1 is empirically optimal
-    
-    WARNING: Keep wavelet weak to preserve N2N logic!
+    - High noise images: stronger wavelet (more denoising)
+    - Low noise images: weaker wavelet (preserve details)
+    - Automatic balancing for optimal results
     """
     
     def __init__(self,
                  n2n_gamma=2.0,
-                 wavelet_weight=0.05,
-                 wavelet_threshold=50,
-                 wavelet_levels=3):
+                 wavelet_weight=0.005,
+                 wavelet_threshold=40,
+                 wavelet_levels=3,
+                 hu_window=(-160, 240),
+                 adaptive=True,
+                 target_noise=0.1):  # Target noise level for weight scaling
         super().__init__()
         
-        self.wavelet_weight = wavelet_weight
+        self.base_wavelet_weight = wavelet_weight
+        self.target_noise = target_noise  # Reference noise level
+        self.adaptive = adaptive
         
         # N2N loss (main)
         self.n2n_loss = Neighbor2NeighborLoss(gamma=n2n_gamma)
@@ -274,18 +308,22 @@ class CombinedN2NWaveletLoss(nn.Module):
         self.wavelet_loss = WaveletSparsityPrior(
             threshold=wavelet_threshold,
             wavelet='haar',
-            levels=wavelet_levels
+            levels=wavelet_levels,
+            hu_window=hu_window,
+            adaptive=adaptive
         )
         
-        print(f"\nCombined Loss Balancing:")
+        print(f"\nCombined Loss Balancing (Adaptive):")
         print(f"   N2N weight: 1.0 (MAIN - reconstruction)")
-        print(f"   Wavelet weight: {wavelet_weight} (REGULARIZATION)")
-        print(f"   Balance ratio target: ~{1.0/wavelet_weight:.1f}:1")
-        print(f"   N2N logic preserved, wavelet prevents overfitting")
+        print(f"   Base Wavelet weight: {wavelet_weight} (REGULARIZATION)")
+        print(f"   Adaptive weighting: {adaptive} (noise-aware)")
+        print(f"   Target noise level: {target_noise:.4f}")
+        print(f"   -> High noise images get stronger wavelet regularization")
+        print(f"   -> Low noise images get weaker wavelet (preserve details)")
         
     def forward(self, model, noisy_input):
         """
-        Compute combined loss.
+        Compute combined loss with adaptive weighting.
         
         Args:
             model: denoising network
@@ -304,15 +342,25 @@ class CombinedN2NWaveletLoss(nn.Module):
         output = model(g1)
         output = torch.clamp(output, 0, 1)
         
-        # Wavelet sparsity (regularization)
-        wavelet = self.wavelet_loss(output)
+        # Wavelet sparsity (regularization) with noise estimation
+        wavelet, estimated_noise = self.wavelet_loss(output)
         
         # NaN protection
         if torch.isnan(wavelet):
             wavelet = torch.tensor(0.0, device=noisy_input.device, requires_grad=True)
+            estimated_noise = 0.0
+        
+        # Adaptive weighting based on noise level
+        if self.adaptive and estimated_noise > 0:
+            # Scale weight proportionally to noise level
+            noise_ratio = estimated_noise / self.target_noise
+            noise_ratio = max(0.5, min(noise_ratio, 2.0))  # Clamp to [0.5, 2.0]
+            adaptive_weight = self.base_wavelet_weight * noise_ratio
+        else:
+            adaptive_weight = self.base_wavelet_weight
         
         # Combined loss (keep gradient!)
-        total = n2n_total + self.wavelet_weight * wavelet
+        total = n2n_total + adaptive_weight * wavelet
         
         return total, {
             'n2n_rec': n2n_dict['rec'],
@@ -320,9 +368,11 @@ class CombinedN2NWaveletLoss(nn.Module):
             'n2n_reg_weighted': n2n_dict['reg_weighted'],
             'n2n_total': n2n_dict['total'],
             'wavelet_raw': wavelet.item(),
-            'wavelet_weighted': wavelet.item() * self.wavelet_weight,
+            'wavelet_weighted': wavelet.item() * adaptive_weight,
             'total': total.item(),
-            'balance_ratio': n2n_dict['total'] / (wavelet.item() * self.wavelet_weight + 1e-8)
+            'balance_ratio': n2n_dict['total'] / (wavelet.item() * adaptive_weight + 1e-8),
+            'estimated_noise': estimated_noise,
+            'adaptive_weight': adaptive_weight
         }
 
 
