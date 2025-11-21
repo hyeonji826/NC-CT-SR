@@ -217,7 +217,7 @@ class WaveletSparsityPrior(nn.Module):
                     
                     # Adapt threshold: k * sigma (k=2.0~3.0 empirically good)
                     adaptive_threshold = max(sigma * 2.5, self.base_threshold * 0.5)  # Floor at 50% of base
-                    adaptive_threshold = min(adaptive_threshold, self.base_threshold * 2.0)  # Ceiling at 200% of base
+                    adaptive_threshold = min(adaptive_threshold, self.base_threshold * 3.0)  # Ceiling at 300% of base (increased for noise variation)
                 else:
                     adaptive_threshold = self.base_threshold
                 

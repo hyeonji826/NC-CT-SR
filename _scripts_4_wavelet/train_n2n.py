@@ -83,12 +83,12 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
                 tissue_region = center_slice[tissue_mask]
                 noise_std = tissue_region.std()
                 
-                # Store candidate
+                # Store candidate (CROPPED center region)
                 candidates.append({
                     'file_path': file_path,
                     'slice_idx': slice_idx,
                     'noise_std': noise_std,
-                    'slice_2d': slice_2d
+                    'slice_2d': center_slice  # ✅ Cropped center region
                 })
         except:
             continue

@@ -120,6 +120,21 @@ def save_sample_images(noisy_input, denoised_output, save_path, epoch, metrics=N
     for idx in range(num_samples):
         noisy_np = noisy_input[idx, 0].cpu().numpy()
         denoised_np = denoised_output[idx, 0].detach().cpu().numpy()
+        
+        # Calculate center region BEFORE rotation (original coordinates)
+        # Rectangle: wider horizontally (70%) to match abdomen shape
+        h_orig, w_orig = noisy_np.shape
+        center_ratio_w = 0.55  # Horizontal: 70%
+        center_ratio_h = 0.60  # Vertical: 50%
+        margin_h_orig = int(h_orig * (1 - center_ratio_h) / 2)
+        margin_w_orig = int(w_orig * (1 - center_ratio_w) / 2)
+        center_h_orig = h_orig - 2*margin_h_orig
+        center_w_orig = w_orig - 2*margin_w_orig
+        
+        # Rotate 90 degrees counter-clockwise for proper orientation
+        noisy_np = np.rot90(noisy_np, k=1)
+        denoised_np = np.rot90(denoised_np, k=1)
+        
         diff_np = noisy_np - denoised_np  # Removed noise
         
         # Get metrics if available
@@ -150,7 +165,17 @@ def save_sample_images(noisy_input, denoised_output, save_path, epoch, metrics=N
         
         # Noisy input
         axes[idx, 0].imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
-        title_str = f'[{label}] Noisy\nOriginal: {orig_noise:.1f} HU'
+        
+        # Draw center region box (adjusted for rotation)
+        # After rot90(k=1): (x,y) -> (y, width-x-w), width/height swapped
+        h_rotated, w_rotated = noisy_np.shape
+        from matplotlib.patches import Rectangle
+        rect = Rectangle((margin_h_orig, w_rotated - (margin_w_orig + center_w_orig)), 
+                        center_h_orig, center_w_orig,
+                        linewidth=2, edgecolor='lime', facecolor='none', linestyle='--')
+        axes[idx, 0].add_patch(rect)
+        
+        title_str = f'[{label}] Noisy (ROI: 70%×50%)\nOriginal: {orig_noise:.1f} HU'
         if est_noise > 0:
             title_str += f'\nEstimated: {est_noise:.1f} HU'
         axes[idx, 0].set_title(title_str, fontsize=11, fontweight='bold', color=label_color)
