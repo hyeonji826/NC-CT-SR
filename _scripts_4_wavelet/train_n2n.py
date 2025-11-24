@@ -15,6 +15,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import time
 import yaml
+import argparse
 
 # Add SwinIR to path
 sys.path.insert(0, r'E:\LD-CT SR\_externals\SwinIR')
@@ -142,7 +143,18 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
     
     return slices, slice_info
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str,
+                        default='_scripts_4_wavelet/config/config_n2n.yaml')
+    parser.add_argument('--exp', type=str, default='debug')
+    args = parser.parse_args()
+    return args
 
+def load_config(path):
+    with open(path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    return cfg
 
 
 def train_n2n():
@@ -173,7 +185,9 @@ def train_n2n():
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
     
+    args = parse_args()
     config = load_config(config_path)
+    exp_name = args.exp
     
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -589,26 +603,31 @@ def train_n2n():
                 denoised_batch = torch.clamp(denoised_batch, 0, 1)
                 
                 # Calculate per-sample metrics (lightweight - wavelet only)
-                sample_metrics = []
-                for i in range(len(fixed_samples)):
-                    single_denoised = denoised_batch[i:i+1]
-                    
-                    # Only compute wavelet noise estimation (no full criterion)
-                    _, est_noise = criterion.wavelet_loss(single_denoised)
-                    
-                    sample_metrics.append({
-                        'estimated_noise_hu': est_noise * 400,
-                        'adaptive_threshold_hu': est_noise * 400 * 2.5,
-                        'adaptive_weight': config['training']['wavelet_weight'],
-                        'balance_ratio': 0,  # Not computed per-sample
-                        'label': slice_info[i]['label'],
-                        'file': slice_info[i]['file'],
-                        'original_noise_hu': slice_info[i]['noise_std_hu']
-                    })
-                
-                # Save comparison with metrics
+                sample_metrics = None
+
+                # criterion이 Wavelet 기반 loss를 가지고 있을 때만 계산
+                if hasattr(criterion, "wavelet_loss"):
+                    sample_metrics = []
+                    for i in range(len(fixed_samples)):
+                        single_denoised = denoised_batch[i:i+1]
+
+                        # Only compute wavelet noise estimation (no full criterion / no grad)
+                        with torch.no_grad():
+                            _, est_noise = criterion.wavelet_loss(single_denoised)
+
+                        sample_metrics.append({
+                            'estimated_noise_hu': est_noise * 400,
+                            'adaptive_threshold_hu': est_noise * 400 * 2.5,
+                            'adaptive_weight': config['training']['wavelet_weight'],
+                            'balance_ratio': 0,  # Not computed per-sample
+                            'label': slice_info[i]['label'],
+                            'file': slice_info[i]['file'],
+                            'original_noise_hu': slice_info[i]['noise_std_hu']
+                        })
+
+                # Save comparison with metrics (없으면 metrics=None으로 넘김)
                 save_sample_images(
-                    noisy_batch, 
+                    noisy_batch,
                     denoised_batch,
                     sample_dir / f"epoch_{epoch}.png",
                     epoch,

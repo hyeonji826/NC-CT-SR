@@ -1,4 +1,4 @@
-# losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity (Optimized)
+# losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity (Adaptive + Edge Preservation)
 
 import torch
 import torch.nn as nn
@@ -11,38 +11,25 @@ warnings.filterwarnings('ignore')
 class PyTorchDWT2D(nn.Module):
     """
     PyTorch-based 2D Discrete Wavelet Transform (Haar)
-    
-    Runs entirely on GPU - NO CPU transfers!
-    Replaces pywt for massive performance improvement
+    100% GPU computation - NO CPU transfers
     """
     
     def __init__(self, wavelet='haar'):
         super().__init__()
         
         if wavelet == 'haar':
-            # Haar wavelet filters
             h0 = torch.tensor([1/np.sqrt(2), 1/np.sqrt(2)], dtype=torch.float32)
             h1 = torch.tensor([1/np.sqrt(2), -1/np.sqrt(2)], dtype=torch.float32)
         else:
-            raise NotImplementedError(f"Wavelet '{wavelet}' not implemented. Use 'haar'.")
+            raise NotImplementedError(f"Wavelet '{wavelet}' not implemented.")
         
-        # Create 2D filters
         self.register_buffer('h0', h0)
         self.register_buffer('h1', h1)
     
     def forward(self, x):
-        """
-        Single-level 2D DWT
-        
-        Args:
-            x: [B, C, H, W] tensor
-            
-        Returns:
-            coeffs: (LL, LH, HL, HH) - each [B, C, H/2, W/2]
-        """
+        """Single-level 2D DWT"""
         B, C, H, W = x.shape
         
-        # Ensure even dimensions
         if H % 2 != 0:
             x = F.pad(x, (0, 0, 0, 1), mode='reflect')
             H += 1
@@ -50,20 +37,14 @@ class PyTorchDWT2D(nn.Module):
             x = F.pad(x, (0, 1, 0, 0), mode='reflect')
             W += 1
         
-        # Create 2D conv kernels from 1D filters
-        # Low-pass filter (h0)
         h0_2d_row = self.h0.view(1, 1, 1, -1).repeat(C, 1, 1, 1)
         h0_2d_col = self.h0.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
-        
-        # High-pass filter (h1)
         h1_2d_row = self.h1.view(1, 1, 1, -1).repeat(C, 1, 1, 1)
         h1_2d_col = self.h1.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
         
-        # Apply row-wise filtering
         x_l = F.conv2d(x, h0_2d_row, stride=(1, 2), padding=(0, 0), groups=C)
         x_h = F.conv2d(x, h1_2d_row, stride=(1, 2), padding=(0, 0), groups=C)
         
-        # Apply column-wise filtering
         LL = F.conv2d(x_l, h0_2d_col, stride=(2, 1), padding=(0, 0), groups=C)
         LH = F.conv2d(x_l, h1_2d_col, stride=(2, 1), padding=(0, 0), groups=C)
         HL = F.conv2d(x_h, h0_2d_col, stride=(2, 1), padding=(0, 0), groups=C)
@@ -72,17 +53,7 @@ class PyTorchDWT2D(nn.Module):
         return LL, LH, HL, HH
     
     def multi_level(self, x, levels):
-        """
-        Multi-level DWT
-        
-        Args:
-            x: [B, C, H, W]
-            levels: number of decomposition levels
-            
-        Returns:
-            List of tuples: [(LH1, HL1, HH1), (LH2, HL2, HH2), ...]
-            Plus final LL: [LL_final]
-        """
+        """Multi-level DWT"""
         coeffs = []
         current = x
         
@@ -97,22 +68,6 @@ class PyTorchDWT2D(nn.Module):
 class Neighbor2NeighborLoss(nn.Module):
     """
     Neighbor2Neighbor Loss (CVPR 2021) - EXACT Implementation
-    
-    Paper: "Neighbor2Neighbor: Self-Supervised Denoising from Single Noisy Images"
-    Authors: Huang et al.
-    
-    Key Idea:
-    1. Subsample noisy image into 4 spatially-disjoint sub-images (2x2 checkerboard)
-    2. Each sub-image has INDEPENDENT noise (critical!)
-    3. Use one as input (g1), another as target (g2)
-    4. Loss = ||f(g1) - g2||^2 + gamma * ||f(g1) - g1||^2
-       - First term: reconstruction with independent noise -> denoises
-       - Second term: regularization to prevent identity mapping
-    
-    Implementation Details:
-    - 2x2 checkerboard creates 4 positions: (even,even), (even,odd), (odd,even), (odd,odd)
-    - We use (even,even) and (odd,odd) for maximum spatial separation
-    - gamma = 2.0 (paper's optimal value)
     """
     
     def __init__(self, gamma=2.0):
@@ -121,24 +76,11 @@ class Neighbor2NeighborLoss(nn.Module):
         print(f"\nNeighbor2Neighbor Loss:")
         print(f"   gamma = {gamma}")
         print(f"   Loss = L_rec + {gamma} * L_reg")
-        print(f"   Prevents identity mapping while denoising")
     
     def generate_subimages_checkerboard(self, noisy):
-        """
-        Generate two spatially-disjoint sub-images using 2x2 checkerboard pattern.
-        
-        Args:
-            noisy: [B, C, H, W] - noisy input image
-            
-        Returns:
-            g1: [B, C, H, W] - subsampled image 1 (even-even positions)
-            g2: [B, C, H, W] - subsampled image 2 (odd-odd positions)
-            
-        Critical: g1 and g2 must have INDEPENDENT noise!
-        """
+        """Generate two spatially-disjoint sub-images"""
         B, C, H, W = noisy.shape
         
-        # Ensure even dimensions
         if H % 2 != 0:
             noisy = noisy[:, :, :-1, :]
             H = H - 1
@@ -146,46 +88,24 @@ class Neighbor2NeighborLoss(nn.Module):
             noisy = noisy[:, :, :, :-1]
             W = W - 1
         
-        # Extract checkerboard positions
-        pos_0 = noisy[:, :, 0::2, 0::2]  # [B, C, H/2, W/2]
-        pos_3 = noisy[:, :, 1::2, 1::2]  # [B, C, H/2, W/2]
+        pos_0 = noisy[:, :, 0::2, 0::2]
+        pos_3 = noisy[:, :, 1::2, 1::2]
         
-        # Upsample to original size (bilinear for gradient flow)
         g1 = F.interpolate(pos_0, size=(H, W), mode='bilinear', align_corners=False)
         g2 = F.interpolate(pos_3, size=(H, W), mode='bilinear', align_corners=False)
         
         return g1, g2
     
     def forward(self, model, noisy_input, return_output=False):
-        """
-        Compute N2N loss.
-        
-        Args:
-            model: denoising network f(·)
-            noisy_input: [B, C, H, W] - noisy CT image
-            return_output: if True, also return model output
-            
-        Returns:
-            total_loss: scalar tensor with gradients
-            loss_dict: dictionary with loss components (detached scalars)
-            output: (optional) model output if return_output=True
-        """
-        # Generate spatially-disjoint subsamples
+        """Compute N2N loss"""
         g1, g2 = self.generate_subimages_checkerboard(noisy_input)
         
-        # Forward pass: denoise g1
         output = model(g1)
         output = torch.clamp(output, 0, 1)
         
-        # L_rec: reconstruction loss (output vs g2)
-        # g2 has INDEPENDENT noise from g1, so this denoises!
         rec_loss = F.mse_loss(output, g2)
-        
-        # L_reg: regularization loss (output vs g1)
-        # Prevents identity mapping
         reg_loss = F.mse_loss(output, g1)
         
-        # Total N2N loss (keep gradient!)
         total = rec_loss + self.gamma * reg_loss
         
         loss_dict = {
@@ -196,167 +116,155 @@ class Neighbor2NeighborLoss(nn.Module):
         }
         
         if return_output:
-            return total, loss_dict, output
+            return total, loss_dict, output, g1
         else:
             return total, loss_dict
 
 
 class WaveletSparsityPrior(nn.Module):
     """
-    Wavelet Sparsity Prior for Medical Image Denoising (GPU-Optimized)
-    
-    Key Improvements:
-    1. 100% GPU computation - NO CPU transfers!
-    2. PyTorch-based DWT (replaces pywt)
-    3. Adaptive thresholding using MAD
-    4. Per-image noise estimation
-    
-    Method:
-    1. Estimate noise level using MAD from wavelet coefficients
-    2. Adapt threshold based on estimated noise (k * sigma)
-    3. Apply soft thresholding with adapted threshold
-    4. L1 penalty to encourage sparsity
+    Wavelet Sparsity Prior - FIXED: Estimate noise from INPUT, not output
     """
     
-    def __init__(self, threshold=40, wavelet='haar', levels=3, hu_window=(-160, 240), adaptive=True):
+    def __init__(self, threshold=60, wavelet='haar', levels=3, hu_window=(-160, 240), adaptive=True):
         super().__init__()
         
-        # HU window for correct normalization
-        self.hu_range = hu_window[1] - hu_window[0]  # 400 for (-160, 240)
-        
-        # Base threshold (will be adapted per image if adaptive=True)
-        self.base_threshold = threshold / self.hu_range  # Correct normalization
+        self.hu_range = hu_window[1] - hu_window[0]
+        self.base_threshold = threshold / self.hu_range
         self.base_threshold_hu = threshold
-        
         self.levels = levels
         self.adaptive = adaptive
         
-        # PyTorch DWT (GPU-based)
         self.dwt = PyTorchDWT2D(wavelet=wavelet)
         
-        print(f"\nWavelet Sparsity Prior (GPU-Optimized):")
-        print(f"   Base Threshold: {threshold} HU -> {self.base_threshold:.4f} (normalized)")
-        print(f"   HU Range: {self.hu_range} ({hu_window[0]} to {hu_window[1]})")
-        print(f"   Wavelet: {wavelet}")
+        print(f"\nWavelet Sparsity Prior (FIXED Adaptive):")
+        print(f"   Base Threshold: {threshold} HU -> {self.base_threshold:.4f}")
         print(f"   Levels: {levels}")
-        print(f"   Adaptive: {adaptive} (noise-aware thresholding)")
-        print(f"   ✅ 100% GPU computation (NO CPU transfers!)")
+        print(f"   ✅ Noise estimated from INPUT (not output)")
     
-    def estimate_noise_mad(self, detail_coeffs):
+    def estimate_noise_from_input(self, noisy_input):
         """
-        Estimate noise level using MAD (Median Absolute Deviation)
+        Estimate noise level from NOISY INPUT using MAD
+        This is the CORRECT way - estimate from input, not denoised output
+        """
+        _, detail_coeffs_list = self.dwt.multi_level(noisy_input, 1)
         
-        Args:
-            detail_coeffs: (LH, HL, HH) tuple from finest level
+        if len(detail_coeffs_list) > 0:
+            LH, HL, HH = detail_coeffs_list[0]
             
-        Returns:
-            sigma: estimated noise standard deviation (normalized)
-        """
-        LH, HL, HH = detail_coeffs
+            all_details = torch.cat([
+                LH.flatten(1),
+                HL.flatten(1),
+                HH.flatten(1)
+            ], dim=1)
+            
+            mad = torch.median(torch.abs(all_details), dim=1)[0]
+            sigma = mad / 0.6745
+            
+            return sigma
         
-        # Combine all detail coefficients from finest level
-        all_details = torch.cat([
-            LH.flatten(1),
-            HL.flatten(1),
-            HH.flatten(1)
-        ], dim=1)  # [B, N*3]
-        
-        # MAD estimation: sigma = median(|X|) / 0.6745
-        # Per-batch calculation
-        mad = torch.median(torch.abs(all_details), dim=1)[0]  # [B]
-        sigma = mad / 0.6745
-        
-        return sigma
+        return torch.zeros(noisy_input.size(0), device=noisy_input.device)
     
     def soft_threshold(self, coeffs, threshold):
-        """
-        Soft Thresholding Operator (SoT) - GPU version
-        
-        Formula:
-            T_soft(x) = sign(x) * max(|x| - threshold, 0)
-        
-        Effect:
-            - Small coeffs (< threshold): -> 0 (assumed to be noise)
-            - Large coeffs (> threshold): -> shrunk but preserved (signal)
-        """
+        """Soft Thresholding Operator"""
         return torch.sign(coeffs) * torch.clamp(torch.abs(coeffs) - threshold, min=0)
     
-    def forward(self, pred):
+    def forward(self, pred, estimated_sigma=None):
         """
-        Compute wavelet sparsity loss with adaptive thresholding.
-        
-        Args:
-            pred: [B, C, H, W] - model output (denoised)
-            
-        Returns:
-            loss: L1 distance between coeffs and sparse target
-            estimated_noise: average estimated noise level (for monitoring)
+        Compute wavelet sparsity loss
+        estimated_sigma: pre-computed noise level from input
         """
         B, C, H, W = pred.shape
         device = pred.device
         
-        # Multi-level DWT (100% GPU)
         LL_final, detail_coeffs_list = self.dwt.multi_level(pred, self.levels)
         
-        # Estimate noise level from finest level (adaptive)
-        if self.adaptive and len(detail_coeffs_list) > 0:
-            sigma = self.estimate_noise_mad(detail_coeffs_list[0])  # [B]
-            
-            # Adapt threshold: k * sigma (k=2.5)
+        if self.adaptive and estimated_sigma is not None:
             adaptive_threshold = torch.clamp(
-                sigma * 2.5,
-                min=self.base_threshold * 0.5,
+                estimated_sigma * 2.5,
+                min=self.base_threshold * 0.3,
                 max=self.base_threshold * 3.0
-            )  # [B]
-            
-            # Broadcast to [B, 1, 1, 1]
+            )
             adaptive_threshold = adaptive_threshold.view(B, 1, 1, 1)
         else:
             adaptive_threshold = self.base_threshold
-            sigma = torch.zeros(B, device=device)
+            estimated_sigma = torch.zeros(B, device=device)
         
-        # Compute sparsity loss across all levels
         total_loss = 0.0
         
         for level_idx, (LH, HL, HH) in enumerate(detail_coeffs_list, start=1):
-            # Scale threshold per level
             level_threshold = adaptive_threshold / (2 ** (level_idx - 1))
             
-            # Compute sparse targets (GPU)
             LH_sparse = self.soft_threshold(LH, level_threshold).detach()
             HL_sparse = self.soft_threshold(HL, level_threshold).detach()
             HH_sparse = self.soft_threshold(HH, level_threshold).detach()
             
-            # L1 sparsity penalty
             loss_lh = F.l1_loss(LH, LH_sparse)
             loss_hl = F.l1_loss(HL, HL_sparse)
             loss_hh = F.l1_loss(HH, HH_sparse)
             
-            # Weight finer levels more
             level_weight = 1.0 / level_idx
             total_loss = total_loss + level_weight * (loss_lh + loss_hl + loss_hh) / 3.0
         
-        # Average noise level for monitoring
-        avg_noise = sigma.mean().item()
+        avg_sigma = estimated_sigma.mean().item() if isinstance(estimated_sigma, torch.Tensor) else 0.0
         
-        return total_loss, avg_noise
+        return total_loss, avg_sigma
+
+
+class EdgePreservationLoss(nn.Module):
+    """
+    Edge Preservation Loss - Prevents blurring at edges
+    Uses Sobel operator to detect edges and penalize changes
+    """
+    
+    def __init__(self, edge_weight=0.1):
+        super().__init__()
+        self.edge_weight = edge_weight
+        
+        # Sobel filters
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        
+        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
+        
+        print(f"\nEdge Preservation Loss:")
+        print(f"   Edge weight: {edge_weight}")
+        print(f"   ✅ Sobel-based edge detection")
+    
+    def get_edges(self, x):
+        """Extract edges using Sobel operator"""
+        edge_x = F.conv2d(x, self.sobel_x, padding=1)
+        edge_y = F.conv2d(x, self.sobel_y, padding=1)
+        edges = torch.sqrt(edge_x**2 + edge_y**2 + 1e-8)
+        return edges
+    
+    def forward(self, noisy_input, denoised_output):
+        """
+        Compute edge preservation loss
+        Penalize edge changes between input and output
+        """
+        input_edges = self.get_edges(noisy_input)
+        output_edges = self.get_edges(denoised_output)
+        
+        # Edge magnitude preservation
+        edge_diff = torch.abs(input_edges - output_edges)
+        
+        # Weight by edge strength (preserve strong edges more)
+        edge_weight_map = torch.clamp(input_edges / (input_edges.mean() + 1e-8), 0, 3)
+        weighted_diff = edge_diff * edge_weight_map
+        
+        return weighted_diff.mean()
 
 
 class CombinedN2NWaveletLoss(nn.Module):
     """
-    Combined Loss: Neighbor2Neighbor + Wavelet Sparsity (Optimized)
+    Combined Loss: N2N + Wavelet + Edge Preservation
     
-    Key Optimizations:
-    1. NO forward pass duplication - model runs ONCE per batch
-    2. 100% GPU computation - NO CPU transfers
-    3. Extended adaptive weight range [0.3, 3.0]
-    
-    Philosophy:
-    - High noise images: stronger wavelet (more denoising)
-    - Low noise images: weaker wavelet (preserve details)
-    - Automatic balancing for optimal results
+    - Noise는 INPUT에서 추정
+    - Wavelet weight를 샘플별(HN/LN별) adaptive하게 적용
     """
-    
+
     def __init__(self,
                  n2n_gamma=2.0,
                  wavelet_weight=0.0025,
@@ -364,19 +272,20 @@ class CombinedN2NWaveletLoss(nn.Module):
                  wavelet_levels=3,
                  hu_window=(-160, 240),
                  adaptive=True,
-                 target_noise=0.15,
-                 adaptive_weight_range=(0.3, 3.0)):
+                 # 🔧 Step2: HN/LN 구분을 위해 target_noise/범위를 조금 더 보수적으로 설정
+                 target_noise=0.012,                # 대략 LN σ 근처 (정확한 값은 데이터에 따라 조정)
+                 adaptive_weight_range=(0.8, 4.0),  # LN ~0.8x, HN 최대 ~4x
+                 edge_weight=0.08):                 # edge 보존 조금 더 강하게
         super().__init__()
-        
+
         self.base_wavelet_weight = wavelet_weight
         self.target_noise = target_noise
         self.adaptive = adaptive
         self.weight_min, self.weight_max = adaptive_weight_range
-        
-        # N2N loss (main)
+        self.edge_weight = edge_weight
+
         self.n2n_loss = Neighbor2NeighborLoss(gamma=n2n_gamma)
-        
-        # Wavelet sparsity (regularization)
+
         self.wavelet_loss = WaveletSparsityPrior(
             threshold=wavelet_threshold,
             wavelet='haar',
@@ -384,65 +293,99 @@ class CombinedN2NWaveletLoss(nn.Module):
             hu_window=hu_window,
             adaptive=adaptive
         )
-        
-        print(f"\n🔧 Combined Loss (OPTIMIZED):")
-        print(f"   N2N weight: 1.0 (MAIN)")
-        print(f"   Base Wavelet weight: {wavelet_weight}")
-        print(f"   Adaptive weighting: {adaptive}")
-        print(f"   Adaptive range: [{self.weight_min}, {self.weight_max}]")
-        print(f"   Target noise: {target_noise:.4f}")
-        print(f"   ✅ Forward pass runs ONCE (no duplication!)")
-        print(f"   ✅ 100% GPU computation")
-    
+
+        self.edge_loss = EdgePreservationLoss(edge_weight=edge_weight)
+
+        print("\n🔧 Combined Loss (Sample-wise Adaptive + Edge Preservation)")
+        print(f"   N2N gamma        : {n2n_gamma}")
+        print(f"   Base wavelet w   : {wavelet_weight}")
+        print(f"   Target noise     : {target_noise:.4f} (norm.)")
+        print(f"   Weight range     : [{self.weight_min:.2f}, {self.weight_max:.2f}]")
+        print(f"   Edge weight      : {edge_weight}")
+
     def forward(self, model, noisy_input):
         """
-        Compute combined loss - OPTIMIZED VERSION
-        
-        Args:
-            model: denoising network
-            noisy_input: [B, C, H, W] - noisy input
-            
-        Returns:
-            total_loss: scalar tensor with gradients
-            loss_dict: detailed loss breakdown (detached scalars)
+        model: SwinIR
+        noisy_input: [B, 1, H, W]  (normalized)
         """
-        # N2N loss + get output (SINGLE forward pass)
-        n2n_total, n2n_dict, output = self.n2n_loss(model, noisy_input, return_output=True)
-        
-        # Wavelet sparsity on SAME output (no duplication!)
-        wavelet, estimated_noise = self.wavelet_loss(output)
-        
-        # NaN protection
-        if torch.isnan(wavelet):
-            wavelet = torch.tensor(0.0, device=noisy_input.device, requires_grad=True)
-            estimated_noise = 0.0
-        
-        # Adaptive weighting based on noise level
-        if self.adaptive and estimated_noise > 0:
-            # Scale weight proportionally to noise level
-            noise_ratio = estimated_noise / self.target_noise
-            noise_ratio = max(self.weight_min, min(noise_ratio, self.weight_max))
-            adaptive_weight = self.base_wavelet_weight * noise_ratio
-        else:
-            adaptive_weight = self.base_wavelet_weight
-        
-        # Combined loss (keep gradient!)
-        total = n2n_total + adaptive_weight * wavelet
-        
+        B = noisy_input.size(0)
+
+        # 1) INPUT 기준 noise estimate (샘플별 σ_i)
+        estimated_sigma = self.wavelet_loss.estimate_noise_from_input(noisy_input)  # [B]
+
+        # 2) N2N loss + output
+        n2n_total, n2n_dict, output, g1 = self.n2n_loss(model, noisy_input, return_output=True)
+
+        # 3) Wavelet sparsity (샘플별 loss, 샘플별 weight)
+        per_sample_wavelet = []
+        per_sample_weight = []
+        per_sample_ratio = []
+
+        for i in range(B):
+            # 각 샘플별 wavelet loss (σ_i에 맞는 threshold 사용)
+            w_loss_i, _ = self.wavelet_loss(
+                output[i:i+1],           # [1,1,H,W]
+                estimated_sigma[i:i+1]   # [1]
+            )
+            per_sample_wavelet.append(w_loss_i)
+
+            if self.adaptive and self.target_noise > 0:
+                ratio_i = (estimated_sigma[i] / self.target_noise).clamp(
+                    self.weight_min, self.weight_max
+                )
+                weight_i = self.base_wavelet_weight * ratio_i
+            else:
+                ratio_i = torch.tensor(1.0, device=noisy_input.device)
+                weight_i = torch.tensor(self.base_wavelet_weight, device=noisy_input.device)
+
+            per_sample_weight.append(weight_i)
+            per_sample_ratio.append(ratio_i)
+
+        per_sample_wavelet = torch.stack(per_sample_wavelet)   # [B]
+        per_sample_weight = torch.stack(per_sample_weight)     # [B]
+        per_sample_ratio = torch.stack(per_sample_ratio)       # [B]
+
+        # 🔹 HN/LN별 weight 차이를 실제 loss에 반영
+        #   (가중 평균으로 배치 전체 wavelet loss 구성)
+        weighted_wavelet = per_sample_weight * per_sample_wavelet   # [B]
+        wavelet = weighted_wavelet.mean()                           # scalar
+        wavelet_raw = per_sample_wavelet.mean()                     # unweighted 평균
+
+        # 4) Edge preservation loss (여전히 전체 배치 기준)
+        edge = self.edge_loss(g1, output)
+
+        # 5) Total loss
+        total = n2n_total + wavelet + self.edge_weight * edge
+
+        # NaN 보호
+        if torch.isnan(total):
+            total = n2n_total
+            wavelet = torch.tensor(0.0, device=noisy_input.device)
+            edge = torch.tensor(0.0, device=noisy_input.device)
+
+        # 모니터링용 통계 (기존 필드 유지 + 몇 개 추가)
+        avg_sigma = float(estimated_sigma.mean().item())
+        avg_sigma_hu = avg_sigma * self.wavelet_loss.hu_range if hasattr(self.wavelet_loss, 'hu_range') else avg_sigma * 400
+        avg_weight = float(per_sample_weight.mean().item())
+        avg_ratio = float(per_sample_ratio.mean().item())
+
         return total, {
             'n2n_rec': n2n_dict['rec'],
             'n2n_reg': n2n_dict['reg'],
             'n2n_reg_weighted': n2n_dict['reg_weighted'],
             'n2n_total': n2n_dict['total'],
-            'wavelet_raw': wavelet.item(),
-            'wavelet_weighted': (wavelet * adaptive_weight).item(),
-            'total': total.item(),
-            'balance_ratio': n2n_dict['total'] / (wavelet.item() * adaptive_weight + 1e-8),
-            'estimated_noise': estimated_noise,
-            'adaptive_weight': adaptive_weight
+            'wavelet_raw': float(wavelet_raw.item()),
+            'wavelet_weighted': float(wavelet.item()),
+            'edge_loss': float(edge.item()),
+            'total': float(total.item()),
+            'balance_ratio': n2n_dict['total'] / (wavelet.item() + 1e-8),
+            'estimated_noise': avg_sigma,
+            'estimated_noise_hu': avg_sigma_hu,
+            'adaptive_weight': avg_weight,   # utils.save_sample_images에서 사용
+            'noise_ratio': avg_ratio
         }
 
 
-# For backward compatibility
+# Backward compatibility
 Neighbor2NeighborLoss_v2 = Neighbor2NeighborLoss
 WaveletSparsityLoss = WaveletSparsityPrior
