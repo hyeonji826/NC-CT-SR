@@ -29,16 +29,6 @@ from utils import (
 )
 
 def load_fixed_full_slices(nc_ct_dir, hu_window):
-    """
-    Load 2 representative slices: HIGH-NOISE + LOW-NOISE for comparison
-    
-    This allows us to verify that adaptive thresholding works correctly:
-    - High-noise slice: should use higher threshold/weight
-    - Low-noise slice: should use lower threshold/weight
-    
-    Returns:
-        List of 2 [1, 1, H, W] tensors: [high_noise_slice, low_noise_slice]
-    """
     import nibabel as nib
     import numpy as np
     from pathlib import Path
@@ -105,22 +95,43 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
             {'slice_2d': slice_2d, 'noise_std': 25, 'file_path': files[0], 'slice_idx': volume.shape[2]//2}
         ]
     
-    # Sort by noise level
+    # Sort by noise level (내림차순: 가장 noisy → 가장 clean)
     candidates.sort(key=lambda x: x['noise_std'], reverse=True)
-    
-    # Select: Highest noise (HN) + Lowest noise (LN)
-    high_noise = candidates[0]  # Highest
-    low_noise = candidates[-1]   # Lowest
-    
+
+    # ------------------------------
+    # ① High-noise slice (HN): 그대로
+    # ------------------------------
+    high_noise = candidates[0]  # 가장 noisy 한 슬라이스
+
+    # ------------------------------
+    # ② Low-noise but "structured" slice (LN)
+    #    - noise는 낮은 편이지만
+    #    - 혈관/병변 같은 구조가 어느 정도 있는 슬라이스를 선택
+    # ------------------------------
+    num_cands = len(candidates)
+    # noise 기준으로 하위 50%만 LN 후보로 사용 (충분히 깨끗한 것들)
+    start_idx = num_cands // 2
+    low_noise_candidates = candidates[start_idx:]
+
+    def structure_score(cand):
+        s = cand['slice_2d']
+        # 전체 intensity std를 구조 풍부함의 간단한 proxy로 사용
+        return s.std()
+
+    # 하위 noise 그룹 중에서 구조가 가장 풍부한 슬라이스 선택
+    low_noise = max(low_noise_candidates, key=structure_score)
+
     print(f"✅ Selected 2 representative slices:")
-    print(f"   [HN] {high_noise['file_path'].name[:30]} slice {high_noise['slice_idx']} - Noise: {high_noise['noise_std']:.1f} HU")
-    print(f"   [LN] {low_noise['file_path'].name[:30]} slice {low_noise['slice_idx']} - Noise: {low_noise['noise_std']:.1f} HU")
-    print(f"   Noise ratio: {high_noise['noise_std'] / low_noise['noise_std']:.2f}x")
-    
+    print(f"   [HN] {high_noise['file_path'].name[:30]} "
+          f"slice {high_noise['slice_idx']} - Noise: {high_noise['noise_std']:.1f} HU")
+    print(f"   [LN] {low_noise['file_path'].name[:30]} "
+          f"slice {low_noise['slice_idx']} - Noise: {low_noise['noise_std']:.1f} HU")
+    print(f"   Noise ratio (HN/LN): {high_noise['noise_std'] / low_noise['noise_std']:.2f}x")
+
     # Prepare tensors
     slices = []
     slice_info = []
-    
+
     for label, cand in [('HN', high_noise), ('LN', low_noise)]:
         slice_2d = cand['slice_2d']
         
@@ -158,16 +169,6 @@ def load_config(path):
 
 
 def train_n2n():
-    """
-    Self-Supervised Training with Neighbor2Neighbor + Wavelet Sparsity
-    
-    Key Points:
-    1. NO paired data needed!
-    2. N2N creates supervision via checkerboard subsampling
-    3. Wavelet acts as light regularization
-    4. Critical: maintain N2N : Wavelet balance (~20:1)
-    """
-    
     print("="*80)
     print(" Self-Supervised Training: Neighbor2Neighbor + Wavelet Sparsity")
     print("="*80)

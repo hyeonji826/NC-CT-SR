@@ -348,7 +348,7 @@ class CombinedN2NWaveletLoss(nn.Module):
         # 🔹 HN/LN별 weight 차이를 실제 loss에 반영
         #   (가중 평균으로 배치 전체 wavelet loss 구성)
         weighted_wavelet = per_sample_weight * per_sample_wavelet   # [B]
-        wavelet = weighted_wavelet.mean()                           # scalar
+        wavelet = 2.0*weighted_wavelet.mean()                           # scalar
         wavelet_raw = per_sample_wavelet.mean()                     # unweighted 평균
 
         # 4) Edge preservation loss (여전히 전체 배치 기준)
