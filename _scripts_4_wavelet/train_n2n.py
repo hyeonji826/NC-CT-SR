@@ -28,130 +28,147 @@ from utils import (
     cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
 )
 
+# train_n2n.py 안의 기존 load_fixed_full_slices 전체를 이걸로 교체
+
 def load_fixed_full_slices(nc_ct_dir, hu_window):
+    """
+    HIGH-NOISE(HN) + LOW-NOISE but EDGE-RICH(LN) full slices 선택
+
+    - HN : 전체 후보 중 noise_std 가장 높은 1장
+    - LN : noise_std 하위 50% 중에서 Sobel edge(혈관/엣지 양) 가장 큰 1장
+    """
     import nibabel as nib
     import numpy as np
     from pathlib import Path
-    
+    from scipy import ndimage   # Sobel edge
+
     nc_ct_dir = Path(nc_ct_dir)
     files = sorted(list(nc_ct_dir.glob("*.nii.gz")))
-    
-    # Analyze multiple files to find varied noise levels
+
     candidates = []
-    
-    print(f"\n🔍 Analyzing slices to find HIGH-NOISE and LOW-NOISE samples...")
-    
-    for file_idx, file_path in enumerate(files[:15]):  # Check first 15 files
+
+    print("\n🔍 Analyzing slices to find HIGH-NOISE and EDGE-RICH LOW-NOISE samples.")
+
+    for file_idx, file_path in enumerate(files[:15]):  # 최대 15개 볼륨만 스캔
         try:
             nii = nib.load(str(file_path))
             volume = nii.get_fdata()
-            
-            # Check multiple slices per volume
+
             D = volume.shape[2]
-            slice_indices = [D//4, D//2, 3*D//4]  # Check 3 slices per volume
-            
+            slice_indices = [D // 4, D // 2, 3 * D // 4]
+
             for slice_idx in slice_indices:
                 if slice_idx >= D:
                     continue
-                
+
                 slice_2d = volume[:, :, slice_idx]
-                
-                # Use CENTER REGION ONLY (RECTANGLE) - exclude arms and equipment
-                # Horizontal: 70%, Vertical: 50% (matches abdomen shape)
+
+                # 중심부(복부)만 사용해서 팔/장비 제외
                 h, w = slice_2d.shape
-                center_ratio_w = 0.55  # Horizontal
-                center_ratio_h = 0.60  # Vertical
+                center_ratio_w = 0.55
+                center_ratio_h = 0.60
                 margin_h = int(h * (1 - center_ratio_h) / 2)
                 margin_w = int(w * (1 - center_ratio_w) / 2)
-                
-                center_slice = slice_2d[margin_h:h-margin_h, margin_w:w-margin_w]
-                
-                # Measure noise level in tissue region (CENTER ONLY)
+
+                center_slice = slice_2d[margin_h:h - margin_h,
+                                        margin_w:w - margin_w]
+
+                # 조직(HU -100 ~ 100)만 보고 noise 계산
                 tissue_mask = (center_slice > -100) & (center_slice < 100)
-                if tissue_mask.sum() < 1000:  # Skip if too little tissue
+                if tissue_mask.sum() < 1000:
                     continue
-                
+
                 tissue_region = center_slice[tissue_mask]
                 noise_std = tissue_region.std()
-                
-                # Store candidate (CROPPED center region)
+
+                # ⬇️ 같은 조직 마스크에서 Sobel edge(혈관/엣지 양) 측정
+                gx = ndimage.sobel(center_slice, axis=0)
+                gy = ndimage.sobel(center_slice, axis=1)
+                edge_mag = np.hypot(gx, gy)
+                edge_score = edge_mag[tissue_mask].mean()
+
                 candidates.append({
                     'file_path': file_path,
                     'slice_idx': slice_idx,
-                    'noise_std': noise_std,
-                    'slice_2d': center_slice  # ✅ Cropped center region
+                    'noise_std': float(noise_std),
+                    'edge_score': float(edge_score),
+                    'slice_2d': center_slice  # cropped center region
                 })
-        except:
+        except Exception as e:
+            print(f"  ⚠️ Skip {file_path.name}: {e}")
             continue
-    
+
     if len(candidates) < 2:
         print("⚠️ Warning: Not enough valid slices found, using defaults")
-        # Fallback
+        # Fallback: 중간 슬라이스 한 장을 HN/LN 둘 다로 사용
         nii = nib.load(str(files[0]))
         volume = nii.get_fdata()
-        slice_2d = volume[:, :, volume.shape[2]//2]
+        slice_2d = volume[:, :, volume.shape[2] // 2]
         candidates = [
-            {'slice_2d': slice_2d, 'noise_std': 40, 'file_path': files[0], 'slice_idx': volume.shape[2]//2},
-            {'slice_2d': slice_2d, 'noise_std': 25, 'file_path': files[0], 'slice_idx': volume.shape[2]//2}
+            {
+                'slice_2d': slice_2d,
+                'noise_std': 40.0,
+                'edge_score': 1.0,
+                'file_path': files[0],
+                'slice_idx': volume.shape[2] // 2
+            },
+            {
+                'slice_2d': slice_2d,
+                'noise_std': 25.0,
+                'edge_score': 0.5,
+                'file_path': files[0],
+                'slice_idx': volume.shape[2] // 2
+            }
         ]
-    
-    # Sort by noise level (내림차순: 가장 noisy → 가장 clean)
+
+    # 1) 노이즈 기준으로 정렬 (내림차순)
     candidates.sort(key=lambda x: x['noise_std'], reverse=True)
 
-    # ------------------------------
-    # ① High-noise slice (HN): 그대로
-    # ------------------------------
-    high_noise = candidates[0]  # 가장 noisy 한 슬라이스
+    # HN: noise_std 가장 큰 1장
+    high_noise = candidates[0]
 
-    # ------------------------------
-    # ② Low-noise but "structured" slice (LN)
-    #    - noise는 낮은 편이지만
-    #    - 혈관/병변 같은 구조가 어느 정도 있는 슬라이스를 선택
-    # ------------------------------
-    num_cands = len(candidates)
-    # noise 기준으로 하위 50%만 LN 후보로 사용 (충분히 깨끗한 것들)
-    start_idx = num_cands // 2
-    low_noise_candidates = candidates[start_idx:]
+    # 2) LN 후보군: noise_std 하위 50% (충분히 저노이즈인 그룹)
+    mid_idx = max(1, len(candidates) // 2)
+    low_group = candidates[mid_idx:]
+    if not low_group:
+        low_group = candidates[-2:]
 
-    def structure_score(cand):
-        s = cand['slice_2d']
-        # 전체 intensity std를 구조 풍부함의 간단한 proxy로 사용
-        return s.std()
+    # LN: 저노이즈 그룹 중 edge_score 가장 높은 1장 (혈관/엣지 풍부)
+    low_noise = max(low_group, key=lambda x: x.get('edge_score', 0.0))
 
-    # 하위 noise 그룹 중에서 구조가 가장 풍부한 슬라이스 선택
-    low_noise = max(low_noise_candidates, key=structure_score)
-
-    print(f"✅ Selected 2 representative slices:")
+    print("✅ Selected 2 representative slices (noise + edge-aware):")
     print(f"   [HN] {high_noise['file_path'].name[:30]} "
-          f"slice {high_noise['slice_idx']} - Noise: {high_noise['noise_std']:.1f} HU")
+          f"slice {high_noise['slice_idx']}  "
+          f"Noise: {high_noise['noise_std']:.1f} HU  "
+          f"Edge: {high_noise.get('edge_score', 0):.4f}")
     print(f"   [LN] {low_noise['file_path'].name[:30]} "
-          f"slice {low_noise['slice_idx']} - Noise: {low_noise['noise_std']:.1f} HU")
-    print(f"   Noise ratio (HN/LN): {high_noise['noise_std'] / low_noise['noise_std']:.2f}x")
+          f"slice {low_noise['slice_idx']}  "
+          f"Noise: {low_noise['noise_std']:.1f} HU  "
+          f"Edge: {low_noise.get('edge_score', 0):.4f}")
+    print(f"   Noise ratio (HN/LN): {high_noise['noise_std'] / max(low_noise['noise_std'], 1e-6):.2f}x")
 
-    # Prepare tensors
+    # 텐서 변환 (전체 슬라이스를 HU window 후 [0,1]로)
     slices = []
     slice_info = []
 
     for label, cand in [('HN', high_noise), ('LN', low_noise)]:
         slice_2d = cand['slice_2d']
-        
-        # Normalize HU
+
         slice_2d = np.clip(slice_2d, hu_window[0], hu_window[1])
         slice_2d = (slice_2d - hu_window[0]) / (hu_window[1] - hu_window[0])
         slice_2d = slice_2d.astype(np.float32)
-        
-        # To tensor [1, 1, H, W]
+
         slice_tensor = torch.from_numpy(slice_2d).unsqueeze(0).unsqueeze(0)
         slices.append(slice_tensor)
-        
-        # Store metadata
+
         slice_info.append({
             'label': label,
             'noise_std_hu': cand['noise_std'],
+            'edge_score': cand.get('edge_score', 0.0),
             'file': cand['file_path'].name,
             'slice_idx': cand['slice_idx']
         })
-    
+
     return slices, slice_info
 
 def parse_args():
