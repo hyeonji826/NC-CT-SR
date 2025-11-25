@@ -180,10 +180,9 @@ def parse_args():
     return args
 
 def load_config(path):
-    with open(path, 'r') as f:
+    with open(path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
     return cfg
-
 
 def train_n2n():
     print("="*80)
@@ -196,14 +195,23 @@ def train_n2n():
     print("   [OK] Balance: N2N >> Wavelet (20:1)")
     print("="*80)
     
-    # Load config
+    # ---- 1) 인자 파싱 ----
+    args = parse_args()
+
+    # ---- 2) config 경로 결정 ----
     script_dir = Path(__file__).parent
-    config_path = script_dir / 'config_n2n.yaml'
-    
+
+    # args.config가 relative path면, 스크립트 기준으로 붙여주기
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = script_dir / config_path
+
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
-    
-    args = parse_args()
+
+    print(f"\n📄 Using config file: {config_path}")
+
+    # ---- 3) config 로드 ----
     config = load_config(config_path)
     exp_name = args.exp
     

@@ -212,10 +212,6 @@ class WaveletSparsityPrior(nn.Module):
 
 
 class EdgePreservationLoss(nn.Module):
-    """
-    Edge Preservation Loss - Prevents blurring at edges
-    Uses Sobel operator to detect edges and penalize changes
-    """
     
     def __init__(self, edge_weight=0.1):
         super().__init__()
@@ -240,10 +236,6 @@ class EdgePreservationLoss(nn.Module):
         return edges
     
     def forward(self, noisy_input, denoised_output):
-        """
-        Compute edge preservation loss
-        Penalize edge changes between input and output
-        """
         input_edges = self.get_edges(noisy_input)
         output_edges = self.get_edges(denoised_output)
         
@@ -258,13 +250,6 @@ class EdgePreservationLoss(nn.Module):
 
 
 class CombinedN2NWaveletLoss(nn.Module):
-    """
-    Combined Loss: N2N + Wavelet + Edge Preservation
-    
-    - Noise는 INPUT에서 추정
-    - Wavelet weight를 샘플별(HN/LN별) adaptive하게 적용
-    """
-
     def __init__(self,
                  n2n_gamma=2.0,
                  wavelet_weight=0.0025,
@@ -381,7 +366,7 @@ class CombinedN2NWaveletLoss(nn.Module):
             'balance_ratio': n2n_dict['total'] / (wavelet.item() + 1e-8),
             'estimated_noise': avg_sigma,
             'estimated_noise_hu': avg_sigma_hu,
-            'adaptive_weight': avg_weight,   # utils.save_sample_images에서 사용
+            'adaptive_weight': avg_weight,   
             'noise_ratio': avg_ratio
         }
 
