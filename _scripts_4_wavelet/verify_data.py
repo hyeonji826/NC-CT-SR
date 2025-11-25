@@ -1,159 +1,222 @@
-"""
-Verify center region cropping on NC-CT data
-Rectangle crop: 70% width × 50% height
-"""
+# verify_data.py - NC-CT Noise Distribution Analysis
 
 import nibabel as nib
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
-import random
-from matplotlib.patches import Rectangle
+import matplotlib.pyplot as plt
+import argparse
 
-print("="*80)
-print("CENTER REGION CROP VERIFICATION - RECTANGLE")
-print("="*80)
-
-# Data directory
-data_dir = Path(r"E:\LD-CT SR\Data\Image_NC-CT")
-files = sorted(list(data_dir.glob("*.nii.gz")))
-
-if len(files) == 0:
-    print(f"❌ No files found in {data_dir}")
-    exit(1)
-
-print(f"\n✅ Found {len(files)} files")
-
-# Select 5 random files
-random.seed(42)
-selected_files = random.sample(files, min(5, len(files)))
-
-print(f"\n📁 Selected files:")
-for i, f in enumerate(selected_files):
-    print(f"   {i+1}. {f.name}")
-
-# HU window
-hu_window = (-160, 240)
-
-# Center region parameters - RECTANGLE
-center_ratio_w = 0.55  # Horizontal: 70%
-center_ratio_h = 0.6  # Vertical: 50%
-
-print(f"\n🎯 Center region: {center_ratio_w*100:.0f}% × {center_ratio_h*100:.0f}% (Rectangle)")
-print(f"   Horizontal (width): {center_ratio_w*100:.0f}%")
-print(f"   Vertical (height): {center_ratio_h*100:.0f}%")
-print(f"   → Matches abdomen shape (wider horizontally)")
-
-# Create figure
-fig, axes = plt.subplots(5, 3, figsize=(15, 20))
-
-for idx, file_path in enumerate(selected_files):
+def analyze_noise_distribution(nc_ct_dir, max_files=50, plot=True):
+    """
+    Analyze noise distribution in NC-CT dataset
+    
+    Args:
+        nc_ct_dir: Path to NC-CT directory
+        max_files: Maximum number of files to scan
+        plot: Whether to plot histogram
+    """
+    nc_ct_dir = Path(nc_ct_dir)
+    files = sorted(list(nc_ct_dir.glob("*.nii.gz")))
+    
     print(f"\n{'='*80}")
-    print(f"Processing: {file_path.name}")
+    print(f"NC-CT Noise Distribution Analysis")
+    print(f"{'='*80}")
+    print(f"Directory: {nc_ct_dir}")
+    print(f"Total files: {len(files)}")
+    print(f"Scanning: {min(max_files, len(files))} files\n")
     
-    # Load volume
-    nii = nib.load(str(file_path))
-    volume = nii.get_fdata()
+    noise_samples = []
+    edge_samples = []
+    file_stats = []
     
-    print(f"   Volume shape: {volume.shape}")
+    from scipy import ndimage
     
-    # Get middle slice
-    mid_idx = volume.shape[2] // 2
-    slice_2d = volume[:, :, mid_idx]
+    for file_idx, file_path in enumerate(files[:max_files]):
+        try:
+            nii = nib.load(str(file_path))
+            volume = nii.get_fdata()
+            D = volume.shape[2]
+            
+            # Sample multiple slices per volume
+            slice_indices = [D//5, D//3, D//2, 2*D//3, 4*D//5]
+            
+            file_noises = []
+            file_edges = []
+            
+            for slice_idx in slice_indices:
+                if slice_idx >= D:
+                    continue
+                    
+                slice_2d = volume[:, :, slice_idx]
+                
+                # Center region (exclude arms/equipment)
+                h, w = slice_2d.shape
+                center_h = slice(h//4, 3*h//4)
+                center_w = slice(w//4, 3*w//4)
+                center = slice_2d[center_h, center_w]
+                
+                # Tissue mask (HU -100 ~ 100)
+                mask = (center > -100) & (center < 100)
+                
+                if mask.sum() < 1000:
+                    continue
+                
+                tissue = center[mask]
+                noise_std = tissue.std()
+                
+                # Edge score
+                gx = ndimage.sobel(center, axis=0)
+                gy = ndimage.sobel(center, axis=1)
+                edge_mag = np.hypot(gx, gy)
+                edge_score = edge_mag[mask].mean()
+                
+                noise_samples.append(noise_std)
+                edge_samples.append(edge_score)
+                file_noises.append(noise_std)
+                file_edges.append(edge_score)
+            
+            if file_noises:
+                file_stats.append({
+                    'file': file_path.name,
+                    'noise_mean': np.mean(file_noises),
+                    'noise_min': np.min(file_noises),
+                    'noise_max': np.max(file_noises),
+                    'edge_mean': np.mean(file_edges)
+                })
+            
+            if (file_idx + 1) % 10 == 0:
+                print(f"  Processed {file_idx + 1}/{min(max_files, len(files))} files...")
+                
+        except Exception as e:
+            print(f"  ⚠️ Skip {file_path.name}: {e}")
+            continue
     
-    h, w = slice_2d.shape
-    print(f"   Slice shape: {h} x {w}")
+    if not noise_samples:
+        print("❌ No valid samples found!")
+        return
     
-    # Calculate center region - RECTANGLE
-    margin_h = int(h * (1 - center_ratio_h) / 2)
-    margin_w = int(w * (1 - center_ratio_w) / 2)
+    noise_samples = np.array(noise_samples)
+    edge_samples = np.array(edge_samples)
     
-    center_h = h - 2*margin_h
-    center_w = w - 2*margin_w
+    # Statistics
+    print(f"\n{'='*80}")
+    print(f"Noise Distribution Statistics (HU)")
+    print(f"{'='*80}")
+    print(f"Total samples: {len(noise_samples)}")
+    print(f"Min:           {noise_samples.min():.1f} HU")
+    print(f"5th %ile:      {np.percentile(noise_samples, 5):.1f} HU")
+    print(f"10th %ile:     {np.percentile(noise_samples, 10):.1f} HU")
+    print(f"25th %ile:     {np.percentile(noise_samples, 25):.1f} HU")
+    print(f"Median:        {np.median(noise_samples):.1f} HU")
+    print(f"75th %ile:     {np.percentile(noise_samples, 75):.1f} HU")
+    print(f"90th %ile:     {np.percentile(noise_samples, 90):.1f} HU")
+    print(f"95th %ile:     {np.percentile(noise_samples, 95):.1f} HU")
+    print(f"Max:           {noise_samples.max():.1f} HU")
+    print(f"Mean ± Std:    {noise_samples.mean():.1f} ± {noise_samples.std():.1f} HU")
     
-    print(f"   Margins: top/bottom={margin_h}px, left/right={margin_w}px")
-    print(f"   Center region: {center_h} x {center_w} (Rectangle)")
+    # Recommendations
+    print(f"\n{'='*80}")
+    print(f"HN/LN Selection Recommendations")
+    print(f"{'='*80}")
     
-    # Extract center region
-    center_slice = slice_2d[margin_h:h-margin_h, margin_w:w-margin_w]
+    p10 = np.percentile(noise_samples, 10)
+    p90 = np.percentile(noise_samples, 90)
+    median = np.median(noise_samples)
     
-    # Measure noise in full vs center
-    tissue_mask_full = (slice_2d > -100) & (slice_2d < 100)
-    tissue_mask_center = (center_slice > -100) & (center_slice < 100)
-    
-    if tissue_mask_full.sum() > 100:
-        noise_full = slice_2d[tissue_mask_full].std()
+    if p10 > 40:
+        print("⚠️  WARNING: Entire dataset has HIGH NOISE!")
+        print(f"   10th percentile = {p10:.1f} HU (should be < 30 HU for good LN)")
+        print(f"\n   Strategy: Use RELATIVE thresholds")
+        print(f"   - HN: > 90th percentile ({p90:.1f} HU)")
+        print(f"   - LN: < 20th percentile + high edge")
+    elif p10 > 30:
+        print("⚠️  Dataset is moderately noisy overall")
+        print(f"   10th percentile = {p10:.1f} HU")
+        print(f"\n   Strategy: Use lower percentiles")
+        print(f"   - HN: > 90th percentile ({p90:.1f} HU)")
+        print(f"   - LN: < 15th percentile + high edge")
     else:
-        noise_full = 0
+        print("✅ Good noise distribution for HN/LN separation")
+        print(f"   10th percentile = {p10:.1f} HU (< 30 HU)")
+        print(f"\n   Strategy: Use absolute + relative thresholds")
+        print(f"   - HN: > 90th percentile ({p90:.1f} HU)")
+        print(f"   - LN: < 25 HU + high edge")
     
-    if tissue_mask_center.sum() > 100:
-        noise_center = center_slice[tissue_mask_center].std()
+    # Top LN candidates (low noise + high edge)
+    print(f"\n{'='*80}")
+    print(f"Top 5 LN Candidates (Low Noise + High Edge)")
+    print(f"{'='*80}")
+    
+    # Below median noise
+    low_noise_mask = noise_samples < median
+    low_noise_indices = np.where(low_noise_mask)[0]
+    
+    if len(low_noise_indices) > 0:
+        low_noise_edges = edge_samples[low_noise_indices]
+        top_edge_in_low_noise = low_noise_indices[np.argsort(low_noise_edges)[-5:]]
+        
+        for rank, idx in enumerate(reversed(top_edge_in_low_noise), 1):
+            print(f"{rank}. Noise: {noise_samples[idx]:.1f} HU, Edge: {edge_samples[idx]:.1f}")
     else:
-        noise_center = 0
+        print("No samples below median found")
     
-    print(f"   Noise (full image): {noise_full:.1f} HU")
-    print(f"   Noise (center only): {noise_center:.1f} HU")
-    print(f"   Difference: {noise_full - noise_center:+.1f} HU")
+    # Top HN candidates
+    print(f"\n{'='*80}")
+    print(f"Top 5 HN Candidates (High Noise)")
+    print(f"{'='*80}")
     
-    # Normalize for display
-    slice_norm = np.clip(slice_2d, hu_window[0], hu_window[1])
-    slice_norm = (slice_norm - hu_window[0]) / (hu_window[1] - hu_window[0])
+    top_hn_indices = np.argsort(noise_samples)[-5:]
+    for rank, idx in enumerate(reversed(top_hn_indices), 1):
+        print(f"{rank}. Noise: {noise_samples[idx]:.1f} HU, Edge: {edge_samples[idx]:.1f}")
     
-    center_norm = np.clip(center_slice, hu_window[0], hu_window[1])
-    center_norm = (center_norm - hu_window[0]) / (hu_window[1] - hu_window[0])
+    # Plot histogram
+    if plot:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Noise histogram
+        axes[0].hist(noise_samples, bins=50, alpha=0.7, color='blue', edgecolor='black')
+        axes[0].axvline(median, color='red', linestyle='--', linewidth=2, label=f'Median: {median:.1f}')
+        axes[0].axvline(p10, color='green', linestyle='--', linewidth=2, label=f'10th %: {p10:.1f}')
+        axes[0].axvline(p90, color='orange', linestyle='--', linewidth=2, label=f'90th %: {p90:.1f}')
+        axes[0].set_xlabel('Noise Std (HU)', fontsize=12)
+        axes[0].set_ylabel('Count', fontsize=12)
+        axes[0].set_title('NC-CT Noise Distribution', fontsize=14, fontweight='bold')
+        axes[0].legend()
+        axes[0].grid(alpha=0.3)
+        
+        # Noise vs Edge scatter
+        axes[1].scatter(noise_samples, edge_samples, alpha=0.5, s=20)
+        axes[1].axvline(median, color='red', linestyle='--', linewidth=2, alpha=0.5)
+        axes[1].axhline(np.median(edge_samples), color='blue', linestyle='--', linewidth=2, alpha=0.5)
+        axes[1].set_xlabel('Noise Std (HU)', fontsize=12)
+        axes[1].set_ylabel('Edge Score', fontsize=12)
+        axes[1].set_title('Noise vs Edge Complexity', fontsize=14, fontweight='bold')
+        axes[1].grid(alpha=0.3)
+        
+        plt.tight_layout()
+        
+        output_path = Path(nc_ct_dir).parent / 'noise_distribution_analysis.png'
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"\n📊 Plot saved: {output_path}")
+        plt.close()
     
-    # Rotate 90 degrees for proper orientation
-    slice_norm = np.rot90(slice_norm, k=1)
-    center_norm = np.rot90(center_norm, k=1)
-    
-    # Plot 1: Original with box
-    axes[idx, 0].imshow(slice_norm, cmap='gray', vmin=0, vmax=1)
-    
-    # Draw center region box (adjusted for rotation)
-    # After rot90(k=1): coordinates transform
-    h_rotated, w_rotated = slice_norm.shape
-    rect = Rectangle((margin_h, w_rotated - (margin_w + center_w)), 
-                     center_h, center_w,
-                     linewidth=3, edgecolor='lime', facecolor='none', linestyle='--')
-    axes[idx, 0].add_patch(rect)
-    
-    axes[idx, 0].set_title(f'{file_path.name[:25]}\nFull Image\nNoise: {noise_full:.1f} HU', 
-                          fontsize=10, fontweight='bold')
-    axes[idx, 0].axis('off')
-    
-    # Plot 2: Center region only
-    axes[idx, 1].imshow(center_norm, cmap='gray', vmin=0, vmax=1)
-    axes[idx, 1].set_title(f'Center {center_ratio_w*100:.0f}%×{center_ratio_h*100:.0f}%\n{center_h}×{center_w}\nNoise: {noise_center:.1f} HU',
-                          fontsize=10, fontweight='bold', color='lime')
-    axes[idx, 1].axis('off')
-    
-    # Plot 3: Full image (no box)
-    axes[idx, 2].imshow(slice_norm, cmap='gray', vmin=0, vmax=1)
-    axes[idx, 2].set_title(f'Full Image\n(for comparison)',
-                          fontsize=10)
-    axes[idx, 2].axis('off')
+    return noise_samples, edge_samples, file_stats
 
-plt.suptitle(f'Center Region Crop Verification - RECTANGLE\nCenter: {center_ratio_w*100:.0f}%×{center_ratio_h*100:.0f}% (W×H) | HU Window: {hu_window}',
-            fontsize=14, fontweight='bold')
-plt.tight_layout()
 
-# Save
-output_path = Path(r"E:\LD-CT SR\Outputs") / "crop_verification_rectangle.png"
-output_path.parent.mkdir(parents=True, exist_ok=True)
-plt.savefig(output_path, dpi=150, bbox_inches='tight')
-
-print(f"\n{'='*80}")
-print(f"✅ Verification complete!")
-print(f"📊 Saved: {output_path}")
-print(f"\n💡 Check the image:")
-print(f"   - Left column: Full image with GREEN RECTANGLE showing crop area")
-print(f"   - Middle column: CROPPED region only (what model will see)")
-print(f"   - Right column: Full image for comparison")
-print(f"\n🎯 Verify that:")
-print(f"   1. Green box is RECTANGLE (wider horizontally)")
-print(f"   2. Box excludes arms and top/bottom background")
-print(f"   3. Center region contains only abdomen")
-print(f"   4. Noise difference is reasonable")
-print("="*80)
-
-plt.show()
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Analyze NC-CT noise distribution')
+    parser.add_argument('--data_dir', type=str, 
+                       default=r'E:/LD-CT SR/Data/Image_NC-CT',
+                       help='Path to NC-CT directory')
+    parser.add_argument('--max_files', type=int, default=50,
+                       help='Maximum number of files to scan')
+    parser.add_argument('--no_plot', action='store_true',
+                       help='Disable plotting')
+    
+    args = parser.parse_args()
+    
+    analyze_noise_distribution(
+        args.data_dir,
+        max_files=args.max_files,
+        plot=not args.no_plot
+    )

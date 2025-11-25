@@ -28,34 +28,35 @@ from utils import (
     cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
 )
 
-# train_n2n.py 안의 기존 load_fixed_full_slices 전체를 이걸로 교체
-
 def load_fixed_full_slices(nc_ct_dir, hu_window):
     """
-    HIGH-NOISE(HN) + LOW-NOISE but EDGE-RICH(LN) full slices 선택
-
-    - HN : 전체 후보 중 noise_std 가장 높은 1장
-    - LN : noise_std 하위 50% 중에서 Sobel edge(혈관/엣지 양) 가장 큰 1장
+    HIGH-NOISE(HN) + RELATIVELY-LOW-NOISE(LN) full slices 선택
+    
+    ⚠️ 전체 데이터셋이 noisy하므로 RELATIVE 기준 사용
+    - HN: 90th percentile 이상 (극단적 high)
+    - LN: 10th percentile 이하 (상대적 low) + high edge
     """
     import nibabel as nib
     import numpy as np
     from pathlib import Path
-    from scipy import ndimage   # Sobel edge
+    from scipy import ndimage
 
     nc_ct_dir = Path(nc_ct_dir)
     files = sorted(list(nc_ct_dir.glob("*.nii.gz")))
 
     candidates = []
 
-    print("\n🔍 Analyzing slices to find HIGH-NOISE and EDGE-RICH LOW-NOISE samples.")
+    print("\n🔍 Analyzing slices (RELATIVE noise-based selection)...")
 
-    for file_idx, file_path in enumerate(files[:15]):  # 최대 15개 볼륨만 스캔
+    # ✅ 전체 파일 스캔 (충분한 샘플 확보)
+    for file_idx, file_path in enumerate(files):
         try:
             nii = nib.load(str(file_path))
             volume = nii.get_fdata()
 
             D = volume.shape[2]
-            slice_indices = [D // 4, D // 2, 3 * D // 4]
+            # 많은 슬라이스 샘플링
+            slice_indices = [D//5, D//3, D//2, 2*D//3, 4*D//5]
 
             for slice_idx in slice_indices:
                 if slice_idx >= D:
@@ -63,7 +64,7 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
 
                 slice_2d = volume[:, :, slice_idx]
 
-                # 중심부(복부)만 사용해서 팔/장비 제외
+                # 중심부(복부)만 사용
                 h, w = slice_2d.shape
                 center_ratio_w = 0.55
                 center_ratio_h = 0.60
@@ -81,7 +82,7 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
                 tissue_region = center_slice[tissue_mask]
                 noise_std = tissue_region.std()
 
-                # ⬇️ 같은 조직 마스크에서 Sobel edge(혈관/엣지 양) 측정
+                # Sobel edge
                 gx = ndimage.sobel(center_slice, axis=0)
                 gy = ndimage.sobel(center_slice, axis=1)
                 edge_mag = np.hypot(gx, gy)
@@ -92,62 +93,54 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
                     'slice_idx': slice_idx,
                     'noise_std': float(noise_std),
                     'edge_score': float(edge_score),
-                    'slice_2d': center_slice  # cropped center region
+                    'slice_2d': center_slice
                 })
         except Exception as e:
             print(f"  ⚠️ Skip {file_path.name}: {e}")
             continue
+        
+        # Progress
+        if (file_idx + 1) % 50 == 0:
+            print(f"  Scanned {file_idx + 1}/{len(files)} files...")
 
     if len(candidates) < 2:
-        print("⚠️ Warning: Not enough valid slices found, using defaults")
-        # Fallback: 중간 슬라이스 한 장을 HN/LN 둘 다로 사용
-        nii = nib.load(str(files[0]))
-        volume = nii.get_fdata()
-        slice_2d = volume[:, :, volume.shape[2] // 2]
-        candidates = [
-            {
-                'slice_2d': slice_2d,
-                'noise_std': 40.0,
-                'edge_score': 1.0,
-                'file_path': files[0],
-                'slice_idx': volume.shape[2] // 2
-            },
-            {
-                'slice_2d': slice_2d,
-                'noise_std': 25.0,
-                'edge_score': 0.5,
-                'file_path': files[0],
-                'slice_idx': volume.shape[2] // 2
-            }
-        ]
+        raise RuntimeError("Not enough valid slices found!")
 
-    # 1) 노이즈 기준으로 정렬 (내림차순)
-    candidates.sort(key=lambda x: x['noise_std'], reverse=True)
+    # ✅ Percentile 기준 계산
+    all_noise = np.array([c['noise_std'] for c in candidates])
+    p10 = np.percentile(all_noise, 10)
+    p90 = np.percentile(all_noise, 90)
+    median = np.median(all_noise)
+    
+    print(f"   Noise distribution: 10th={p10:.1f}, median={median:.1f}, 90th={p90:.1f} HU")
 
-    # HN: noise_std 가장 큰 1장
-    high_noise = candidates[0]
+    # 1) HN: 90th percentile 이상 중 가장 높은 것
+    hn_candidates = [c for c in candidates if c['noise_std'] >= p90]
+    high_noise = max(hn_candidates, key=lambda x: x['noise_std'])
 
-    # 2) LN 후보군: noise_std 하위 50% (충분히 저노이즈인 그룹)
-    mid_idx = max(1, len(candidates) // 2)
-    low_group = candidates[mid_idx:]
-    if not low_group:
-        low_group = candidates[-2:]
+    # 2) LN: 10th percentile 이하 중 edge 가장 높은 것
+    ln_candidates = [c for c in candidates if c['noise_std'] <= p10]
+    
+    # Fallback: 10th percentile 이하가 없으면 하위 15%
+    if len(ln_candidates) < 3:
+        candidates_sorted = sorted(candidates, key=lambda x: x['noise_std'])
+        ln_candidates = candidates_sorted[:len(candidates)//7]
+    
+    low_noise = max(ln_candidates, key=lambda x: x.get('edge_score', 0.0))
 
-    # LN: 저노이즈 그룹 중 edge_score 가장 높은 1장 (혈관/엣지 풍부)
-    low_noise = max(low_group, key=lambda x: x.get('edge_score', 0.0))
-
-    print("✅ Selected 2 representative slices (noise + edge-aware):")
+    print("✅ Selected 2 representative slices (RELATIVE extremes):")
     print(f"   [HN] {high_noise['file_path'].name[:30]} "
           f"slice {high_noise['slice_idx']}  "
-          f"Noise: {high_noise['noise_std']:.1f} HU  "
-          f"Edge: {high_noise.get('edge_score', 0):.4f}")
+          f"Noise: {high_noise['noise_std']:.1f} HU (top {100*(1 - high_noise['noise_std']/all_noise.max()):.1f}%)  "
+          f"Edge: {high_noise.get('edge_score', 0):.1f}")
     print(f"   [LN] {low_noise['file_path'].name[:30]} "
           f"slice {low_noise['slice_idx']}  "
-          f"Noise: {low_noise['noise_std']:.1f} HU  "
-          f"Edge: {low_noise.get('edge_score', 0):.4f}")
+          f"Noise: {low_noise['noise_std']:.1f} HU (bottom {100*low_noise['noise_std']/all_noise.max():.1f}%)  "
+          f"Edge: {low_noise.get('edge_score', 0):.1f}")
     print(f"   Noise ratio (HN/LN): {high_noise['noise_std'] / max(low_noise['noise_std'], 1e-6):.2f}x")
+    print(f"   ⚠️  Note: Entire dataset is noisy (10th %ile = {p10:.1f} HU)")
 
-    # 텐서 변환 (전체 슬라이스를 HU window 후 [0,1]로)
+    # 텐서 변환
     slices = []
     slice_info = []
 
@@ -342,23 +335,33 @@ def train_n2n():
         except Exception as e:
             print(f"     Failed to load pretrained: {e}")
     
-    # Loss function
-    print("\n  Setting up loss function...")
-    loss_type = config['training'].get('loss_type', 'n2n_wavelet')
-    
-    if loss_type == 'n2n_wavelet':
+    print("\n🔧 Setting up loss function...")
+    loss_type = config['training'].get('loss_type', 'n2n_wavelet_edge')
+
+    if loss_type in ['n2n_wavelet', 'n2n_wavelet_edge']:
         criterion = CombinedN2NWaveletLoss(
             n2n_gamma=config['training']['n2n_gamma'],
             wavelet_weight=config['training']['wavelet_weight'],
             wavelet_threshold=config['training']['wavelet_threshold'],
             wavelet_levels=config['training']['wavelet_levels'],
             hu_window=tuple(config['preprocessing']['hu_window']),
-            adaptive=True
+            adaptive=True,
+            # ✅ CRITICAL: Pass YAML parameters to criterion (S1A/S1B 차이 반영)
+            target_noise=config['training'].get('target_noise', 0.15),
+            adaptive_weight_range=tuple(config['training'].get('adaptive_weight_range', [0.3, 3.0])),
+            edge_weight=config['training'].get('edge_weight', 0.05),
         ).to(device)
-    else:  # n2n_only
+        
+        print(f"\n✅ Criterion Parameters from YAML:")
+        print(f"   target_noise         : {config['training'].get('target_noise', 0.15)}")
+        print(f"   adaptive_weight_range: {config['training'].get('adaptive_weight_range', [0.3, 3.0])}")
+        print(f"   edge_weight          : {config['training'].get('edge_weight', 0.05)}")
+        
+    else:  # n2n_only (fallback)
         criterion = Neighbor2NeighborLoss(
             gamma=config['training']['n2n_gamma']
         ).to(device)
+        print(f"\n⚠️  Using basic N2N loss (no wavelet/edge)")
     
     # Optimizer
     optimizer = torch.optim.Adam(
@@ -493,7 +496,8 @@ def train_n2n():
                 writer.add_scalar('Train/estimated_noise', loss_dict['estimated_noise'], global_step)
             
             if 'adaptive_weight' in loss_dict:
-                writer.add_scalar('Train/adaptive_weight', loss_dict['adaptive_weight'], global_step)
+                writer.add_scalar('train/adaptive_weight', loss_dict.get('adaptive_weight', 0), global_step)
+                writer.add_scalar('train/edge_loss', loss_dict.get('edge_loss', 0), global_step)
             
             # Update progress bar
             pbar_dict = {
@@ -612,46 +616,47 @@ def train_n2n():
             )
             cleanup_old_checkpoints(ckpt_dir, config['training']['keep_last_n'])
         
-        # Save samples (use FIXED samples for consistent tracking) - OPTIMIZED
+        # Save samples (use FIXED samples for consistent tracking)
         if epoch % config['training']['sample_interval'] == 0:
             model.eval()
             with torch.no_grad():
                 # Process all fixed samples as batch
                 noisy_batch = torch.cat(fixed_samples, dim=0).to(device)
                 
-                # Get denoised output - single forward pass
+                # N2N forward (use g1 for inference)
+                g1, g2 = criterion.n2n_loss.generate_subimages_checkerboard(noisy_batch)
+                
                 if use_amp:
                     with autocast():
-                        denoised_batch = model(noisy_batch)
+                        denoised_batch = model(g1)
                 else:
-                    denoised_batch = model(noisy_batch)
+                    denoised_batch = model(g1)
                 
                 denoised_batch = torch.clamp(denoised_batch, 0, 1)
                 
-                # Calculate per-sample metrics (lightweight - wavelet only)
+                # Compute per-sample adaptive metrics
                 sample_metrics = None
+                if hasattr(criterion, "compute_sample_metrics"):
+                    sample_metrics = criterion.compute_sample_metrics(
+                        noisy_batch, 
+                        slice_info=slice_info
+                    )
+                    
+                    # Debug output
+                    if len(sample_metrics) >= 2:
+                        print(f"\n📊 Adaptive Metrics (Epoch {epoch}):")
+                        print(f"   HN: weight={sample_metrics[0]['adaptive_weight']:.5f}, "
+                              f"noise={sample_metrics[0]['estimated_noise_hu']:.1f} HU, "
+                              f"ratio={sample_metrics[0]['noise_ratio']:.2f}x")
+                        print(f"   LN: weight={sample_metrics[1]['adaptive_weight']:.5f}, "
+                              f"noise={sample_metrics[1]['estimated_noise_hu']:.1f} HU, "
+                              f"ratio={sample_metrics[1]['noise_ratio']:.2f}x")
+                        
+                        if sample_metrics[0]['adaptive_weight'] > 0 and sample_metrics[1]['adaptive_weight'] > 0:
+                            ratio = sample_metrics[0]['adaptive_weight'] / sample_metrics[1]['adaptive_weight']
+                            print(f"   Weight Ratio (HN/LN): {ratio:.2f}x")
 
-                # criterion이 Wavelet 기반 loss를 가지고 있을 때만 계산
-                if hasattr(criterion, "wavelet_loss"):
-                    sample_metrics = []
-                    for i in range(len(fixed_samples)):
-                        single_denoised = denoised_batch[i:i+1]
-
-                        # Only compute wavelet noise estimation (no full criterion / no grad)
-                        with torch.no_grad():
-                            _, est_noise = criterion.wavelet_loss(single_denoised)
-
-                        sample_metrics.append({
-                            'estimated_noise_hu': est_noise * 400,
-                            'adaptive_threshold_hu': est_noise * 400 * 2.5,
-                            'adaptive_weight': config['training']['wavelet_weight'],
-                            'balance_ratio': 0,  # Not computed per-sample
-                            'label': slice_info[i]['label'],
-                            'file': slice_info[i]['file'],
-                            'original_noise_hu': slice_info[i]['noise_std_hu']
-                        })
-
-                # Save comparison with metrics (없으면 metrics=None으로 넘김)
+                # Save comparison with metrics
                 save_sample_images(
                     noisy_batch,
                     denoised_batch,
@@ -659,6 +664,8 @@ def train_n2n():
                     epoch,
                     metrics=sample_metrics
                 )
+            
+            model.train()
         
         # Early stopping
         if early_stopping(avg_val_loss):

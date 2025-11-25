@@ -1,4 +1,5 @@
 # losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity (Adaptive + Edge Preservation)
+# ✅ FIXED: Added compute_sample_metrics() for validation visualization
 
 import torch
 import torch.nn as nn
@@ -257,10 +258,9 @@ class CombinedN2NWaveletLoss(nn.Module):
                  wavelet_levels=3,
                  hu_window=(-160, 240),
                  adaptive=True,
-                 # 🔧 Step2: HN/LN 구분을 위해 target_noise/범위를 조금 더 보수적으로 설정
-                 target_noise=0.012,                # 대략 LN σ 근처 (정확한 값은 데이터에 따라 조정)
-                 adaptive_weight_range=(0.8, 4.0),  # LN ~0.8x, HN 최대 ~4x
-                 edge_weight=0.08):                 # edge 보존 조금 더 강하게
+                 target_noise=0.012,
+                 adaptive_weight_range=(0.8, 4.0),
+                 edge_weight=0.08):
         super().__init__()
 
         self.base_wavelet_weight = wavelet_weight
@@ -331,12 +331,11 @@ class CombinedN2NWaveletLoss(nn.Module):
         per_sample_ratio = torch.stack(per_sample_ratio)       # [B]
 
         # 🔹 HN/LN별 weight 차이를 실제 loss에 반영
-        #   (가중 평균으로 배치 전체 wavelet loss 구성)
         weighted_wavelet = per_sample_weight * per_sample_wavelet   # [B]
-        wavelet = 2.0*weighted_wavelet.mean()                           # scalar
+        wavelet = weighted_wavelet.mean()                       # scalar
         wavelet_raw = per_sample_wavelet.mean()                     # unweighted 평균
 
-        # 4) Edge preservation loss (여전히 전체 배치 기준)
+        # 4) Edge preservation loss
         edge = self.edge_loss(g1, output)
 
         # 5) Total loss
@@ -348,7 +347,7 @@ class CombinedN2NWaveletLoss(nn.Module):
             wavelet = torch.tensor(0.0, device=noisy_input.device)
             edge = torch.tensor(0.0, device=noisy_input.device)
 
-        # 모니터링용 통계 (기존 필드 유지 + 몇 개 추가)
+        # 모니터링용 통계
         avg_sigma = float(estimated_sigma.mean().item())
         avg_sigma_hu = avg_sigma * self.wavelet_loss.hu_range if hasattr(self.wavelet_loss, 'hu_range') else avg_sigma * 400
         avg_weight = float(per_sample_weight.mean().item())
@@ -369,6 +368,71 @@ class CombinedN2NWaveletLoss(nn.Module):
             'adaptive_weight': avg_weight,   
             'noise_ratio': avg_ratio
         }
+
+    @torch.no_grad()
+    def compute_sample_metrics(self, noisy_input, slice_info=None):
+        """
+        ✅ NEW: Compute per-sample adaptive metrics for validation visualization
+        
+        Args:
+            noisy_input: [B, 1, H, W] - noisy input images
+            slice_info: list of dicts with 'label', 'file', 'noise_std_hu' (optional)
+        
+        Returns:
+            list of dicts with adaptive metrics for each sample
+        """
+        B = noisy_input.size(0)
+        
+        # Estimate noise from INPUT (correct way)
+        estimated_sigma = self.wavelet_loss.estimate_noise_from_input(noisy_input)  # [B]
+        
+        sample_metrics = []
+        
+        for i in range(B):
+            sigma_i = estimated_sigma[i].item()
+            sigma_hu = sigma_i * self.wavelet_loss.hu_range
+            
+            # Compute adaptive threshold (same logic as training)
+            adaptive_threshold = torch.clamp(
+                estimated_sigma[i] * 2.5,
+                min=self.wavelet_loss.base_threshold * 0.3,
+                max=self.wavelet_loss.base_threshold * 3.0
+            ).item()
+            adaptive_threshold_hu = adaptive_threshold * self.wavelet_loss.hu_range
+            
+            # Compute adaptive weight (same logic as training)
+            if self.adaptive and self.target_noise > 0:
+                ratio = (estimated_sigma[i] / self.target_noise).clamp(
+                    self.weight_min, self.weight_max
+                ).item()
+                adaptive_weight = self.base_wavelet_weight * ratio
+            else:
+                ratio = 1.0
+                adaptive_weight = self.base_wavelet_weight
+            
+            metrics = {
+                'estimated_noise': sigma_i,
+                'estimated_noise_hu': sigma_hu,
+                'adaptive_threshold': adaptive_threshold,
+                'adaptive_threshold_hu': adaptive_threshold_hu,
+                'adaptive_weight': adaptive_weight,
+                'noise_ratio': ratio,
+                'balance_ratio': 0.0,  # Not computed per-sample in validation
+            }
+            
+            # Add slice info if provided
+            if slice_info and i < len(slice_info):
+                metrics['label'] = slice_info[i].get('label', f'Sample {i+1}')
+                metrics['file'] = slice_info[i].get('file', 'unknown')
+                metrics['original_noise_hu'] = slice_info[i].get('noise_std_hu', 0.0)
+            else:
+                metrics['label'] = f'Sample {i+1}'
+                metrics['file'] = 'unknown'
+                metrics['original_noise_hu'] = 0.0
+            
+            sample_metrics.append(metrics)
+        
+        return sample_metrics
 
 
 # Backward compatibility
