@@ -1,6 +1,6 @@
 CUDA_VISIBLE_DEVICES=0 python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_s1a.yaml --exp S1_A_wavelet_reconfig
 
-
+CUDA_VISIBLE_DEVICES=0 python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_s1b.yaml --exp S1_B_wavelet_reconfig_s1b
 
 
 CUDA_VISIBLE_DEVICES=1 python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_s1a.yaml --exp S1_A_wavelet_reconfig
