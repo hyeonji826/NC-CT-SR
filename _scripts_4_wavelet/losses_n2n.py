@@ -143,27 +143,43 @@ class WaveletSparsityPrior(nn.Module):
         print(f"   Levels: {levels}")
         print(f"   ✅ Noise estimated from INPUT (not output)")
     
-    def estimate_noise_from_input(self, noisy_input):
+    def estimate_noise_from_input(self, noisy_input, crop_size=128):
         """
-        Estimate noise level from NOISY INPUT using MAD
-        This is the CORRECT way - estimate from input, not denoised output
+        Estimate noise level from NOISY INPUT using MAD.
+        ⚠️ 공기(배경) 영향 줄이기 위해 중앙 crop 후 DWT.
         """
-        _, detail_coeffs_list = self.dwt.multi_level(noisy_input, 1)
-        
+        B, C, H, W = noisy_input.shape
+
+        x = noisy_input
+
+        # ---- 1) 큰 슬라이스면 중앙 crop 해서 body 위주로 사용 ----
+        if H > crop_size or W > crop_size:
+            top  = max((H - crop_size) // 2, 0)
+            left = max((W - crop_size) // 2, 0)
+            bottom = min(top + crop_size, H)
+            right  = min(left + crop_size, W)
+            x = x[:, :, top:bottom, left:right]
+        # (패치 학습에서는 보통 H=W=128이라 그대로 들어감)
+
+        # ---- 2) 1-level DWT 후 detail 계수 모아서 MAD ----
+        _, detail_coeffs_list = self.dwt.multi_level(x, 1)
+
         if len(detail_coeffs_list) > 0:
             LH, HL, HH = detail_coeffs_list[0]
-            
+
             all_details = torch.cat([
                 LH.flatten(1),
                 HL.flatten(1),
                 HH.flatten(1)
             ], dim=1)
-            
+
+            # MAD → sigma 추정
             mad = torch.median(torch.abs(all_details), dim=1)[0]
             sigma = mad / 0.6745
-            
+
             return sigma
-        
+
+        # 만약 어떤 이유로 coeffs가 비어 있으면 fallback
         return torch.zeros(noisy_input.size(0), device=noisy_input.device)
     
     def soft_threshold(self, coeffs, threshold):
