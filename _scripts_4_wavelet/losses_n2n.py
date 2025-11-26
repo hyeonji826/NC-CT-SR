@@ -372,7 +372,7 @@ class CombinedN2NWaveletLoss(nn.Module):
     @torch.no_grad()
     def compute_sample_metrics(self, noisy_input, slice_info=None):
         """
-        ✅ NEW: Compute per-sample adaptive metrics for validation visualization
+        ✅ Compute per-sample adaptive metrics for validation visualization
         
         Args:
             noisy_input: [B, 1, H, W] - noisy input images

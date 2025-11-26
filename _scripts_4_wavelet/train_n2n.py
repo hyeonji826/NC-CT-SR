@@ -346,7 +346,7 @@ def train_n2n():
             wavelet_levels=config['training']['wavelet_levels'],
             hu_window=tuple(config['preprocessing']['hu_window']),
             adaptive=True,
-            # ✅ CRITICAL: Pass YAML parameters to criterion (S1A/S1B 차이 반영)
+            # ✅ CRITICAL: YAML 파라미터 전달
             target_noise=config['training'].get('target_noise', 0.15),
             adaptive_weight_range=tuple(config['training'].get('adaptive_weight_range', [0.3, 3.0])),
             edge_weight=config['training'].get('edge_weight', 0.05),
@@ -616,62 +616,70 @@ def train_n2n():
             )
             cleanup_old_checkpoints(ckpt_dir, config['training']['keep_last_n'])
         
-        # Save samples (use FIXED samples for consistent tracking)
-        if epoch % config['training']['sample_interval'] == 0:
-            model.eval()
-            with torch.no_grad():
-                # Process all fixed samples as batch
-                noisy_batch = torch.cat(fixed_samples, dim=0).to(device)
+    if epoch % config['training']['sample_interval'] == 0:
+        model.eval()
+        with torch.no_grad():
+            # ✅ 개별 샘플 처리 (배치 처리 금지!)
+            denoised_list = []
+            metrics_list = []
+            
+            for i, single_sample in enumerate(fixed_samples):
+                # Single sample [1, 1, H, W]
+                single_noisy = single_sample.to(device)
                 
-                # N2N forward (use g1 for inference)
-                g1, g2 = criterion.n2n_loss.generate_subimages_checkerboard(noisy_batch)
+                # N2N forward (g1 사용)
+                g1, g2 = criterion.n2n_loss.generate_subimages_checkerboard(single_noisy)
                 
                 if use_amp:
                     with autocast():
-                        denoised_batch = model(g1)
+                        single_denoised = model(g1)
                 else:
-                    denoised_batch = model(g1)
+                    single_denoised = model(g1)
                 
-                denoised_batch = torch.clamp(denoised_batch, 0, 1)
+                single_denoised = torch.clamp(single_denoised, 0, 1)
+                denoised_list.append(single_denoised)
                 
-                # Compute per-sample adaptive metrics
-                sample_metrics = None
-                if hasattr(criterion, "compute_sample_metrics"):
-                    sample_metrics = criterion.compute_sample_metrics(
-                        noisy_batch, 
-                        slice_info=slice_info
-                    )
-                    
-                    # Debug output
-                    if len(sample_metrics) >= 2:
-                        print(f"\n📊 Adaptive Metrics (Epoch {epoch}):")
-                        print(f"   HN: weight={sample_metrics[0]['adaptive_weight']:.5f}, "
-                              f"noise={sample_metrics[0]['estimated_noise_hu']:.1f} HU, "
-                              f"ratio={sample_metrics[0]['noise_ratio']:.2f}x")
-                        print(f"   LN: weight={sample_metrics[1]['adaptive_weight']:.5f}, "
-                              f"noise={sample_metrics[1]['estimated_noise_hu']:.1f} HU, "
-                              f"ratio={sample_metrics[1]['noise_ratio']:.2f}x")
-                        
-                        if sample_metrics[0]['adaptive_weight'] > 0 and sample_metrics[1]['adaptive_weight'] > 0:
-                            ratio = sample_metrics[0]['adaptive_weight'] / sample_metrics[1]['adaptive_weight']
-                            print(f"   Weight Ratio (HN/LN): {ratio:.2f}x")
-
-                # Save comparison with metrics
-                save_sample_images(
-                    noisy_batch,
-                    denoised_batch,
-                    sample_dir / f"epoch_{epoch}.png",
-                    epoch,
-                    metrics=sample_metrics
-                )
+                # ✅ 개별 샘플별 adaptive metrics 계산
+                if hasattr(criterion, 'compute_sample_metrics'):
+                    single_metrics = criterion.compute_sample_metrics(
+                        single_noisy,
+                        slice_info=[slice_info[i]]
+                    )[0]  # 첫 번째 (유일한) 샘플
+                    metrics_list.append(single_metrics)
             
-            model.train()
+            # Concat for visualization
+            noisy_batch = torch.cat(fixed_samples, dim=0).to(device)
+            denoised_batch = torch.cat(denoised_list, dim=0)
+            
+            # ✅ Debug output (adaptive weight 차이 확인)
+            if len(metrics_list) >= 2:
+                print(f"\n📊 Adaptive Metrics (Epoch {epoch}):")
+                print(f"   HN: weight={metrics_list[0]['adaptive_weight']:.5f}, "
+                    f"noise={metrics_list[0]['estimated_noise_hu']:.1f} HU, "
+                    f"ratio={metrics_list[0]['noise_ratio']:.2f}x")
+                print(f"   LN: weight={metrics_list[1]['adaptive_weight']:.5f}, "
+                    f"noise={metrics_list[1]['estimated_noise_hu']:.1f} HU, "
+                    f"ratio={metrics_list[1]['noise_ratio']:.2f}x")
+                
+                if metrics_list[0]['adaptive_weight'] > 0 and metrics_list[1]['adaptive_weight'] > 0:
+                    ratio = metrics_list[0]['adaptive_weight'] / metrics_list[1]['adaptive_weight']
+                    print(f"   Weight Ratio (HN/LN): {ratio:.2f}x")
+            
+            # Save comparison with correct metrics
+            save_sample_images(
+                noisy_batch,
+                denoised_batch,
+                sample_dir / f"epoch_{epoch}.png",
+                epoch,
+                metrics=metrics_list if metrics_list else None
+            )
+        
+        model.train()
         
         # Early stopping
         if early_stopping(avg_val_loss):
             print(f"\n Early stopping triggered at epoch {epoch}")
             print(f"   Best val loss: {best_val_loss:.4f}")
-            break
     
     writer.close()
     
