@@ -372,19 +372,29 @@ class CombinedN2NWaveletLoss(nn.Module):
     @torch.no_grad()
     def compute_sample_metrics(self, noisy_input, slice_info=None):
         """
-        ✅ Compute per-sample adaptive metrics for validation visualization
-        
-        Args:
-            noisy_input: [B, 1, H, W] - noisy input images
-            slice_info: list of dicts with 'label', 'file', 'noise_std_hu' (optional)
-        
-        Returns:
-            list of dicts with adaptive metrics for each sample
+        Compute per-sample adaptive metrics for validation
         """
         B = noisy_input.size(0)
         
-        # Estimate noise from INPUT (correct way)
-        estimated_sigma = self.wavelet_loss.estimate_noise_from_input(noisy_input)  # [B]
+        # ✅ FIX: Large image → crop to 128x128 for noise estimation
+        estimated_sigma_list = []
+        for i in range(B):
+            single = noisy_input[i:i+1]  # [1, 1, H, W]
+            
+            # Center crop to 128x128 (training patch size)
+            _, _, h, w = single.shape
+            if h > 128 or w > 128:
+                crop_h = (h - 128) // 2
+                crop_w = (w - 128) // 2
+                cropped = single[:, :, crop_h:crop_h+128, crop_w:crop_w+128]
+            else:
+                cropped = single
+            
+            # Estimate from cropped region
+            sigma = self.wavelet_loss.estimate_noise_from_input(cropped)
+            estimated_sigma_list.append(sigma)
+        
+        estimated_sigma = torch.cat(estimated_sigma_list)  # [B]
         
         sample_metrics = []
         
@@ -392,7 +402,7 @@ class CombinedN2NWaveletLoss(nn.Module):
             sigma_i = estimated_sigma[i].item()
             sigma_hu = sigma_i * self.wavelet_loss.hu_range
             
-            # Compute adaptive threshold (same logic as training)
+            # Adaptive threshold
             adaptive_threshold = torch.clamp(
                 estimated_sigma[i] * 2.5,
                 min=self.wavelet_loss.base_threshold * 0.3,
@@ -400,7 +410,7 @@ class CombinedN2NWaveletLoss(nn.Module):
             ).item()
             adaptive_threshold_hu = adaptive_threshold * self.wavelet_loss.hu_range
             
-            # Compute adaptive weight (same logic as training)
+            # Adaptive weight
             if self.adaptive and self.target_noise > 0:
                 ratio = (estimated_sigma[i] / self.target_noise).clamp(
                     self.weight_min, self.weight_max
@@ -417,10 +427,10 @@ class CombinedN2NWaveletLoss(nn.Module):
                 'adaptive_threshold_hu': adaptive_threshold_hu,
                 'adaptive_weight': adaptive_weight,
                 'noise_ratio': ratio,
-                'balance_ratio': 0.0,  # Not computed per-sample in validation
+                'balance_ratio': 0.0,
             }
             
-            # Add slice info if provided
+            # Add slice info
             if slice_info and i < len(slice_info):
                 metrics['label'] = slice_info[i].get('label', f'Sample {i+1}')
                 metrics['file'] = slice_info[i].get('file', 'unknown')

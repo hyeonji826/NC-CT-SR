@@ -16,6 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 import time
 import yaml
 import argparse
+import nibabel as nib
 
 # Add SwinIR to path
 sys.path.insert(0, r'E:\LD-CT SR\_externals\SwinIR')
@@ -28,28 +29,29 @@ from utils import (
     cleanup_old_checkpoints, EarlyStopping, WarmupScheduler
 )
 
-def load_fixed_full_slices(nc_ct_dir, hu_window):
-    """
-    HIGH-NOISE(HN) + RELATIVELY-LOW-NOISE(LN) full slices 선택
-    
-    ⚠️ 전체 데이터셋이 noisy하므로 RELATIVE 기준 사용
-    - HN: 90th percentile 이상 (극단적 high)
-    - LN: 10th percentile 이하 (상대적 low) + high edge
-    """
+def load_fixed_full_slices(nc_ct_dir, hu_window, seed=None):
     import nibabel as nib
     import numpy as np
     from pathlib import Path
     from scipy import ndimage
+    import random
+
+    # ✅ Set seed if provided
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
 
     nc_ct_dir = Path(nc_ct_dir)
     files = sorted(list(nc_ct_dir.glob("*.nii.gz")))
 
     candidates = []
 
-    print("\n🔍 Analyzing slices (RELATIVE noise-based selection)...")
+    print(f"\n🔍 Analyzing slices (RELATIVE noise-based selection, seed={seed})...")
 
     # ✅ 전체 파일 스캔 (충분한 샘플 확보)
-    for file_idx, file_path in enumerate(files):
+    max_files = min(50, len(files))  # 속도를 위해 50개 제한
+    
+    for file_idx, file_path in enumerate(files[:max_files]):
         try:
             nii = nib.load(str(file_path))
             volume = nii.get_fdata()
@@ -79,64 +81,65 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
                 if tissue_mask.sum() < 1000:
                     continue
 
-                tissue_region = center_slice[tissue_mask]
-                noise_std = tissue_region.std()
+                noise_std = center_slice[tissue_mask].std()
 
-                # Sobel edge
-                gx = ndimage.sobel(center_slice, axis=0)
-                gy = ndimage.sobel(center_slice, axis=1)
-                edge_mag = np.hypot(gx, gy)
-                edge_score = edge_mag[tissue_mask].mean()
+                # Edge 점수 (Sobel)
+                edge_x = ndimage.sobel(center_slice, axis=0)
+                edge_y = ndimage.sobel(center_slice, axis=1)
+                edge_magnitude = np.sqrt(edge_x**2 + edge_y**2)
+                edge_score = edge_magnitude[tissue_mask].mean()
 
                 candidates.append({
                     'file_path': file_path,
                     'slice_idx': slice_idx,
-                    'noise_std': float(noise_std),
-                    'edge_score': float(edge_score),
+                    'noise_std': noise_std,
+                    'edge_score': edge_score,
                     'slice_2d': center_slice
                 })
+
         except Exception as e:
-            print(f"  ⚠️ Skip {file_path.name}: {e}")
             continue
-        
-        # Progress
-        if (file_idx + 1) % 50 == 0:
-            print(f"  Scanned {file_idx + 1}/{len(files)} files...")
+
+        if file_idx >= 49:
+            break
 
     if len(candidates) < 2:
-        raise RuntimeError("Not enough valid slices found!")
+        raise ValueError(f"Not enough valid slices found (only {len(candidates)})")
 
-    # ✅ Percentile 기준 계산
-    all_noise = np.array([c['noise_std'] for c in candidates])
-    p10 = np.percentile(all_noise, 10)
-    p90 = np.percentile(all_noise, 90)
-    median = np.median(all_noise)
-    
-    print(f"   Noise distribution: 10th={p10:.1f}, median={median:.1f}, 90th={p90:.1f} HU")
+    # Noise 분포 분석
+    noise_values = [c['noise_std'] for c in candidates]
+    p10 = np.percentile(noise_values, 10)
+    p50 = np.percentile(noise_values, 50)
+    p90 = np.percentile(noise_values, 90)
 
-    # 1) HN: 90th percentile 이상 중 가장 높은 것
+    print(f"  Scanned {min(50, len(files))}/{len(files)} files...")
+    print(f"   Noise distribution: 10th={p10:.1f}, median={p50:.1f}, 90th={p90:.1f} HU")
+
+    # HN 선택: >= 90th percentile
     hn_candidates = [c for c in candidates if c['noise_std'] >= p90]
+    if len(hn_candidates) == 0:
+        hn_candidates = sorted(candidates, key=lambda x: x['noise_std'], reverse=True)[:10]
+
     high_noise = max(hn_candidates, key=lambda x: x['noise_std'])
 
-    # 2) LN: 10th percentile 이하 중 edge 가장 높은 것
+    # LN 선택: <= 10th percentile (or bottom 15%)
     ln_candidates = [c for c in candidates if c['noise_std'] <= p10]
-    
-    # Fallback: 10th percentile 이하가 없으면 하위 15%
-    if len(ln_candidates) < 3:
-        candidates_sorted = sorted(candidates, key=lambda x: x['noise_std'])
-        ln_candidates = candidates_sorted[:len(candidates)//7]
-    
-    low_noise = max(ln_candidates, key=lambda x: x.get('edge_score', 0.0))
+    if len(ln_candidates) < 5:
+        ln_candidates = sorted(candidates, key=lambda x: x['noise_std'])[:max(5, len(candidates)//7)]
 
-    print("✅ Selected 2 representative slices (RELATIVE extremes):")
-    print(f"   [HN] {high_noise['file_path'].name[:30]} "
-          f"slice {high_noise['slice_idx']}  "
-          f"Noise: {high_noise['noise_std']:.1f} HU (top {100*(1 - high_noise['noise_std']/all_noise.max()):.1f}%)  "
-          f"Edge: {high_noise.get('edge_score', 0):.1f}")
-    print(f"   [LN] {low_noise['file_path'].name[:30]} "
-          f"slice {low_noise['slice_idx']}  "
-          f"Noise: {low_noise['noise_std']:.1f} HU (bottom {100*low_noise['noise_std']/all_noise.max():.1f}%)  "
-          f"Edge: {low_noise.get('edge_score', 0):.1f}")
+    low_noise = max(ln_candidates, key=lambda x: x['edge_score'])
+
+    # Percentile 계산
+    hn_percentile = (sum(1 for c in candidates if c['noise_std'] > high_noise['noise_std']) / len(candidates)) * 100
+    ln_percentile = (sum(1 for c in candidates if c['noise_std'] > low_noise['noise_std']) / len(candidates)) * 100
+
+    print(f"✅ Selected 2 representative slices (RELATIVE extremes, seed={seed}):")
+    print(f"   [HN] {high_noise['file_path'].name} slice {high_noise['slice_idx']}  "
+          f"Noise: {high_noise['noise_std']:.1f} HU (top {hn_percentile:.1f}%)  "
+          f"Edge: {high_noise['edge_score']:.1f}")
+    print(f"   [LN] {low_noise['file_path'].name} slice {low_noise['slice_idx']}  "
+          f"Noise: {low_noise['noise_std']:.1f} HU (bottom {ln_percentile:.1f}%)  "
+          f"Edge: {low_noise['edge_score']:.1f}")
     print(f"   Noise ratio (HN/LN): {high_noise['noise_std'] / max(low_noise['noise_std'], 1e-6):.2f}x")
     print(f"   ⚠️  Note: Entire dataset is noisy (10th %ile = {p10:.1f} HU)")
 
@@ -163,6 +166,8 @@ def load_fixed_full_slices(nc_ct_dir, hu_window):
         })
 
     return slices, slice_info
+
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -283,15 +288,6 @@ def train_n2n():
             file_idx = idx % len(full_dataset.files)
             f.write(f"{full_dataset.files[file_idx]}\n")
     print(f"   Test set file list saved: {test_indices_path}")
-    
-    # Prepare fixed validation samples for consistent progress tracking
-    print("\nPreparing fixed validation samples (HN + LN comparison)...")
-    fixed_samples, slice_info = load_fixed_full_slices(
-        config['data']['nc_ct_dir'],
-        config['preprocessing']['hu_window']
-    )
-    print(f"   Fixed samples: {len(fixed_samples)} full slices (HN + LN)")
-    print(f"   Size: {fixed_samples[0].shape}")
     
     # Model
     print("\n  Building SwinIR model...")
@@ -616,71 +612,95 @@ def train_n2n():
             )
             cleanup_old_checkpoints(ckpt_dir, config['training']['keep_last_n'])
         
-    if epoch % config['training']['sample_interval'] == 0:
-        model.eval()
-        with torch.no_grad():
-            # ✅ 개별 샘플 처리 (배치 처리 금지!)
-            denoised_list = []
-            metrics_list = []
+# Save samples (use FIXED samples for consistent tracking)
+        if epoch % config['training']['sample_interval'] == 0 or epoch == 1:
+            sample_seed = epoch // 10  
+            fixed_samples, slice_info = load_fixed_full_slices(
+                config['data']['nc_ct_dir'],
+                config['preprocessing']['hu_window'],
+                seed=sample_seed
+            )
             
-            for i, single_sample in enumerate(fixed_samples):
-                # Single sample [1, 1, H, W]
-                single_noisy = single_sample.to(device)
+            model.eval()
+            with torch.no_grad():
+                # ✅ 개별 샘플 처리
+                denoised_list = []
+                metrics_list = []
                 
-                # N2N forward (g1 사용)
-                g1, g2 = criterion.n2n_loss.generate_subimages_checkerboard(single_noisy)
-                
-                if use_amp:
-                    with autocast():
+                for i, single_sample in enumerate(fixed_samples):
+                    single_noisy = single_sample.to(device)
+                    
+                    # N2N forward
+                    g1, g2 = criterion.n2n_loss.generate_subimages_checkerboard(single_noisy)
+                    
+                    if use_amp:
+                        with autocast():
+                            single_denoised = model(g1)
+                    else:
                         single_denoised = model(g1)
-                else:
-                    single_denoised = model(g1)
-                
-                single_denoised = torch.clamp(single_denoised, 0, 1)
-                denoised_list.append(single_denoised)
-                
-                # ✅ 개별 샘플별 adaptive metrics 계산
+                    
+                    single_denoised = torch.clamp(single_denoised, 0, 1)
+                    denoised_list.append(single_denoised)
+                    
+                # Adaptive metrics
                 if hasattr(criterion, 'compute_sample_metrics'):
+                    # ✅ DEBUG: Noise estimation 테스트
+                    print(f"\n🔍 DEBUG Sample {i} ({slice_info[i]['label']}):")
+                    print(f"   Input shape: {single_noisy.shape}")
+                    print(f"   Input range: [{single_noisy.min():.4f}, {single_noisy.max():.4f}]")
+                    print(f"   Input std: {single_noisy.std():.4f}")
+                    
+                    # Direct noise estimation test
+                    test_sigma = criterion.wavelet_loss.estimate_noise_from_input(single_noisy)
+                    print(f"   Wavelet sigma (raw): {test_sigma.item():.6f}")
+                    print(f"   Wavelet sigma (HU): {test_sigma.item() * 400:.2f}")
+                    
+                    # Compute full metrics
                     single_metrics = criterion.compute_sample_metrics(
                         single_noisy,
                         slice_info=[slice_info[i]]
-                    )[0]  # 첫 번째 (유일한) 샘플
+                    )[0]
                     metrics_list.append(single_metrics)
-            
-            # Concat for visualization
-            noisy_batch = torch.cat(fixed_samples, dim=0).to(device)
-            denoised_batch = torch.cat(denoised_list, dim=0)
-            
-            # ✅ Debug output (adaptive weight 차이 확인)
-            if len(metrics_list) >= 2:
-                print(f"\n📊 Adaptive Metrics (Epoch {epoch}):")
-                print(f"   HN: weight={metrics_list[0]['adaptive_weight']:.5f}, "
-                    f"noise={metrics_list[0]['estimated_noise_hu']:.1f} HU, "
-                    f"ratio={metrics_list[0]['noise_ratio']:.2f}x")
-                print(f"   LN: weight={metrics_list[1]['adaptive_weight']:.5f}, "
-                    f"noise={metrics_list[1]['estimated_noise_hu']:.1f} HU, "
-                    f"ratio={metrics_list[1]['noise_ratio']:.2f}x")
+                    
+                    print(f"   Metrics adaptive_weight: {single_metrics['adaptive_weight']:.5f}")
+                    print(f"   Metrics estimated_noise_hu: {single_metrics['estimated_noise_hu']:.2f}")
                 
-                if metrics_list[0]['adaptive_weight'] > 0 and metrics_list[1]['adaptive_weight'] > 0:
-                    ratio = metrics_list[0]['adaptive_weight'] / metrics_list[1]['adaptive_weight']
-                    print(f"   Weight Ratio (HN/LN): {ratio:.2f}x")
+                # Concat for visualization
+                noisy_batch = torch.cat(fixed_samples, dim=0).to(device)
+                denoised_batch = torch.cat(denoised_list, dim=0)
+                
+                # Debug output
+                if len(metrics_list) >= 2:
+                    print(f"\n📊 Adaptive Metrics (Epoch {epoch}):")
+                    print(f"   HN: weight={metrics_list[0]['adaptive_weight']:.5f}, "
+                          f"noise={metrics_list[0]['estimated_noise_hu']:.1f} HU, "
+                          f"ratio={metrics_list[0]['noise_ratio']:.2f}x")
+                    print(f"   LN: weight={metrics_list[1]['adaptive_weight']:.5f}, "
+                          f"noise={metrics_list[1]['estimated_noise_hu']:.1f} HU, "
+                          f"ratio={metrics_list[1]['noise_ratio']:.2f}x")
+                    
+                    if metrics_list[0]['adaptive_weight'] > 0 and metrics_list[1]['adaptive_weight'] > 0:
+                        ratio = metrics_list[0]['adaptive_weight'] / metrics_list[1]['adaptive_weight']
+                        print(f"   Weight Ratio (HN/LN): {ratio:.2f}x")
+                
+                # Save
+                save_sample_images(
+                    noisy_batch,
+                    denoised_batch,
+                    sample_dir / f"epoch_{epoch}.png",
+                    epoch,
+                    metrics=metrics_list if metrics_list else None
+                )
             
-            # Save comparison with correct metrics
-            save_sample_images(
-                noisy_batch,
-                denoised_batch,
-                sample_dir / f"epoch_{epoch}.png",
-                epoch,
-                metrics=metrics_list if metrics_list else None
-            )
+            model.train()
         
-        model.train()
-        
-        # Early stopping
+        # Early stopping (for loop 안)
         if early_stopping(avg_val_loss):
-            print(f"\n Early stopping triggered at epoch {epoch}")
+            print(f"\nEarly stopping triggered at epoch {epoch}")
             print(f"   Best val loss: {best_val_loss:.4f}")
+            break
     
+    # for loop 끝
     writer.close()
     
     # Final summary
