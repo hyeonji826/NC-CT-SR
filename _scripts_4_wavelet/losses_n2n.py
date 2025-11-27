@@ -87,10 +87,16 @@ class WaveletSparsityPrior(nn.Module):
         b, c, h, w = x.shape
         assert c == 1, "Noise estimation assumes 1-channel input."
 
+        # 0~1 -> HU
         img_hu = x * self.hu_range + self.hu_min
-        flat = img_hu.view(b, -1)
+
+        # ⚠️ view 대신 reshape 사용 (또는 contiguous() 후 view)
+        #     non-contiguous 텐서에서도 안전하게 동작
+        flat = img_hu.reshape(b, -1)  # <-- 여기만 핵심 수정
+
         sigma = flat.std(dim=1) / (self.hu_range + 1e-8)  # 다시 0~1 스케일
         return sigma  # [B]
+
 
     def forward(self, x: torch.Tensor, estimated_sigma: torch.Tensor | None = None):
         """
@@ -164,23 +170,52 @@ class SupervisedWaveletLoss(nn.Module):
 
     def forward(self, output: torch.Tensor, target: torch.Tensor):
         """
-        output: [B, 1, H, W]
-        target: [B, 1, H, W]
+        output: [B, C, H, W]  (C=3인 경우 존재)
+        target: [B, 1, H, W]  (중앙 슬라이스 GT)
         """
-        base = self.mse(output, target)
 
+        # ---- 1) 출력 채널 정리: 3채널이면 중앙 채널 하나만 사용 ----
+        # SwinIR out_chans = in_chans 이라 C=3.
+        # 우리는 그 중 "중앙 채널"만 실제 복원 결과로 사용.
+        b, c, h, w = output.shape
+
+        if c == 1:
+            out_1ch = output
+        else:
+            mid = c // 2  # 예: c=3 -> mid=1
+            out_1ch = output[:, mid : mid + 1, :, :]  # [B,1,H,W]
+
+        # ---- 2) 타깃 채널 정리 ----
+        # target 이 [B,1,H,W] 이므로 그대로 사용
+        if target.shape[1] == 1:
+            tgt_1ch = target
+        elif target.shape[1] == c:
+            # 혹시나 target도 3채널이면 동일하게 중앙 채널 사용
+            mid = target.shape[1] // 2
+            tgt_1ch = target[:, mid : mid + 1, :, :]
+        else:
+            raise ValueError(
+                f"Unexpected target shape {target.shape}, "
+                f"expected [B,1,H,W] or [B,{c},H,W]."
+            )
+
+        # ---- 3) 기본 MSE 손실 ----
+        base = self.mse(out_1ch, tgt_1ch)  # [B,1,H,W] vs [B,1,H,W]
+
+        # ---- 4) Wavelet sparsity 손실 ----
         wavelet = torch.tensor(0.0, device=output.device)
         est_sigma = torch.tensor(0.0, device=output.device)
 
         if self.wavelet_weight > 0.0:
-            wavelet_raw, est_sigma = self.wavelet_loss(output, None)
+            # Wavelet prior는 1채널 입력만 받으므로 out_1ch 사용
+            wavelet_raw, est_sigma = self.wavelet_loss(out_1ch, None)
             wavelet = self.wavelet_weight * wavelet_raw
             total = base + wavelet
         else:
             wavelet_raw = torch.tensor(0.0, device=output.device)
             total = base
 
-        # noise(HU) 추정은 모니터링용
+        # ---- 5) 노이즈(HU) 추정 (모니터링용) ----
         if isinstance(est_sigma, torch.Tensor):
             sigma_val = float(est_sigma)
         else:

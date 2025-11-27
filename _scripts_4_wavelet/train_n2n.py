@@ -178,6 +178,41 @@ def load_fixed_full_slices(nc_ct_dir, hu_window, seed=None):
 
     return slices, slice_info
 
+def compute_roi_noise_hu(x_01: torch.Tensor,
+                         hu_window,
+                         body_hu_range=(-100, 100),
+                         roi_h=0.7,
+                         roi_w=0.5) -> float:
+    """
+    x_01 : [1,1,H,W]  0~1 정규화된 CT 슬라이스
+    hu_window : (hu_min, hu_max)  ex) (-160, 240)
+    body_hu_range : 조직 마스크 범위 (기본 -100~100 HU)
+    roi_h, roi_w : ROI 크기 비율 (70% x 50%)
+    반환값 : ROI 내 노이즈 표준편차 (HU 단위)
+    """
+    hu_min, hu_max = hu_window
+    arr = x_01[0, 0].detach().cpu().numpy()
+    H, W = arr.shape
+
+    # 중심 ROI (위/아래 15%, 좌/우 25% 잘라내기 → 70% x 50%)
+    top = int(H * (1 - roi_h) / 2)
+    bottom = H - top
+    left = int(W * (1 - roi_w) / 2)
+    right = W - left
+    roi = arr[top:bottom, left:right]
+
+    # 0~1 → HU
+    hu = roi * (hu_max - hu_min) + hu_min
+
+    # 조직 마스크
+    mask = (hu > body_hu_range[0]) & (hu < body_hu_range[1])
+    vals = hu[mask]
+    # 조직 픽셀이 너무 적으면 ROI 전체 사용 (fallback)
+    if vals.size < 500:
+        vals = hu
+
+    return float(vals.std())
+
 
 # -------------------------------------------------------------------------
 # Config / arg parsing
@@ -340,9 +375,7 @@ def train_n2n():
 
     early_stopping = EarlyStopping(
         patience=config["training"]["early_stopping_patience"],
-        verbose=True,
-        delta=config["training"].get("early_stopping_delta", 0.0),
-        path=str(ckpt_dir / "best_model.pth"),
+        min_delta=config["training"].get("early_stopping_delta", 0.0),
     )
 
     scaler = GradScaler(enabled=config["training"].get("use_amp", False))
@@ -484,7 +517,15 @@ def train_n2n():
 
         if epoch % config["training"]["save_interval"] == 0 or is_best:
             ckpt_path = ckpt_dir / f"model_epoch_{epoch:04d}.pth"
-            save_checkpoint(ckpt_path, epoch, model, optimizer, scheduler, avg_val_loss)
+            save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                avg_val_loss,
+                ckpt_path,
+                is_best=is_best,
+            )
             cleanup_old_checkpoints(ckpt_dir, keep_last_n=config["training"]["keep_last_n"])
 
         # ---------------- 샘플 HN/LN 이미지 저장 ----------------
@@ -498,7 +539,7 @@ def train_n2n():
                 seed=sample_seed,
             )
 
-            wavelet_estimator = criterion.wavelet_loss  # WaveletSparsityPrior
+            hu_window = tuple(config["preprocessing"]["hu_window"])
 
             model.eval()
             with torch.no_grad():
@@ -506,36 +547,38 @@ def train_n2n():
                 metrics_list = []
 
                 for i, single_sample in enumerate(fixed_samples):
-                    # single_sample: [1,1,H,W]
+                    # single_sample: [1,1,H,W] (noisy, 0~1 정규화 상태)
                     single_noisy = single_sample.to(device)
 
-                    # 2.5D 입력 스택: 중앙 슬라이스를 3번 복제 (이웃 슬라이스 없이 시각화용)
+                    # 2.5D 입력 스택: 중앙 슬라이스를 3번 복제 (시각화용)
                     center_2d = single_noisy[0, 0]  # [H,W]
-                    stack = torch.stack([center_2d, center_2d, center_2d], dim=0).unsqueeze(
-                        0
-                    )  # [1,3,H,W]
+                    stack = torch.stack([center_2d, center_2d, center_2d], dim=0).unsqueeze(0)  # [1,3,H,W]
 
                     if use_amp:
                         with autocast():
                             single_denoised = model(stack)
                     else:
                         single_denoised = model(stack)
+
                     single_denoised = torch.clamp(single_denoised, 0.0, 1.0)
 
-                    # 시각화를 위해 1채널만 사용
-                    denoised_list.append(single_denoised[:, :1, ...])
+                    # wavelet/MSE는 중앙 채널 하나만 쓰지만,
+                    # 시각화/노이즈 계산도 1채널만 사용
+                    den_1ch = single_denoised[:, 1:2, ...] if single_denoised.shape[1] > 1 else single_denoised
 
-                    # noise(HU) 추정
-                    sigma = wavelet_estimator.estimate_noise_from_input(single_noisy)
-                    sigma_val = float(sigma.mean().item())
-                    sigma_hu = sigma_val * wavelet_estimator.hu_range
+                    denoised_list.append(den_1ch)
+
+                    # === ROI 기반 노이즈 (HU) 계산 ===
+                    #   - noisy: 학습 전 LD
+                    #   - denoised: 모델 출력
+                    noisy_hu_std = compute_roi_noise_hu(single_noisy, hu_window)
+                    den_hu_std = compute_roi_noise_hu(den_1ch, hu_window)
 
                     m = {
                         "label": slice_info[i].get("label", f"Sample {i+1}"),
                         "file": slice_info[i].get("file", "unknown"),
-                        "original_noise_hu": slice_info[i].get("noise_std_hu", 0.0),
-                        "estimated_noise": sigma_val,
-                        "estimated_noise_hu": sigma_hu,
+                        "original_noise_hu": float(noisy_hu_std),   # 재계산 (slice_info 값 대신)
+                        "estimated_noise_hu": float(den_hu_std),    # 모델 적용 후 ROI 노이즈
                     }
                     metrics_list.append(m)
 
@@ -564,9 +607,10 @@ def train_n2n():
             model.train()
 
         # ---------------- Early stopping ----------------
-        if early_stopping(avg_val_loss):
+        early_stopping(avg_val_loss)
+        if early_stopping.early_stop:
             print(f"\nEarly stopping at epoch {epoch}, best val loss {best_val_loss:.4f}")
-            break
+            break   
 
     writer.close()
     print("\n==================== Training Done ====================")
