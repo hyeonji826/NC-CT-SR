@@ -1,9 +1,4 @@
-# E:\LD-CT SR\_scripts_4_wavelet\losses_n2n.py
-# Supervised 2.5D Loss for SwinIR (MSE + Wavelet Sparsity)
-# NaN-safe 버전
-
 import warnings
-
 import numpy as np
 import torch
 import torch.nn as nn
