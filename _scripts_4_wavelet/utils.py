@@ -9,8 +9,16 @@ import warnings
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
+import yaml
 
-# Suppress warnings
+def load_yaml_config(path: str):
+    """
+    Load YAML config file safely.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg
+
 warnings.filterwarnings('ignore')
 
 def calculate_psnr(img1, img2, data_range=1.0):

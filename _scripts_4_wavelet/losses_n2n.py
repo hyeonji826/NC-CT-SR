@@ -1,466 +1,198 @@
-# losses_n2n.py - Neighbor2Neighbor + Wavelet Sparsity (Adaptive + Edge Preservation)
-# ✅ FIXED: Added compute_sample_metrics() for validation visualization
+# E:\LD-CT SR\_scripts_4_wavelet\losses_n2n.py
+# Supervised 2.5D Loss for SwinIR (MSE + Wavelet Sparsity)
 
+import warnings
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import warnings
-warnings.filterwarnings('ignore')
+
+warnings.filterwarnings("ignore")
 
 
+# ------------------------------------------------------------
+# 2D Discrete Wavelet Transform (Haar) in PyTorch
+# ------------------------------------------------------------
 class PyTorchDWT2D(nn.Module):
     """
-    PyTorch-based 2D Discrete Wavelet Transform (Haar)
-    100% GPU computation - NO CPU transfers
+    Simple 2D Haar DWT implemented in PyTorch.
+    Input:  [B, 1, H, W]
+    Output: cA, (cH, cV, cD) for each level
     """
-    
-    def __init__(self, wavelet='haar'):
+
+    def __init__(self, wave="haar"):
         super().__init__()
-        
-        if wavelet == 'haar':
-            h0 = torch.tensor([1/np.sqrt(2), 1/np.sqrt(2)], dtype=torch.float32)
-            h1 = torch.tensor([1/np.sqrt(2), -1/np.sqrt(2)], dtype=torch.float32)
-        else:
-            raise NotImplementedError(f"Wavelet '{wavelet}' not implemented.")
-        
-        self.register_buffer('h0', h0)
-        self.register_buffer('h1', h1)
-    
+
+        if wave != "haar":
+            raise NotImplementedError("Only 'haar' wavelet is implemented.")
+
+        # Haar filters
+        h0 = torch.tensor([1.0, 1.0]) / np.sqrt(2.0)  # low-pass
+        h1 = torch.tensor([-1.0, 1.0]) / np.sqrt(2.0)  # high-pass
+
+        ll = torch.outer(h0, h0)
+        lh = torch.outer(h0, h1)
+        hl = torch.outer(h1, h0)
+        hh = torch.outer(h1, h1)
+
+        self.register_buffer("ll", ll.view(1, 1, 2, 2))
+        self.register_buffer("lh", lh.view(1, 1, 2, 2))
+        self.register_buffer("hl", hl.view(1, 1, 2, 2))
+        self.register_buffer("hh", hh.view(1, 1, 2, 2))
+
     def forward(self, x):
-        """Single-level 2D DWT"""
-        B, C, H, W = x.shape
-        
-        if H % 2 != 0:
-            x = F.pad(x, (0, 0, 0, 1), mode='reflect')
-            H += 1
-        if W % 2 != 0:
-            x = F.pad(x, (0, 1, 0, 0), mode='reflect')
-            W += 1
-        
-        h0_2d_row = self.h0.view(1, 1, 1, -1).repeat(C, 1, 1, 1)
-        h0_2d_col = self.h0.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
-        h1_2d_row = self.h1.view(1, 1, 1, -1).repeat(C, 1, 1, 1)
-        h1_2d_col = self.h1.view(1, 1, -1, 1).repeat(C, 1, 1, 1)
-        
-        x_l = F.conv2d(x, h0_2d_row, stride=(1, 2), padding=(0, 0), groups=C)
-        x_h = F.conv2d(x, h1_2d_row, stride=(1, 2), padding=(0, 0), groups=C)
-        
-        LL = F.conv2d(x_l, h0_2d_col, stride=(2, 1), padding=(0, 0), groups=C)
-        LH = F.conv2d(x_l, h1_2d_col, stride=(2, 1), padding=(0, 0), groups=C)
-        HL = F.conv2d(x_h, h0_2d_col, stride=(2, 1), padding=(0, 0), groups=C)
-        HH = F.conv2d(x_h, h1_2d_col, stride=(2, 1), padding=(0, 0), groups=C)
-        
-        return LL, LH, HL, HH
-    
-    def multi_level(self, x, levels):
-        """Multi-level DWT"""
-        coeffs = []
-        current = x
-        
-        for _ in range(levels):
-            LL, LH, HL, HH = self.forward(current)
-            coeffs.append((LH, HL, HH))
-            current = LL
-        
-        return current, coeffs
+        """
+        x: [B, 1, H, W]
+        """
+        ll = F.conv2d(x, self.ll, stride=2)
+        lh = F.conv2d(x, self.lh, stride=2)
+        hl = F.conv2d(x, self.hl, stride=2)
+        hh = F.conv2d(x, self.hh, stride=2)
+        return ll, (lh, hl, hh)
 
 
-class Neighbor2NeighborLoss(nn.Module):
-    """
-    Neighbor2Neighbor Loss (CVPR 2021) - EXACT Implementation
-    """
-    
-    def __init__(self, gamma=2.0):
-        super().__init__()
-        self.gamma = gamma
-        print(f"\nNeighbor2Neighbor Loss:")
-        print(f"   gamma = {gamma}")
-        print(f"   Loss = L_rec + {gamma} * L_reg")
-    
-    def generate_subimages_checkerboard(self, noisy):
-        """Generate two spatially-disjoint sub-images"""
-        B, C, H, W = noisy.shape
-        
-        if H % 2 != 0:
-            noisy = noisy[:, :, :-1, :]
-            H = H - 1
-        if W % 2 != 0:
-            noisy = noisy[:, :, :, :-1]
-            W = W - 1
-        
-        pos_0 = noisy[:, :, 0::2, 0::2]
-        pos_3 = noisy[:, :, 1::2, 1::2]
-        
-        g1 = F.interpolate(pos_0, size=(H, W), mode='bilinear', align_corners=False)
-        g2 = F.interpolate(pos_3, size=(H, W), mode='bilinear', align_corners=False)
-        
-        return g1, g2
-    
-    def forward(self, model, noisy_input, return_output=False):
-        """Compute N2N loss"""
-        g1, g2 = self.generate_subimages_checkerboard(noisy_input)
-        
-        output = model(g1)
-        output = torch.clamp(output, 0, 1)
-        
-        rec_loss = F.mse_loss(output, g2)
-        reg_loss = F.mse_loss(output, g1)
-        
-        total = rec_loss + self.gamma * reg_loss
-        
-        loss_dict = {
-            'rec': rec_loss.item(),
-            'reg': reg_loss.item(),
-            'reg_weighted': (self.gamma * reg_loss).item(),
-            'total': total.item()
-        }
-        
-        if return_output:
-            return total, loss_dict, output, g1
-        else:
-            return total, loss_dict
-
-
+# ------------------------------------------------------------
+# Wavelet sparsity prior (thresholding high-frequency bands)
+# ------------------------------------------------------------
 class WaveletSparsityPrior(nn.Module):
-    """
-    Wavelet Sparsity Prior - FIXED: Estimate noise from INPUT, not output
-    """
-    
-    def __init__(self, threshold=60, wavelet='haar', levels=3, hu_window=(-160, 240), adaptive=True):
+    def __init__(
+        self,
+        threshold=60.0,
+        wavelet="haar",
+        levels=3,
+        hu_window=(-160, 240),
+        adaptive=False,
+    ):
+        """
+        threshold: HU 단위 threshold (기본 60 HU)
+        adaptive : 여기서는 False로 사용 (고정 threshold)
+        """
         super().__init__()
-        
-        self.hu_range = hu_window[1] - hu_window[0]
-        self.base_threshold = threshold / self.hu_range
-        self.base_threshold_hu = threshold
         self.levels = levels
         self.adaptive = adaptive
-        
-        self.dwt = PyTorchDWT2D(wavelet=wavelet)
-        
-        print(f"\nWavelet Sparsity Prior (FIXED Adaptive):")
-        print(f"   Base Threshold: {threshold} HU -> {self.base_threshold:.4f}")
-        print(f"   Levels: {levels}")
-        print(f"   ✅ Noise estimated from INPUT (not output)")
-    
-    def estimate_noise_from_input(self, noisy_input, crop_size=128):
+
+        self.hu_min, self.hu_max = hu_window
+        self.hu_range = self.hu_max - self.hu_min
+        self.base_threshold_hu = threshold
+        self.base_threshold = threshold / (self.hu_range + 1e-8)
+
+        self.dwt = PyTorchDWT2D(wavelet)
+
+    @torch.no_grad()
+    def estimate_noise_from_input(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Estimate noise level from NOISY INPUT using MAD.
-        ⚠️ 공기(배경) 영향 줄이기 위해 중앙 crop 후 DWT.
+        x: [B, 1, H, W], 정규화(0~1) 이미지를 HU로 되돌려서 sigma 추정.
         """
-        B, C, H, W = noisy_input.shape
+        b, c, h, w = x.shape
+        assert c == 1, "Noise estimation assumes 1-channel input."
 
-        x = noisy_input
+        img_hu = x * self.hu_range + self.hu_min
+        flat = img_hu.view(b, -1)
+        sigma = flat.std(dim=1) / (self.hu_range + 1e-8)  # 다시 0~1 스케일
+        return sigma  # [B]
 
-        # ---- 1) 큰 슬라이스면 중앙 crop 해서 body 위주로 사용 ----
-        if H > crop_size or W > crop_size:
-            top  = max((H - crop_size) // 2, 0)
-            left = max((W - crop_size) // 2, 0)
-            bottom = min(top + crop_size, H)
-            right  = min(left + crop_size, W)
-            x = x[:, :, top:bottom, left:right]
-        # (패치 학습에서는 보통 H=W=128이라 그대로 들어감)
-
-        # ---- 2) 1-level DWT 후 detail 계수 모아서 MAD ----
-        _, detail_coeffs_list = self.dwt.multi_level(x, 1)
-
-        if len(detail_coeffs_list) > 0:
-            LH, HL, HH = detail_coeffs_list[0]
-
-            all_details = torch.cat([
-                LH.flatten(1),
-                HL.flatten(1),
-                HH.flatten(1)
-            ], dim=1)
-
-            # MAD → sigma 추정
-            mad = torch.median(torch.abs(all_details), dim=1)[0]
-            sigma = mad / 0.6745
-
-            return sigma
-
-        # 만약 어떤 이유로 coeffs가 비어 있으면 fallback
-        return torch.zeros(noisy_input.size(0), device=noisy_input.device)
-    
-    def soft_threshold(self, coeffs, threshold):
-        """Soft Thresholding Operator"""
-        return torch.sign(coeffs) * torch.clamp(torch.abs(coeffs) - threshold, min=0)
-    
-    def forward(self, pred, estimated_sigma=None):
+    def forward(self, x: torch.Tensor, estimated_sigma: torch.Tensor | None = None):
         """
-        Compute wavelet sparsity loss
-        estimated_sigma: pre-computed noise level from input
+        x: [B, 1, H, W] (0~1 정규화)
+        estimated_sigma: 사용하지 않음 (adaptive=False로 운용)
         """
-        B, C, H, W = pred.shape
-        device = pred.device
-        
-        LL_final, detail_coeffs_list = self.dwt.multi_level(pred, self.levels)
-        
-        if self.adaptive and estimated_sigma is not None:
-            adaptive_threshold = torch.clamp(
-                estimated_sigma * 2.5,
-                min=self.base_threshold * 0.3,
-                max=self.base_threshold * 3.0
-            )
-            adaptive_threshold = adaptive_threshold.view(B, 1, 1, 1)
-        else:
-            adaptive_threshold = self.base_threshold
-            estimated_sigma = torch.zeros(B, device=device)
-        
-        total_loss = 0.0
-        
-        for level_idx, (LH, HL, HH) in enumerate(detail_coeffs_list, start=1):
-            level_threshold = adaptive_threshold / (2 ** (level_idx - 1))
-            
-            LH_sparse = self.soft_threshold(LH, level_threshold).detach()
-            HL_sparse = self.soft_threshold(HL, level_threshold).detach()
-            HH_sparse = self.soft_threshold(HH, level_threshold).detach()
-            
-            loss_lh = F.l1_loss(LH, LH_sparse)
-            loss_hl = F.l1_loss(HL, HL_sparse)
-            loss_hh = F.l1_loss(HH, HH_sparse)
-            
-            level_weight = 1.0 / level_idx
+        b, c, h, w = x.shape
+        assert c == 1, "Wavelet prior expects 1-channel input."
+
+        # 다중 레벨 DWT
+        total_loss = torch.tensor(0.0, device=x.device)
+        current = x
+        for level in range(1, self.levels + 1):
+            ll, (lh, hl, hh) = self.dwt(current)
+
+            # 고주파 계수에 soft-threshold
+            thr = self.base_threshold
+            lh_sparse = torch.sign(lh) * torch.relu(torch.abs(lh) - thr)
+            hl_sparse = torch.sign(hl) * torch.relu(torch.abs(hl) - thr)
+            hh_sparse = torch.sign(hh) * torch.relu(torch.abs(hh) - thr)
+
+            loss_lh = F.l1_loss(lh, lh_sparse)
+            loss_hl = F.l1_loss(hl, hl_sparse)
+            loss_hh = F.l1_loss(hh, hh_sparse)
+
+            level_weight = 1.0 / level
             total_loss = total_loss + level_weight * (loss_lh + loss_hl + loss_hh) / 3.0
-        
-        avg_sigma = estimated_sigma.mean().item() if isinstance(estimated_sigma, torch.Tensor) else 0.0
-        
+
+            current = ll  # 다음 레벨로
+
+        avg_sigma = (
+            float(estimated_sigma.mean().item()) if isinstance(estimated_sigma, torch.Tensor) else 0.0
+        )
         return total_loss, avg_sigma
 
 
-class EdgePreservationLoss(nn.Module):
-    
-    def __init__(self, edge_weight=0.1):
+# ------------------------------------------------------------
+# Supervised Loss: MSE + λ * Wavelet
+# ------------------------------------------------------------
+class SupervisedWaveletLoss(nn.Module):
+    """
+    L = L_MSE(output, target) + λ * L_wavelet(output)
+
+    - output, target: [B, 1, H, W], 0~1
+    - Wavelet prior는 output에만 적용
+    """
+
+    def __init__(
+        self,
+        wavelet_weight=0.0025,
+        wavelet_threshold=60.0,
+        wavelet_levels=3,
+        hu_window=(-160, 240),
+    ):
         super().__init__()
-        self.edge_weight = edge_weight
-        
-        # Sobel filters
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
-        
-        self.register_buffer('sobel_x', sobel_x.view(1, 1, 3, 3))
-        self.register_buffer('sobel_y', sobel_y.view(1, 1, 3, 3))
-        
-        print(f"\nEdge Preservation Loss:")
-        print(f"   Edge weight: {edge_weight}")
-        print(f"   ✅ Sobel-based edge detection")
-    
-    def get_edges(self, x):
-        """Extract edges using Sobel operator"""
-        edge_x = F.conv2d(x, self.sobel_x, padding=1)
-        edge_y = F.conv2d(x, self.sobel_y, padding=1)
-        edges = torch.sqrt(edge_x**2 + edge_y**2 + 1e-8)
-        return edges
-    
-    def forward(self, noisy_input, denoised_output):
-        input_edges = self.get_edges(noisy_input)
-        output_edges = self.get_edges(denoised_output)
-        
-        # Edge magnitude preservation
-        edge_diff = torch.abs(input_edges - output_edges)
-        
-        # Weight by edge strength (preserve strong edges more)
-        edge_weight_map = torch.clamp(input_edges / (input_edges.mean() + 1e-8), 0, 3)
-        weighted_diff = edge_diff * edge_weight_map
-        
-        return weighted_diff.mean()
-
-
-class CombinedN2NWaveletLoss(nn.Module):
-    def __init__(self,
-                 n2n_gamma=2.0,
-                 wavelet_weight=0.0025,
-                 wavelet_threshold=60,
-                 wavelet_levels=3,
-                 hu_window=(-160, 240),
-                 adaptive=True,
-                 target_noise=0.012,
-                 adaptive_weight_range=(0.8, 4.0),
-                 edge_weight=0.08):
-        super().__init__()
-
-        self.base_wavelet_weight = wavelet_weight
-        self.target_noise = target_noise
-        self.adaptive = adaptive
-        self.weight_min, self.weight_max = adaptive_weight_range
-        self.edge_weight = edge_weight
-
-        self.n2n_loss = Neighbor2NeighborLoss(gamma=n2n_gamma)
-
+        self.mse = nn.MSELoss()
+        self.wavelet_weight = wavelet_weight
         self.wavelet_loss = WaveletSparsityPrior(
             threshold=wavelet_threshold,
-            wavelet='haar',
             levels=wavelet_levels,
             hu_window=hu_window,
-            adaptive=adaptive
+            adaptive=False,  # 여기서는 adaptive 사용 안 함
         )
 
-        self.edge_loss = EdgePreservationLoss(edge_weight=edge_weight)
+        print("\n[SupervisedWaveletLoss]")
+        print(f"  wavelet_weight   : {self.wavelet_weight}")
+        print(f"  wavelet_threshold: {wavelet_threshold} HU")
+        print(f"  wavelet_levels   : {wavelet_levels}")
+        print(f"  hu_window        : {hu_window}")
+        print("  Loss = MSE + λ * Wavelet\n")
 
-        print("\n🔧 Combined Loss (Sample-wise Adaptive + Edge Preservation)")
-        print(f"   N2N gamma        : {n2n_gamma}")
-        print(f"   Base wavelet w   : {wavelet_weight}")
-        print(f"   Target noise     : {target_noise:.4f} (norm.)")
-        print(f"   Weight range     : [{self.weight_min:.2f}, {self.weight_max:.2f}]")
-        print(f"   Edge weight      : {edge_weight}")
-
-    def forward(self, model, noisy_input):
+    def forward(self, output: torch.Tensor, target: torch.Tensor):
         """
-        model: SwinIR
-        noisy_input: [B, 1, H, W]  (normalized)
+        output: [B, 1, H, W]
+        target: [B, 1, H, W]
         """
-        B = noisy_input.size(0)
+        base = self.mse(output, target)
 
-        # 1) INPUT 기준 noise estimate (샘플별 σ_i)
-        estimated_sigma = self.wavelet_loss.estimate_noise_from_input(noisy_input)  # [B]
+        wavelet = torch.tensor(0.0, device=output.device)
+        est_sigma = torch.tensor(0.0, device=output.device)
 
-        # 2) N2N loss + output
-        n2n_total, n2n_dict, output, g1 = self.n2n_loss(model, noisy_input, return_output=True)
+        if self.wavelet_weight > 0.0:
+            wavelet_raw, est_sigma = self.wavelet_loss(output, None)
+            wavelet = self.wavelet_weight * wavelet_raw
+            total = base + wavelet
+        else:
+            wavelet_raw = torch.tensor(0.0, device=output.device)
+            total = base
 
-        # 3) Wavelet sparsity (샘플별 loss, 샘플별 weight)
-        per_sample_wavelet = []
-        per_sample_weight = []
-        per_sample_ratio = []
+        # noise(HU) 추정은 모니터링용
+        if isinstance(est_sigma, torch.Tensor):
+            sigma_val = float(est_sigma)
+        else:
+            sigma_val = float(est_sigma)
+        sigma_hu = sigma_val * self.wavelet_loss.hu_range
 
-        for i in range(B):
-            # 각 샘플별 wavelet loss (σ_i에 맞는 threshold 사용)
-            w_loss_i, _ = self.wavelet_loss(
-                output[i:i+1],           # [1,1,H,W]
-                estimated_sigma[i:i+1]   # [1]
-            )
-            per_sample_wavelet.append(w_loss_i)
-
-            if self.adaptive and self.target_noise > 0:
-                ratio_i = (estimated_sigma[i] / self.target_noise).clamp(
-                    self.weight_min, self.weight_max
-                )
-                weight_i = self.base_wavelet_weight * ratio_i
-            else:
-                ratio_i = torch.tensor(1.0, device=noisy_input.device)
-                weight_i = torch.tensor(self.base_wavelet_weight, device=noisy_input.device)
-
-            per_sample_weight.append(weight_i)
-            per_sample_ratio.append(ratio_i)
-
-        per_sample_wavelet = torch.stack(per_sample_wavelet)   # [B]
-        per_sample_weight = torch.stack(per_sample_weight)     # [B]
-        per_sample_ratio = torch.stack(per_sample_ratio)       # [B]
-
-        # 🔹 HN/LN별 weight 차이를 실제 loss에 반영
-        weighted_wavelet = per_sample_weight * per_sample_wavelet   # [B]
-        wavelet = weighted_wavelet.mean()                       # scalar
-        wavelet_raw = per_sample_wavelet.mean()                     # unweighted 평균
-
-        # 4) Edge preservation loss
-        edge = self.edge_loss(g1, output)
-
-        # 5) Total loss
-        total = n2n_total + wavelet + self.edge_weight * edge
-
-        # NaN 보호
-        if torch.isnan(total):
-            total = n2n_total
-            wavelet = torch.tensor(0.0, device=noisy_input.device)
-            edge = torch.tensor(0.0, device=noisy_input.device)
-
-        # 모니터링용 통계
-        avg_sigma = float(estimated_sigma.mean().item())
-        avg_sigma_hu = avg_sigma * self.wavelet_loss.hu_range if hasattr(self.wavelet_loss, 'hu_range') else avg_sigma * 400
-        avg_weight = float(per_sample_weight.mean().item())
-        avg_ratio = float(per_sample_ratio.mean().item())
-
-        return total, {
-            'n2n_rec': n2n_dict['rec'],
-            'n2n_reg': n2n_dict['reg'],
-            'n2n_reg_weighted': n2n_dict['reg_weighted'],
-            'n2n_total': n2n_dict['total'],
-            'wavelet_raw': float(wavelet_raw.item()),
-            'wavelet_weighted': float(wavelet.item()),
-            'edge_loss': float(edge.item()),
-            'total': float(total.item()),
-            'balance_ratio': n2n_dict['total'] / (wavelet.item() + 1e-8),
-            'estimated_noise': avg_sigma,
-            'estimated_noise_hu': avg_sigma_hu,
-            'adaptive_weight': avg_weight,   
-            'noise_ratio': avg_ratio
+        loss_dict = {
+            "base": float(base.item()),
+            "wavelet_raw": float(wavelet_raw.item()),
+            "wavelet_weighted": float(wavelet.item()),
+            "total": float(total.item()),
+            "estimated_noise": sigma_val,
+            "estimated_noise_hu": sigma_hu,
         }
-
-    @torch.no_grad()
-    def compute_sample_metrics(self, noisy_input, slice_info=None):
-        """
-        Compute per-sample adaptive metrics for validation
-        """
-        B = noisy_input.size(0)
-        
-        # ✅ FIX: Large image → crop to 128x128 for noise estimation
-        estimated_sigma_list = []
-        for i in range(B):
-            single = noisy_input[i:i+1]  # [1, 1, H, W]
-            
-            # Center crop to 128x128 (training patch size)
-            _, _, h, w = single.shape
-            if h > 128 or w > 128:
-                crop_h = (h - 128) // 2
-                crop_w = (w - 128) // 2
-                cropped = single[:, :, crop_h:crop_h+128, crop_w:crop_w+128]
-            else:
-                cropped = single
-            
-            # Estimate from cropped region
-            sigma = self.wavelet_loss.estimate_noise_from_input(cropped)
-            estimated_sigma_list.append(sigma)
-        
-        estimated_sigma = torch.cat(estimated_sigma_list)  # [B]
-        
-        sample_metrics = []
-        
-        for i in range(B):
-            sigma_i = estimated_sigma[i].item()
-            sigma_hu = sigma_i * self.wavelet_loss.hu_range
-            
-            # Adaptive threshold
-            adaptive_threshold = torch.clamp(
-                estimated_sigma[i] * 2.5,
-                min=self.wavelet_loss.base_threshold * 0.3,
-                max=self.wavelet_loss.base_threshold * 3.0
-            ).item()
-            adaptive_threshold_hu = adaptive_threshold * self.wavelet_loss.hu_range
-            
-            # Adaptive weight
-            if self.adaptive and self.target_noise > 0:
-                ratio = (estimated_sigma[i] / self.target_noise).clamp(
-                    self.weight_min, self.weight_max
-                ).item()
-                adaptive_weight = self.base_wavelet_weight * ratio
-            else:
-                ratio = 1.0
-                adaptive_weight = self.base_wavelet_weight
-            
-            metrics = {
-                'estimated_noise': sigma_i,
-                'estimated_noise_hu': sigma_hu,
-                'adaptive_threshold': adaptive_threshold,
-                'adaptive_threshold_hu': adaptive_threshold_hu,
-                'adaptive_weight': adaptive_weight,
-                'noise_ratio': ratio,
-                'balance_ratio': 0.0,
-            }
-            
-            # Add slice info
-            if slice_info and i < len(slice_info):
-                metrics['label'] = slice_info[i].get('label', f'Sample {i+1}')
-                metrics['file'] = slice_info[i].get('file', 'unknown')
-                metrics['original_noise_hu'] = slice_info[i].get('noise_std_hu', 0.0)
-            else:
-                metrics['label'] = f'Sample {i+1}'
-                metrics['file'] = 'unknown'
-                metrics['original_noise_hu'] = 0.0
-            
-            sample_metrics.append(metrics)
-        
-        return sample_metrics
-
-
-# Backward compatibility
-Neighbor2NeighborLoss_v2 = Neighbor2NeighborLoss
-WaveletSparsityLoss = WaveletSparsityPrior
+        return total, loss_dict
