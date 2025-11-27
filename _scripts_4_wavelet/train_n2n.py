@@ -45,7 +45,7 @@ from utils import (
 
 
 # -------------------------------------------------------------------------
-# HN/LN 대표 슬라이스 선택 (전체 CT 중 noise 상대 극단) – 기존 함수 그대로 사용
+# HN/LN 대표 슬라이스 선택 (전체 CT 중 noise 상대 극단)
 # -------------------------------------------------------------------------
 def load_fixed_full_slices(nc_ct_dir, hu_window, seed=None):
     from scipy import ndimage
@@ -178,6 +178,7 @@ def load_fixed_full_slices(nc_ct_dir, hu_window, seed=None):
 
     return slices, slice_info
 
+
 def compute_roi_noise_hu(x_01: torch.Tensor,
                          hu_window,
                          body_hu_range=(-100, 100),
@@ -256,7 +257,7 @@ def setup_experiment(config, exp_name):
 
 
 # -------------------------------------------------------------------------
-# Main training
+# Main training (NS-N2N + NaN-safe)
 # -------------------------------------------------------------------------
 def train_n2n():
     args = parse_args()
@@ -330,7 +331,7 @@ def train_n2n():
     print(f"   Total parameters   : {total_params:,}")
     print(f"   Trainable parameters: {trainable_params:,}")
 
-    # Pretrained weights (기존과 동일)
+    # Pretrained weights
     pretrained_path = config["model"].get("pretrained_path", None)
     if pretrained_path:
         pretrained_path = Path(pretrained_path)
@@ -415,10 +416,17 @@ def train_n2n():
 
             optimizer.zero_grad(set_to_none=True)
 
+            # ---- AMP / non-AMP 공통: NaN loss batch는 스킵 ----
             if use_amp:
                 with autocast():
                     outputs = model(inputs)
                     loss, loss_dict = criterion(outputs, targets)
+
+                if not torch.isfinite(loss):
+                    print("[WARN] Non-finite loss detected in train (AMP); skip this batch.")
+                    scaler.update()
+                    continue
+
                 scaler.scale(loss).backward()
                 if config["training"]["gradient_clip"] > 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -430,6 +438,11 @@ def train_n2n():
             else:
                 outputs = model(inputs)
                 loss, loss_dict = criterion(outputs, targets)
+
+                if not torch.isfinite(loss):
+                    print("[WARN] Non-finite loss detected in train; skip this batch.")
+                    continue
+
                 loss.backward()
                 if config["training"]["gradient_clip"] > 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -459,7 +472,7 @@ def train_n2n():
                 }
             )
 
-        avg_train_loss = float(np.mean(train_losses))
+        avg_train_loss = float(np.mean(train_losses)) if len(train_losses) > 0 else float("inf")
         avg_train_details = {
             k: float(np.mean(v)) if len(v) > 0 else 0.0 for k, v in train_loss_details.items()
         }
@@ -473,6 +486,7 @@ def train_n2n():
             for inputs, targets in tqdm(val_loader, desc="Validation", leave=False):
                 inputs = inputs.to(device, non_blocking=True)
                 targets = targets.to(device, non_blocking=True)
+
                 if use_amp:
                     with autocast():
                         outputs = model(inputs)
@@ -481,12 +495,16 @@ def train_n2n():
                     outputs = model(inputs)
                     loss, loss_dict = criterion(outputs, targets)
 
+                if not torch.isfinite(loss):
+                    print("[WARN] Non-finite loss detected in validation; skip this batch.")
+                    continue
+
                 val_losses.append(loss.item())
                 for k in val_details.keys():
                     if k in loss_dict:
                         val_details[k].append(loss_dict[k])
 
-        avg_val_loss = float(np.mean(val_losses))
+        avg_val_loss = float(np.mean(val_losses)) if len(val_losses) > 0 else float("inf")
         avg_val_details = {
             k: float(np.mean(v)) if len(v) > 0 else 0.0 for k, v in val_details.items()
         }
@@ -547,12 +565,13 @@ def train_n2n():
                 metrics_list = []
 
                 for i, single_sample in enumerate(fixed_samples):
-                    # single_sample: [1,1,H,W] (noisy, 0~1 정규화 상태)
-                    single_noisy = single_sample.to(device)
+                    single_noisy = single_sample.to(device)  # [1,1,H,W]
 
                     # 2.5D 입력 스택: 중앙 슬라이스를 3번 복제 (시각화용)
                     center_2d = single_noisy[0, 0]  # [H,W]
-                    stack = torch.stack([center_2d, center_2d, center_2d], dim=0).unsqueeze(0)  # [1,3,H,W]
+                    stack = torch.stack(
+                        [center_2d, center_2d, center_2d], dim=0
+                    ).unsqueeze(0)  # [1,3,H,W]
 
                     if use_amp:
                         with autocast():
@@ -562,23 +581,22 @@ def train_n2n():
 
                     single_denoised = torch.clamp(single_denoised, 0.0, 1.0)
 
-                    # wavelet/MSE는 중앙 채널 하나만 쓰지만,
-                    # 시각화/노이즈 계산도 1채널만 사용
-                    den_1ch = single_denoised[:, 1:2, ...] if single_denoised.shape[1] > 1 else single_denoised
+                    den_1ch = (
+                        single_denoised[:, 1:2, ...]
+                        if single_denoised.shape[1] > 1
+                        else single_denoised
+                    )
 
                     denoised_list.append(den_1ch)
 
-                    # === ROI 기반 노이즈 (HU) 계산 ===
-                    #   - noisy: 학습 전 LD
-                    #   - denoised: 모델 출력
                     noisy_hu_std = compute_roi_noise_hu(single_noisy, hu_window)
                     den_hu_std = compute_roi_noise_hu(den_1ch, hu_window)
 
                     m = {
                         "label": slice_info[i].get("label", f"Sample {i+1}"),
                         "file": slice_info[i].get("file", "unknown"),
-                        "original_noise_hu": float(noisy_hu_std),   # 재계산 (slice_info 값 대신)
-                        "estimated_noise_hu": float(den_hu_std),    # 모델 적용 후 ROI 노이즈
+                        "original_noise_hu": float(noisy_hu_std),
+                        "estimated_noise_hu": float(den_hu_std),
                     }
                     metrics_list.append(m)
 
@@ -610,7 +628,7 @@ def train_n2n():
         early_stopping(avg_val_loss)
         if early_stopping.early_stop:
             print(f"\nEarly stopping at epoch {epoch}, best val loss {best_val_loss:.4f}")
-            break   
+            break
 
     writer.close()
     print("\n==================== Training Done ====================")
