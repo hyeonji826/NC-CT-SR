@@ -72,27 +72,19 @@ class NCCTDenoiseDataset(Dataset):
 
     def _calculate_weight_matrix(self, s_curr: np.ndarray, s_next: np.ndarray) -> np.ndarray:
         """
-        NS-N2N weight matrix with adaptive threshold
-        
-        저선량 CT 특성:
-        - Noise: ~40 HU
-        - Slice diff: ~20 HU
-        - Normalized (0-1): threshold ≈ 0.05 (20/400)
+        Weight matrix for matched regions
+        - Threshold: 0.02 (더 엄격하게)
         """
         from scipy.ndimage import median_filter
         
-        # Low-pass filtering (median 3x3)
-        lpf_curr = median_filter(s_curr, size=3)
-        lpf_next = median_filter(s_next, size=3)
+        # Median filter (5x5로 더 강하게)
+        lpf_curr = median_filter(s_curr, size=5)
+        lpf_next = median_filter(s_next, size=5)
         
-        # Residual
         residual = np.abs(lpf_curr - lpf_next)
         
-        # Adaptive threshold (normalized 기준)
-        # HU window 400 기준, 20 HU ≈ 0.05
-        threshold = 0.05
-        
-        # Weight matrix
+        # 엄격한 threshold
+        threshold = 0.02  # 8 HU 수준
         weight = (residual <= threshold).astype(np.float32)
         
         return weight
@@ -105,24 +97,27 @@ class NCCTDenoiseDataset(Dataset):
         s_curr = self._window_and_normalize(vol[:, :, z])
         s_next = self._window_and_normalize(vol[:, :, z + 1])
 
-        # NS-N2N: curr → next 예측, matched region에서만
-        # Input: 3D context
+        # 핵심: s_curr를 denoising하되, neighboring context 활용
+        # Input: 3채널 (context)
         stack = np.stack([s_prev, s_curr, s_next], axis=0)
         
-        # Target: next slice
-        target = s_next
+        # Target: s_curr 자체 (self-supervised)
+        target = s_curr
         
-        # Weight: curr vs next matched
-        weight = self._calculate_weight_matrix(s_curr, s_next)
+        # Weight: curr vs neighbors의 matched region
+        # 양쪽 평균으로 더 안정적
+        w1 = self._calculate_weight_matrix(s_curr, s_prev)
+        w2 = self._calculate_weight_matrix(s_curr, s_next)
+        weight = np.maximum(w1, w2)  # 둘 중 하나라도 matched면 OK
         
         # Crop
         stack = self._random_crop(stack)
         target = self._random_crop(target)
         weight = self._random_crop(weight)
 
-        input_tensor = torch.from_numpy(stack)  # [3, H, W]
-        target_tensor = torch.from_numpy(target).unsqueeze(0)  # [1, H, W]
-        weight_tensor = torch.from_numpy(weight).unsqueeze(0)  # [1, H, W]
+        input_tensor = torch.from_numpy(stack)
+        target_tensor = torch.from_numpy(target).unsqueeze(0)
+        weight_tensor = torch.from_numpy(weight).unsqueeze(0)
 
         return input_tensor, target_tensor, weight_tensor
 
