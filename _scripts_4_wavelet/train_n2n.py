@@ -466,6 +466,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
 
         with torch.no_grad():
             for batch in val_loader:
+                x_i = batch["x_i"].to(device, non_blocking=True)            
                 x_i_aug = batch["x_i_aug"].to(device, non_blocking=True)
                 x_ip1 = batch["x_ip1"].to(device, non_blocking=True)
                 x_mid = batch["x_mid"].to(device, non_blocking=True)
@@ -480,6 +481,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
                     noise_pred = model(x_i_aug)
                     val_loss, _ = criterion(
                         noise_pred=noise_pred,
+                        x_i=x_i,                    # ⭐ 추가
                         x_i_aug=x_i_aug,
                         x_ip1=x_ip1,
                         x_mid=x_mid,
