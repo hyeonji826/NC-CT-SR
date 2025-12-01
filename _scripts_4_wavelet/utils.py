@@ -108,20 +108,10 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     return epoch, loss
 
 def save_sample_images(noisy_input, denoised_output, save_path, epoch, metrics=None):
-    """
-    Save HN + LN comparison with adaptive metrics
+    """HN + LN 비교 (2열: Noisy, Denoised)"""
+    num_samples = noisy_input.shape[0]
     
-    Args:
-        noisy_input: [2, 1, H, W] - HN and LN slices
-        denoised_output: [2, 1, H, W] - denoised versions
-        save_path: output path
-        epoch: current epoch
-        metrics: list of 2 dicts with adaptive metrics
-    """
-    num_samples = noisy_input.shape[0]  # Should be 2 (HN + LN)
-    
-    # 3 columns: Noisy, Denoised, Difference
-    fig, axes = plt.subplots(num_samples, 3, figsize=(20, 6*num_samples + 2))
+    fig, axes = plt.subplots(num_samples, 2, figsize=(14, 6*num_samples + 1))
     if num_samples == 1:
         axes = axes.reshape(1, -1)
     
@@ -129,99 +119,44 @@ def save_sample_images(noisy_input, denoised_output, save_path, epoch, metrics=N
         noisy_np = noisy_input[idx, 0].cpu().numpy()
         denoised_np = denoised_output[idx, 0].detach().cpu().numpy()
         
-        # Calculate center region BEFORE rotation (original coordinates)
-        # Rectangle: wider horizontally (70%) to match abdomen shape
-        h_orig, w_orig = noisy_np.shape
-        center_ratio_w = 0.55  # Horizontal: 70%
-        center_ratio_h = 0.60  # Vertical: 50%
-        margin_h_orig = int(h_orig * (1 - center_ratio_h) / 2)
-        margin_w_orig = int(w_orig * (1 - center_ratio_w) / 2)
-        center_h_orig = h_orig - 2*margin_h_orig
-        center_w_orig = w_orig - 2*margin_w_orig
-        
-        # Rotate 90 degrees counter-clockwise for proper orientation
         noisy_np = np.rot90(noisy_np, k=1)
         denoised_np = np.rot90(denoised_np, k=1)
         
-        diff_np = noisy_np - denoised_np  # Removed noise
-        
-        # Get metrics if available
         if metrics and idx < len(metrics):
             m = metrics[idx]
             label = m.get('label', f'Sample {idx+1}')
             orig_noise = m.get('original_noise_hu', 0)
-            est_noise = m.get('estimated_noise_hu', 0)
-            adapt_thresh = m.get('adaptive_threshold_hu', 0)
-            adapt_weight = m.get('adaptive_weight', 0)
-            balance = m.get('balance_ratio', 0)
+            final_noise = m.get('estimated_noise_hu', 0)
         else:
             label = f'Sample {idx+1}'
-            # Calculate from image
             tissue_mask = (noisy_np > 0.2) & (noisy_np < 0.8)
             if tissue_mask.sum() > 100:
-                noise_std = noisy_np[tissue_mask].std()
-                orig_noise = noise_std * 400
+                orig_noise = noisy_np[tissue_mask].std() * 400
+                final_noise = denoised_np[tissue_mask].std() * 400
             else:
-                orig_noise = 0
-            est_noise = 0
-            adapt_thresh = 0
-            adapt_weight = 0
-            balance = 0
+                orig_noise = final_noise = 0
         
-        # Row title with label
         label_color = 'red' if label == 'HN' else 'blue'
         
-        # Noisy input
+        # Noisy
         axes[idx, 0].imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
-        
-        # Draw center region box (adjusted for rotation)
-        # After rot90(k=1): (x,y) -> (y, width-x-w), width/height swapped
-        h_rotated, w_rotated = noisy_np.shape
-        from matplotlib.patches import Rectangle
-        rect = Rectangle((margin_h_orig, w_rotated - (margin_w_orig + center_w_orig)), 
-                        center_h_orig, center_w_orig,
-                        linewidth=2, edgecolor='lime', facecolor='none', linestyle='--')
-        axes[idx, 0].add_patch(rect)
-        
-        title_str = f'[{label}] Noisy (ROI: 70%×50%)\nOriginal: {orig_noise:.1f} HU'
-        if est_noise > 0:
-            title_str += f'\nEstimated: {est_noise:.1f} HU'
-        axes[idx, 0].set_title(title_str, fontsize=11, fontweight='bold', color=label_color)
+        title_str = f'[{label}] Noisy\nNoise: {orig_noise:.1f} HU'
+        axes[idx, 0].set_title(title_str, fontsize=12, fontweight='bold', color=label_color)
         axes[idx, 0].axis('off')
         
-        # Denoised output
+        # Denoised
         axes[idx, 1].imshow(denoised_np, cmap='gray', vmin=0, vmax=1)
-        title_str = f'[{label}] Denoised (Epoch {epoch})'
-        if adapt_weight > 0:
-            title_str += f'\nWeight: {adapt_weight:.5f}'
-        axes[idx, 1].set_title(title_str, fontsize=11, fontweight='bold', color=label_color)
+        reduction = ((orig_noise - final_noise) / orig_noise * 100) if orig_noise > 0 else 0
+        title_str = f'[{label}] Denoised (Epoch {epoch})\nNoise: {final_noise:.1f} HU ({reduction:.1f}% ↓)'
+        axes[idx, 1].set_title(title_str, fontsize=12, fontweight='bold', color=label_color)
         axes[idx, 1].axis('off')
-        
-        # Difference map (removed noise)
-        im = axes[idx, 2].imshow(diff_np, cmap='seismic', vmin=-0.15, vmax=0.15)
-        title_str = f'[{label}] Removed Noise'
-        if adapt_thresh > 0:
-            title_str += f'\nThreshold: {adapt_thresh:.1f} HU'
-        if balance > 0:
-            title_str += f'\nBalance: {balance:.1f}'
-        axes[idx, 2].set_title(title_str, fontsize=11, fontweight='bold', color=label_color)
-        axes[idx, 2].axis('off')
-        
-        # Add colorbar for difference
-        from mpl_toolkits.axes_grid1 import make_axes_locatable
-        divider = make_axes_locatable(axes[idx, 2])
-        cax = divider.append_axes("right", size="3%", pad=0.05)
-        cbar = plt.colorbar(im, cax=cax)
-        cbar.set_label('Removed\nNoise', rotation=0, labelpad=15, fontsize=9)
     
-    # Overall title with adaptive info
-    title = f'Epoch {epoch} - Adaptive Denoising: HN vs LN Comparison'
+    title = f'Epoch {epoch} - Enhanced NS-N2N'
     if metrics and len(metrics) >= 2:
-        hn_weight = metrics[0].get('adaptive_weight', 0)
-        ln_weight = metrics[1].get('adaptive_weight', 0)
-        if hn_weight > 0 and ln_weight > 0:
-            ratio = hn_weight / ln_weight
-            title += f'\nAdaptive Weight Ratio (HN/LN): {ratio:.2f}x'
+        hn_noise = metrics[0].get('estimated_noise_hu', 0)
+        ln_noise = metrics[1].get('estimated_noise_hu', 0)
+        if hn_noise > 0 and ln_noise > 0:
+            title += f'\nFinal - HN: {hn_noise:.1f} HU | LN: {ln_noise:.1f} HU'
     
     plt.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.96])

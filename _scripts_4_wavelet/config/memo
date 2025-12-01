@@ -20,7 +20,10 @@ E:\LD-CT SR\Outputs\n2n_experiments\n2n_wavelet_20251126_140814
 # -----------------------------------------------------------------------
 
 # S1B
-CUDA_VISIBLE_DEVICES=1 python _scripts_4_wavelet/train_n2n.py --config "config/config_s1b.yaml" --exp S1_B
+CUDA_VISIBLE_DEVICES=0 python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_n2n.yaml
+
+
+
 
 # S1B Output Directory:
 E:\LD-CT SR\Outputs\n2n_experiments\n2n_wavelet_20251126_140829

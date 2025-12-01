@@ -53,9 +53,10 @@ def compute_roi_noise_hu(
     x_01: torch.Tensor,
     hu_window: Tuple[float, float],
     body_hu_range: Tuple[float, float] = (-100.0, 100.0),
-    roi_h: float = 0.7,
+    roi_h: float = 0.5,
     roi_w: float = 0.5,
 ) -> float:
+    """ROI 중앙 영역에서 노이즈 레벨 계산 (단일 이미지)"""
     hu_min, hu_max = hu_window
     arr = x_01[0, 0].detach().cpu().numpy()
     H, W = arr.shape
@@ -207,7 +208,9 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
         hu_window=hu_window,
         patch_size=patch_size,
         min_body_fraction=config["preprocessing"].get("min_body_fraction", 0.05),
-        match_threshold=config["preprocessing"].get("match_threshold", 0.01),
+        match_threshold=config["preprocessing"].get("match_threshold", 0.02),
+        noise_aug_ratio=config["preprocessing"].get("noise_aug_ratio", 0.3),
+        mode="train",
     )
 
     val_split = float(config["training"]["val_split"])
@@ -293,11 +296,14 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
     else:
         print("[INFO] No pretrained_path specified. Training SwinIR from scratch.")
 
-    # ----- Loss / Optimizer / Scheduler -----
+    # ----- Loss -----
     criterion = NSN2NLoss(
-        lambda_rc=config["training"].get("lambda_rc", 0.5),
-        lambda_ic=config["training"].get("lambda_ic", 1.0),
-    )
+        lambda_rc=config["training"]["lambda_rc"],
+        lambda_ic=config["training"]["lambda_ic"],
+        lambda_noise=config["training"]["lambda_noise"],
+        lambda_edge=config["training"]["lambda_edge"],
+        lambda_hf=config["training"]["lambda_hf"],
+    ).to(device)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -376,9 +382,8 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
         # ---------------- Train ----------------
         model.train()
         train_losses: List[float] = []
-        train_detail = {"recon": [], "rc": [], "ic": []}
+        train_detail = {"recon": [], "rc": [], "ic": [], "noise": [], "edge": [], "hf": []}
 
-        # 🔹 train W(mask) coverage 통계
         train_W_sum = 0.0
         train_W_count = 0
 
@@ -389,11 +394,12 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
 
         for batch in pbar:
             x_i = batch["x_i"].to(device, non_blocking=True)
+            x_i_aug = batch["x_i_aug"].to(device, non_blocking=True)
             x_ip1 = batch["x_ip1"].to(device, non_blocking=True)
             x_mid = batch["x_mid"].to(device, non_blocking=True)
             W = batch["W"].to(device, non_blocking=True)
+            noise_synthetic = batch["noise_synthetic"].to(device, non_blocking=True)
 
-            # 🔹 batch W coverage (train)
             batch_W_mean = float(W.mean().item())
             train_W_sum += batch_W_mean
             train_W_count += 1
@@ -401,10 +407,18 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=use_amp):
-                y_i = model(x_i)
-                y_ip1 = model(x_ip1)
-                y_mid = model(x_mid)
-                loss, loss_dict = criterion(y_i, y_ip1, y_mid, x_i, x_ip1, W)
+                # Network predicts noise map
+                noise_pred = model(x_i_aug)
+                
+                loss, loss_dict = criterion(
+                    noise_pred=noise_pred,
+                    x_i=x_i,
+                    x_i_aug=x_i_aug,
+                    x_ip1=x_ip1,
+                    x_mid=x_mid,
+                    W=W,
+                    noise_synthetic=noise_synthetic,
+                )
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -429,44 +443,49 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
 
             global_step += 1
             writer.add_scalar("Train/total_loss", loss.item(), global_step)
-            for k in ("recon", "rc", "ic"):
+            for k in ("recon", "rc", "ic", "noise", "edge", "hf"):
                 if k in loss_dict:
                     writer.add_scalar(f"Train/{k}", loss_dict[k], global_step)
 
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.6f}",
+                noise=f"{loss_dict.get('noise', 0):.4f}",
             )
 
         avg_train_loss = float(np.mean(train_losses)) if train_losses else float("inf")
         avg_train_detail = {k: (float(np.mean(v)) if v else 0.0)
                             for k, v in train_detail.items()}
         avg_train_W = train_W_sum / train_W_count if train_W_count > 0 else 0.0
+        
         # ---------------- Validation ----------------
         model.eval()
         val_losses: List[float] = []
 
-        # 🔹 validation W(mask) coverage 통계
         val_W_sum = 0.0
         val_W_count = 0
 
         with torch.no_grad():
             for batch in val_loader:
-                x_i = batch["x_i"].to(device, non_blocking=True)
+                x_i_aug = batch["x_i_aug"].to(device, non_blocking=True)
                 x_ip1 = batch["x_ip1"].to(device, non_blocking=True)
                 x_mid = batch["x_mid"].to(device, non_blocking=True)
                 W = batch["W"].to(device, non_blocking=True)
+                noise_synthetic = batch["noise_synthetic"].to(device, non_blocking=True)
 
-                # 🔹 batch W coverage (val)
                 batch_W_mean = float(W.mean().item())
                 val_W_sum += batch_W_mean
                 val_W_count += 1
 
                 with autocast(enabled=use_amp):
-                    y_i = model(x_i)
-                    y_ip1 = model(x_ip1)
-                    y_mid = model(x_mid)
-                    val_loss, _ = criterion(y_i, y_ip1, y_mid, x_i, x_ip1, W)
+                    noise_pred = model(x_i_aug)
+                    val_loss, _ = criterion(
+                        noise_pred=noise_pred,
+                        x_i_aug=x_i_aug,
+                        x_ip1=x_ip1,
+                        x_mid=x_mid,
+                        W=W,
+                        noise_synthetic=noise_synthetic,
+                    )
 
                 val_losses.append(float(val_loss.item()))
 
@@ -489,9 +508,12 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
         print(f"  Recon    : {avg_train_detail['recon']:.4f}")
         print(f"  RC       : {avg_train_detail['rc']:.4f}")
         print(f"  IC       : {avg_train_detail['ic']:.4f}")
+        print(f"  Noise    : {avg_train_detail['noise']:.4f}")
+        print(f"  Edge     : {avg_train_detail['edge']:.4f}")
+        print(f"  HF       : {avg_train_detail['hf']:.4f}")
         print(f"Val loss   : {avg_val_loss:.4f}")
-        print(f"train W    : {avg_train_W:.4f}")
-        print(f"val   W    : {avg_val_W:.4f}")
+        print(f"Train W    : {avg_train_W:.4f}")
+        print(f"Val W      : {avg_val_W:.4f}")
         print(f"LR         : {optimizer.param_groups[0]['lr']:.6f}")
         print(f"{'='*60}\n")
 
@@ -509,6 +531,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
             cleanup_old_checkpoints(
                 ckpt_dir, keep_last_n=config["training"]["keep_last_n"]
             )
+            
         # ---------------- 샘플 PNG (고정 HN/LN) ----------------
         if sample_slices is not None and \
            epoch % config["training"]["sample_interval"] == 0:
@@ -519,13 +542,14 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
             for info in sample_slices:
                 noisy = load_fixed_full_slice(info["file"], info["z"], hu_window).to(device)
                 with torch.no_grad():
-                    den = model(noisy)
+                    noise_pred = model(noisy)
+                    denoised = noisy - noise_pred
 
                 fixed_samples.append(noisy.cpu())
-                denoised_list.append(den.cpu())
+                denoised_list.append(denoised.cpu())
 
                 noisy_hu_std = compute_roi_noise_hu(noisy.cpu(), hu_window)
-                den_hu_std = compute_roi_noise_hu(den.cpu(), hu_window)
+                den_hu_std = compute_roi_noise_hu(denoised.cpu(), hu_window)
                 metrics_list.append(
                     {
                         "label": info["label"],
@@ -539,9 +563,8 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
             denoised_batch = torch.cat(denoised_list, dim=0)
             png_path = sample_dir / f"epoch_{epoch:03d}.png"
             save_sample_images(noisy_batch, denoised_batch, png_path, epoch, metrics=metrics_list)
-            print(f"Saved sample PNG: {png_path}")
+            print(f"Saved sample: {png_path.name}")
 
-            # 🔹 HN/LN ROI noise(HU) TensorBoard 로그
             if metrics_list:
                 for m in metrics_list:
                     lbl = m.get("label", "unknown")
