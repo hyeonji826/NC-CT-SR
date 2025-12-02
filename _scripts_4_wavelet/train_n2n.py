@@ -1,5 +1,5 @@
 # E:\LD-CT SR\_scripts_4_wavelet\train_n2n.py
-# NS-N2N training (SwinIR backbone, denoising, no GAN/wavelet/edge)
+# NS-N2N training with 3D UNet + Transformer hybrid
 from __future__ import annotations
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -17,14 +17,8 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-ROOT = Path(__file__).resolve().parent.parent      # D:\LD-CT SR
-SWINIR_ROOT = ROOT / "_externals" / "SwinIR"      # D:\LD-CT SR\_externals\SwinIR
-
-# SwinIR를 python path에 추가
-sys.path.insert(0, str(SWINIR_ROOT))
-print(f"[INFO] SWINIR_ROOT added to sys.path: {SWINIR_ROOT}")
-
-from models.network_swinir import SwinIR
+# Import 3D UNet + Transformer model
+from model_3d_unet_trans import UNet3DTransformer
 from losses_n2n import HighQualityNSN2NLoss
 from utils import (
     EarlyStopping,
@@ -113,6 +107,7 @@ def compute_roi_noise_hu(
 def select_hn_ln_slices(
     nc_ct_dir: str,
     hu_window: Tuple[float, float],
+    config: dict,
     max_files: int = 50,
     seed: int | None = 0,
 ) -> List[dict]:
@@ -194,14 +189,27 @@ def select_hn_ln_slices(
 
 
 def load_fixed_full_slice(path: str, z: int, hu_window: Tuple[float, float]) -> torch.Tensor:
+    """Load 5 consecutive slices as 3D volume for 3D UNet"""
     nii = nib.load(str(path))
     vol = nii.get_fdata().astype(np.float32)
     vol = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
 
-    s = vol[:, :, z]
-    s = np.clip(s, hu_window[0], hu_window[1])
-    s01 = (s - hu_window[0]) / (hu_window[1] - hu_window[0] + 1e-8)
-    t = torch.from_numpy(s01[None, None, ...]).float()
+    D = vol.shape[2]
+    
+    # Get 5 adjacent slices (±2 from center)
+    slices = []
+    for offset in [-2, -1, 0, 1, 2]:
+        z_idx = np.clip(z + offset, 0, D - 1)
+        slices.append(vol[:, :, z_idx])
+    
+    # Window and normalize
+    def window_norm(s):
+        s = np.clip(s, hu_window[0], hu_window[1])
+        s01 = (s - hu_window[0]) / (hu_window[1] - hu_window[0] + 1e-8)
+        return s01.astype(np.float32)
+    
+    x_5slices = np.stack([window_norm(s) for s in slices], axis=0)  # (5, H, W)
+    t = torch.from_numpy(x_5slices).unsqueeze(0).unsqueeze(0).float()  # (1, 1, 5, H, W)
     return t
 
 
@@ -233,7 +241,7 @@ def prepare_experiment(config: dict, exp_name: str) -> tuple[Path, Path, Path, S
 
 def train_n2n(config_path: str = "config_n2n.yaml") -> None:
     config = load_config(config_path)
-    seed = int(config.get("seed", 42))
+    seed = int(config["training"].get("seed", 42))
     set_seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -242,24 +250,24 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
     print("[INFO] Initializing dataset...")
 
     # ----- Load config values -----
-    hu_window = tuple(cfg.preprocessing.hu_window)
-    patch_size = int(cfg.preprocessing.patch_size)
-    min_body_fraction = float(cfg.preprocessing.min_body_fraction)
-    match_threshold = float(cfg.preprocessing.match_threshold)
+    hu_window = tuple(config["preprocessing"]["hu_window"])
+    patch_size = int(config["preprocessing"]["patch_size"])
+    min_body_fraction = float(config["preprocessing"]["min_body_fraction"])
+    match_threshold = float(config["preprocessing"]["match_threshold"])
 
     # dataset.* 섹션
-    lpf_sigma = float(cfg.dataset.lpf_sigma)
-    lpf_median_size = int(cfg.dataset.lpf_median_size)
-    noise_aug_ratio = float(cfg.dataset.noise_aug_ratio)
+    lpf_sigma = float(config["dataset"]["lpf_sigma"])
+    lpf_median_size = int(config["dataset"]["lpf_median_size"])
+    noise_aug_ratio = float(config["dataset"]["noise_aug_ratio"])
 
-    body_hu_range = tuple(cfg.dataset.body_hu_range)
-    noise_roi_margin_ratio = float(cfg.dataset.noise_roi_margin_ratio)
-    noise_tissue_range = tuple(cfg.dataset.noise_tissue_range)
-    noise_default_std = float(cfg.dataset.noise_default_std)
+    body_hu_range = tuple(config["dataset"]["body_hu_range"])
+    noise_roi_margin_ratio = float(config["dataset"]["noise_roi_margin_ratio"])
+    noise_tissue_range = tuple(config["dataset"]["noise_tissue_range"])
+    noise_default_std = float(config["dataset"]["noise_default_std"])
 
     # ----- Train dataset (full) -----
     full_dataset = NSN2NDataset(
-        nc_ct_dir=cfg.data.nc_ct_dir,
+        nc_ct_dir=config["data"]["nc_ct_dir"],
         hu_window=hu_window,
         patch_size=patch_size,
         min_body_fraction=min_body_fraction,
@@ -275,8 +283,8 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
     )
 
     # ----- Train / Val / Test split -----
-    val_split = float(cfg.training.val_split)
-    test_split = float(cfg.training.get("test_split", 0.1))  # optional
+    val_split = float(config["training"]["val_split"])
+    test_split = float(config["training"].get("test_split", 0.1))  # optional
 
     val_size = int(len(full_dataset) * val_split)
     test_size = int(len(full_dataset) * test_split)
@@ -291,7 +299,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
     # ----- But validation mode must not apply training augmentation -----
     # Create a proper validation dataset WITHOUT noise aug.
     val_dataset = NSN2NDataset(
-        nc_ct_dir=cfg.data.nc_ct_dir,
+        nc_ct_dir=config["data"]["nc_ct_dir"],
         hu_window=hu_window,
         patch_size=patch_size,
         min_body_fraction=min_body_fraction,
@@ -308,7 +316,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
 
     # test dataset도 동일 방식
     test_dataset = NSN2NDataset(
-        nc_ct_dir=cfg.data.nc_ct_dir,
+        nc_ct_dir=config["data"]["nc_ct_dir"],
         hu_window=hu_window,
         patch_size=patch_size,
         min_body_fraction=min_body_fraction,
@@ -328,9 +336,9 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
     def make_loader(ds, shuffle: bool):
         return DataLoader(
             ds,
-            batch_size=int(cfg.training.batch_size),
+            batch_size=int(config["training"]["batch_size"]),
             shuffle=shuffle,
-            num_workers=int(cfg.training.num_workers),
+            num_workers=int(config["training"]["num_workers"]),
             pin_memory=True,
             drop_last=shuffle,
         )
@@ -341,72 +349,32 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
 
     print(f"[INFO] Dataset loaded: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
 
-    # ----- Model (1채널 입력) -----
-    config["model"]["in_chans"] = 1
-
-    model = SwinIR(
-        upscale=config["model"]["upscale"],
-        in_chans=config["model"]["in_chans"],
-        img_size=config["model"]["img_size"],
-        window_size=config["model"]["window_size"],
-        img_range=config["model"]["img_range"],
-        depths=config["model"]["depths"],
-        embed_dim=config["model"]["embed_dim"],
+    # ----- 3D UNet + Transformer Model -----
+    print("[INFO] Initializing 3D UNet + Transformer model...")
+    
+    model = UNet3DTransformer(
+        in_channels=1,
+        base_channels=config["model"]["base_channels"],
         num_heads=config["model"]["num_heads"],
-        mlp_ratio=config["model"]["mlp_ratio"],
-        upsampler=config["model"]["upsampler"],
-        resi_connection=config["model"]["resi_connection"],
     ).to(device)
+    
+    num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[INFO] Model parameters: {num_params:,}")
+    print(f"[INFO] Input: (B, 1, 5, H, W) → Output: (B, 1, 1, H, W)")
+    print(f"[INFO] 3D convolution + 3D attention for superior z-axis context")
 
-    pretrained_path = config["model"].get("pretrained_path", "")
-    if pretrained_path:
-        print(f"[INFO] Loading SwinIR pretrained weights from: {pretrained_path}")
-        ckpt = torch.load(pretrained_path, map_location="cpu")
-
-        # SwinIR/KAIR 계열 weight 포맷 대응
-        if isinstance(ckpt, dict):
-            if "params_ema" in ckpt:
-                state_dict = ckpt["params_ema"]
-                print("[INFO] Using 'params_ema' from checkpoint")
-            elif "params" in ckpt:
-                state_dict = ckpt["params"]
-                print("[INFO] Using 'params' from checkpoint")
-            elif "state_dict" in ckpt:
-                state_dict = ckpt["state_dict"]
-                print("[INFO] Using 'state_dict' from checkpoint")
-            else:
-                state_dict = ckpt
-                print("[WARN] Checkpoint dict has no params_ema/params/state_dict, using as-is")
-        else:
-            state_dict = ckpt
-            print("[WARN] Checkpoint is not a dict, using as-is")
-
-        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-        print(
-            f"[INFO] Loaded pretrained weights. "
-            f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}"
-        )
-        if missing_keys:
-            print("  e.g. missing:", missing_keys[:5])
-        if unexpected_keys:
-            print("  e.g. unexpected:", unexpected_keys[:5])
-
-        # sanity check: 첫 conv weight norm 찍기
-        first_key = next(iter(model.state_dict().keys()))
-        w = model.state_dict()[first_key]
-        print(f"[DEBUG] First param '{first_key}' norm after loading: {w.norm().item():.4f}")
-    else:
-        print("[INFO] No pretrained_path specified. Training SwinIR from scratch.")
 
     # ----- Loss -----
     criterion = HighQualityNSN2NLoss(
-        lambda_rc=cfg.loss.lambda_rc,
-        lambda_ic=cfg.loss.lambda_ic,       # = artifact loss 가중치
-        lambda_noise=cfg.loss.lambda_noise, # ← noise-level loss 가중치
-        lambda_edge=cfg.loss.lambda_edge,
-        lambda_hf=cfg.loss.lambda_hf,
-        target_noise_ratio=0.6,             # 몸통 노이즈를 input 대비 60%로
-        artifact_grad_factor=2.0,
+        lambda_rc=config["loss"]["lambda_rc"],
+        lambda_ic=config["loss"]["lambda_ic"],
+        lambda_noise=config["loss"]["lambda_noise"],
+        lambda_edge=config["loss"]["lambda_edge"],
+        lambda_hf=config["loss"]["lambda_hf"],
+        target_noise_ratio=config["loss"]["target_noise_ratio"],
+        min_body_pixels=config["loss"]["min_body_pixels"],
+        artifact_grad_factor=config["loss"]["artifact_grad_factor"],
+        flat_threshold=config["loss"]["flat_threshold"],
     )
 
 
@@ -476,6 +444,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
         sample_slices = select_hn_ln_slices(
             nc_ct_dir=config["data"]["nc_ct_dir"],
             hu_window=hu_window,
+            config=config,
             max_files=config["validation"].get("sample_scan_files", 50),
             seed=seed,
         )
@@ -487,7 +456,8 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
         # ---------------- Train ----------------
         model.train()
         train_losses: List[float] = []
-        train_detail = {"recon": [], "rc": [], "ic": [], "noise": [], "edge": [], "hf": []}
+        train_detail = {"flat": [], "rc": [], "ic": [], "noise": [], "edge": [], "hf": [], 
+                        "flat_ratio": [], "edge_ratio": []}
 
         train_W_sum = 0.0
         train_W_count = 0
@@ -512,11 +482,14 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=use_amp):
-                # Network predicts noise map
-                noise_pred = model(x_i_aug)
+                # 3D UNet forward: (B, 1, 5, H, W) → (B, 1, 1, H, W)
+                output = model(x_i_aug)
+                
+                # Squeeze depth dimension: (B, 1, 1, H, W) → (B, 1, H, W)
+                noise_pred = output.squeeze(2)
                             
                 loss, loss_dict = criterion(
-                    noise_pred=noise_pred,        # 이름은 noise_pred지만, 이제는 y_i(denoised)
+                    noise_pred=noise_pred,
                     x_i=x_i,
                     x_i_aug=x_i_aug,
                     x_ip1=x_ip1,
@@ -549,7 +522,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
 
             global_step += 1
             writer.add_scalar("Train/total_loss", loss.item(), global_step)
-            for k in ("recon", "rc", "ic", "noise", "edge", "hf"):
+            for k in ("flat", "rc", "ic", "noise", "edge", "hf", "flat_ratio", "edge_ratio"):
                 if k in loss_dict:
                     writer.add_scalar(f"Train/{k}", loss_dict[k], global_step)
 
@@ -584,7 +557,10 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
                 val_W_count += 1
 
                 with autocast(enabled=use_amp):
-                    denoised_pred = model(x_i_aug)
+                    # 3D UNet forward
+                    output = model(x_i_aug)
+                    denoised_pred = output.squeeze(2)  # (B, 1, 1, H, W) → (B, 1, H, W)
+                    
                     val_loss, _ = criterion(
                         noise_pred=denoised_pred,
                         x_i=x_i,
@@ -614,11 +590,11 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}")
         print(f"Train loss : {avg_train_loss:.4f}")
-        print(f"  Recon    : {avg_train_detail['recon']:.4f}")
+        print(f"  Flat     : {avg_train_detail['flat']:.4f} (flat_ratio: {avg_train_detail.get('flat_ratio', 0):.3f})")
         print(f"  RC       : {avg_train_detail['rc']:.4f}")
         print(f"  IC       : {avg_train_detail['ic']:.4f}")
         print(f"  Noise    : {avg_train_detail['noise']:.4f}")
-        print(f"  Edge     : {avg_train_detail['edge']:.4f}")
+        print(f"  Edge     : {avg_train_detail['edge']:.4f} (edge_ratio: {avg_train_detail.get('edge_ratio', 0):.3f})")
         print(f"  HF       : {avg_train_detail['hf']:.4f}")
         print(f"Val loss   : {avg_val_loss:.4f}")
         print(f"Train W    : {avg_train_W:.4f}")
@@ -649,16 +625,19 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
             metrics_list: List[dict] = []
 
             for info in sample_slices:
-                noisy = load_fixed_full_slice(info["file"], info["z"], hu_window).to(device)
+                noisy_5slice = load_fixed_full_slice(info["file"], info["z"], hu_window).to(device)
                 with torch.no_grad():
-                    denoised = model(noisy)    # 바로 denoised
-
-
-                fixed_samples.append(noisy.cpu())
+                    denoised = model(noisy_5slice)  # (1, 1, 1, H, W)
+                    denoised = denoised.squeeze(2)  # (1, 1, H, W)
+                
+                # Extract center slice from input for visualization
+                noisy_center = noisy_5slice[:, :, 2, :, :]  # (1, 1, H, W) - center of 5 slices
+                
+                fixed_samples.append(noisy_center.cpu())
                 denoised_list.append(denoised.cpu())
 
                 noisy_hu_std = compute_roi_noise_hu(
-                    noisy.cpu(), hu_window,
+                    noisy_center.cpu(), hu_window,
                     body_hu_range=tuple(config["noise_analysis"]["body_hu_range_roi"]),
                     roi_h=config["noise_analysis"]["roi_h"],
                     roi_w=config["noise_analysis"]["roi_w"]

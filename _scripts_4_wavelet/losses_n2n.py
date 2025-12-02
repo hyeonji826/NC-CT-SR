@@ -16,18 +16,19 @@ class HighQualityNSN2NLoss(nn.Module):
     Model output interpretation: y_i = F(x_i_aug) where y_i is the denoised/enhanced image
     
     Loss Components:
-      1. L_recon : NS-N2N reconstruction - y_i ≈ x_{i+1} (neighbor consistency in matched regions W)
+      1. L_flat  : Aggressive denoising in flat regions - (y_i ≈ x_{i+1}) * W * M_flat
       2. L_rc    : Self-consistency - y_i ≈ x_i (content preservation in matched regions)
-      3. L_edge  : Edge structure preservation - gradient similarity in NON-ARTIFACT regions only
+      3. L_edge  : Edge structure preservation - gradient similarity in NON-ARTIFACT regions
       4. L_hf    : High-frequency regularization - prevents over-sharpening and residual noise
       5. L_noise : Noise level control - body region std(y_i) ≈ target_ratio * std(x_i)
       6. L_art   : Artifact suppression - selective smoothing of gradient outlier regions
     
-    Key Design Decision:
-      - L_art identifies artifact candidates (gradient outliers: mean + k*std threshold)
-      - L_edge applies ONLY to non-artifact regions (1 - A)
-      - This prevents conflict: edge preservation vs artifact removal on same pixels
-      - Normal tissue/bone boundaries preserved, streak artifacts removed
+    Key Design Decision (FLAT vs EDGE separation):
+      - M_flat: Low gradient regions (< threshold) → aggressive noise removal
+      - M_edge: High gradient regions (≥ threshold) → structure preservation priority
+      - This addresses the core NS-N2N assumption violation: adjacent slices differ at edges
+      - Flat regions: noise only (same structure) → strong denoising
+      - Edge regions: structure change + noise → conservative, preserve boundaries
     
     All parameters are configurable via config.yaml
     """
@@ -42,6 +43,7 @@ class HighQualityNSN2NLoss(nn.Module):
         target_noise_ratio: float = 0.6,
         min_body_pixels: int = 512,
         artifact_grad_factor: float = 2.0,
+        flat_threshold: float = 0.05,
     ) -> None:
         super().__init__()
         self.lambda_rc = float(lambda_rc)
@@ -53,6 +55,7 @@ class HighQualityNSN2NLoss(nn.Module):
         self.target_noise_ratio = float(target_noise_ratio)
         self.min_body_pixels = int(min_body_pixels)
         self.artifact_grad_factor = float(artifact_grad_factor)
+        self.flat_threshold = float(flat_threshold)
 
     def sobel_gradient(self, x: torch.Tensor) -> torch.Tensor:
         """Compute Sobel gradient magnitude for edge detection"""
@@ -92,7 +95,7 @@ class HighQualityNSN2NLoss(nn.Module):
         noise_synthetic: torch.Tensor,
     ):
         """
-        Forward pass computing all loss components
+        Forward pass with FLAT vs EDGE separation
         
         Args:
             noise_pred: Model output (denoised image y_i)
@@ -110,9 +113,15 @@ class HighQualityNSN2NLoss(nn.Module):
         W = W.detach()
         y_i = noise_pred
 
-        # 1) NS-N2N reconstruction: y_i ≈ x_{i+1} in matched regions
-        diff_recon = (y_i - x_ip1) * W
-        l_recon = diff_recon.pow(2).mean()
+        # Compute gradient magnitude for flat/edge separation
+        grad_x = self.sobel_gradient(x_i)
+        M_flat = (grad_x < self.flat_threshold).float()
+        M_edge = (grad_x >= self.flat_threshold).float()
+
+        # 1) L_flat: Aggressive denoising in flat regions (NS-N2N principle)
+        # Flat regions have minimal structure change between slices → noise dominates
+        diff_flat = (y_i - x_ip1) * W * M_flat
+        l_flat = diff_flat.pow(2).mean()
 
         # 2) Self-consistency: y_i ≈ x_i for content preservation
         diff_rc = (y_i - x_i) * W
@@ -135,12 +144,13 @@ class HighQualityNSN2NLoss(nn.Module):
             lp_x = self.low_pass(x_i)
             l_art = ((y_i - lp_x).abs() * A).mean()
         else:
-            l_art = torch.zeros_like(l_recon)
+            l_art = torch.zeros_like(l_flat)
 
-        # 3) Edge preservation (only in non-artifact regions to avoid conflict)
+        # 3) Edge preservation (only in non-artifact AND edge regions)
+        # Edge regions: structure preservation is priority, noise removal is secondary
         grad_y = self.sobel_gradient(y_i)
-        grad_x = self.sobel_gradient(x_i)
-        l_edge = F.mse_loss(grad_y * non_artifact, grad_x * non_artifact)
+        edge_protection_mask = non_artifact * M_edge
+        l_edge = F.mse_loss(grad_y * edge_protection_mask, grad_x * edge_protection_mask)
 
         # 4) High-frequency regularization
         hf = self.high_freq(y_i)
@@ -162,11 +172,11 @@ class HighQualityNSN2NLoss(nn.Module):
             target = self.target_noise_ratio * sigma_in.detach()
             l_noise = (sigma_out - target).pow(2)
         else:
-            l_noise = torch.zeros_like(l_recon)
+            l_noise = torch.zeros_like(l_flat)
 
-        # Total loss
+        # Total loss (L_recon replaced by L_flat)
         total = (
-            l_recon +
+            l_flat +
             self.lambda_rc * l_rc +
             self.lambda_edge * l_edge +
             self.lambda_hf * l_hf +
@@ -175,12 +185,14 @@ class HighQualityNSN2NLoss(nn.Module):
         )
 
         log = {
-            "recon": float(l_recon.item()),
+            "flat": float(l_flat.item()),
             "rc": float(l_rc.item()),
             "ic": float(l_art.item()),
             "noise": float(l_noise.item()),
             "edge": float(l_edge.item()),
             "hf": float(l_hf.item()),
             "total": float(total.item()),
+            "flat_ratio": float(M_flat.mean().item()),
+            "edge_ratio": float(M_edge.mean().item()),
         }
         return total, log

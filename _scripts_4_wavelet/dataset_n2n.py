@@ -82,7 +82,7 @@ class NSN2NDataset(Dataset):
             if vol.ndim != 3:
                 raise ValueError(f"Expected 3D volume, got shape {vol.shape}")
 
-            H, W, D = vol.shape
+            H, W_img, D = vol.shape
             self.volumes.append(vol)
 
             for z in range(0, D - 1):
@@ -91,7 +91,7 @@ class NSN2NDataset(Dataset):
 
                 body_mask0 = (s0 > self.body_hu_min) & (s0 < self.body_hu_max)
                 body_mask1 = (s1 > self.body_hu_min) & (s1 < self.body_hu_max)
-                body_frac = float(body_mask0.sum() + body_mask1.sum()) / (2.0 * H * W)
+                body_frac = float(body_mask0.sum() + body_mask1.sum()) / (2.0 * H * W_img)
                 if body_frac < self.min_body_fraction:
                     continue
 
@@ -116,12 +116,12 @@ class NSN2NDataset(Dataset):
         if not self.patch_size:
             return arrays
 
-        H, W = arrays[0].shape
-        if H <= self.patch_size or W <= self.patch_size:
+        H, W_img = arrays[0].shape
+        if H <= self.patch_size or W_img <= self.patch_size:
             return arrays
 
         top = random.randint(0, H - self.patch_size)
-        left = random.randint(0, W - self.patch_size)
+        left = random.randint(0, W_img - self.patch_size)
         slc = (slice(top, top + self.patch_size),
                slice(left, left + self.patch_size))
         return tuple(arr[slc] for arr in arrays)
@@ -178,11 +178,11 @@ class NSN2NDataset(Dataset):
         Uses central ROI to avoid edge artifacts
         Tissue range ensures measurement from soft tissue, not air or bone
         """
-        H, W = x.shape
+        H, W_img = x.shape
         m = self.noise_roi_margin_ratio
         h_margin = int(H * m)
-        w_margin = int(W * m)
-        roi = x[h_margin:H - h_margin, w_margin:W - w_margin]
+        w_margin = int(W_img * m)
+        roi = x[h_margin:H - h_margin, w_margin:W_img - w_margin]
 
         t_min, t_max = self.noise_tissue_min, self.noise_tissue_max
         tissue_mask = (roi > t_min) & (roi < t_max)
@@ -209,52 +209,84 @@ class NSN2NDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """
-        Return matched slice pair with synthetic noise augmentation
+        Return 5 consecutive slices as true 3D volume for 3D UNet + Transformer
         
-        Returns dict with:
-            x_i: Original noisy slice i
-            x_i_aug: Slice i with additional synthetic noise (training only)
-            x_ip1: Adjacent noisy slice i+1
-            x_mid: Average of x_i and x_ip1 (compatibility)
-            W: Matched region weight map
-            noise_synthetic: Added noise map (for analysis)
+        Input format: (1, 5, H, W) where 5 = z-2, z-1, z, z+1, z+2
+        Output: Denoised center slice (z)
+        
+        This TRUE 3D approach (not just channel stacking) enables:
+            - 3D convolutions capture inter-slice structure
+            - 3D attention models z-axis dependency  
+            - Superior noise/structure separation vs 2D or 2.5D methods
         """
         vol_idx, z = self.pairs[idx]
         vol = self.volumes[vol_idx]
+        D = vol.shape[2]
 
-        s0 = vol[:, :, z]
-        s1 = vol[:, :, z + 1]
+        # Get 5 adjacent slices (±2 from center)
+        slices = []
+        for offset in [-2, -1, 0, 1, 2]:
+            z_idx = np.clip(z + offset, 0, D - 1)
+            slices.append(vol[:, :, z_idx])
+        
+        # For paired slice (NS-N2N target) - keep at z+1
+        s_pair = vol[:, :, min(z + 1, D - 1)]
 
-        x_i = self._window_and_normalize(s0)
-        x_ip1 = self._window_and_normalize(s1)
-        x_mid = 0.5 * (x_i + x_ip1)
+        # Window and normalize all slices using existing method
+        x_5slices = np.stack([self._window_and_normalize(s) for s in slices], axis=0)  # (5, H, W)
+        x_center = x_5slices[2]  # Center slice for loss calculation
+        x_pair = self._window_and_normalize(s_pair)
+        x_mid = 0.5 * (x_center + x_pair)
 
-        W = self._compute_weight_map(x_i, x_ip1)
+        # Weight map: compare center slice with pair
+        W = self._compute_weight_map(x_center, x_pair)
 
+        # Noise augmentation (apply to center slice only in 3D volume)
         if self.mode == "train":
-            noise_std = self._estimate_noise_std(x_i)
+            noise_std = self._estimate_noise_std(x_center)
             aug_sigma = noise_std * self.noise_aug_ratio
-            noise_synthetic = self._generate_rician_noise(x_i.shape, aug_sigma)
-            x_i_aug = np.clip(x_i + noise_synthetic, 0.0, 1.0)
+            noise_synthetic = self._generate_rician_noise(x_center.shape, aug_sigma)
+            x_center_aug = np.clip(x_center + noise_synthetic, 0.0, 1.0)
+            
+            # Replace center in 5-slice volume
+            x_5slices_aug = x_5slices.copy()
+            x_5slices_aug[2] = x_center_aug
         else:
-            noise_synthetic = np.zeros_like(x_i)
-            x_i_aug = x_i
+            noise_synthetic = np.zeros_like(x_center)
+            x_5slices_aug = x_5slices.copy()
 
-        x_i, x_i_aug, x_ip1, x_mid, W, noise_synthetic = self._random_crop(
-            x_i, x_i_aug, x_ip1, x_mid, W, noise_synthetic
-        )
+        # Random crop (all slices together + 2D arrays)
+        # Crop 3D volume
+        if self.patch_size > 0:
+            H, W_img = x_5slices.shape[1], x_5slices.shape[2]
+            if H > self.patch_size and W_img > self.patch_size:
+                h = np.random.randint(0, H - self.patch_size + 1)
+                w = np.random.randint(0, W_img - self.patch_size + 1)
+                
+                x_5slices = x_5slices[:, h:h+self.patch_size, w:w+self.patch_size]
+                x_5slices_aug = x_5slices_aug[:, h:h+self.patch_size, w:w+self.patch_size]
+                x_center = x_center[h:h+self.patch_size, w:w+self.patch_size]
+                x_pair = x_pair[h:h+self.patch_size, w:w+self.patch_size]
+                x_mid = x_mid[h:h+self.patch_size, w:w+self.patch_size]
+                W = W[h:h+self.patch_size, w:w+self.patch_size]
+                noise_synthetic = noise_synthetic[h:h+self.patch_size, w:w+self.patch_size]
 
-        x_i_t = torch.from_numpy(x_i).unsqueeze(0)
-        x_i_aug_t = torch.from_numpy(x_i_aug).unsqueeze(0)
-        x_ip1_t = torch.from_numpy(x_ip1).unsqueeze(0)
+        # Convert to torch tensors
+        # Input: (1, 5, H, W) for 3D UNet
+        x_5slices_t = torch.from_numpy(x_5slices).unsqueeze(0).float()  # (1, 5, H, W)
+        x_5slices_aug_t = torch.from_numpy(x_5slices_aug).unsqueeze(0).float()  # (1, 5, H, W)
+        
+        # Loss calculation tensors (2D)
+        x_center_t = torch.from_numpy(x_center).unsqueeze(0)  # (1, H, W)
+        x_pair_t = torch.from_numpy(x_pair).unsqueeze(0)
         x_mid_t = torch.from_numpy(x_mid).unsqueeze(0)
         W_t = torch.from_numpy(W).unsqueeze(0)
         noise_syn_t = torch.from_numpy(noise_synthetic).unsqueeze(0)
 
         return {
-            "x_i": x_i_t,
-            "x_i_aug": x_i_aug_t,
-            "x_ip1": x_ip1_t,
+            "x_i": x_center_t,          # Center slice (1, H, W) for loss
+            "x_i_aug": x_5slices_aug_t, # 5-slice volume (1, 5, H, W) → model input
+            "x_ip1": x_pair_t,          # Paired slice for NS-N2N
             "x_mid": x_mid_t,
             "W": W_t,
             "noise_synthetic": noise_syn_t,
