@@ -1,80 +1,23 @@
-# ----------------------------------------------------------------------------------------
-# S1 : wavelet enhanced N2N 튜닝 기록 (pretrained model from 기존 original best.pth 사용)
-# ----------------------------------------------------------------------------------------
-
-# S1A
-CUDA_VISIBLE_DEVICES=0 python _scripts_4_wavelet/train_n2n.py --config "config/config_s1a.yaml" --exp S1_A
-
-# S1A Output Directory:
-E:\LD-CT SR\Outputs\n2n_experiments\n2n_wavelet_20251126_140814
-
-  # S1A 튜닝 포인트 (Agressive)
-  wavelet_weight: 0.025
-  wavelet_threshold: 40
-  wavelet_levels: 3
-  edge_weight: 0.10
-  adaptive_weight_range: [1.0, 5.0]
-  target_noise: 0.012
-
-
-# -----------------------------------------------------------------------
-
-# S1B
 CUDA_VISIBLE_DEVICES=0 python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_n2n.yaml
 
+python _scripts_4_wavelet/analyze_tensorboard.py
 
+# 참고
+https://github.com/amir-aghdam/3D-UNet?tab=readme-ov-file
 
+training:
+  exp_name: "unet3d_transformer_finetune1"
+  num_epochs: 80          # 새 세션 길이
+  learning_rate: 0.0001   # 한 단계 낮춘 LR
+  lr_step_size: 30
+  lr_gamma: 0.5
+  warmup_epochs: 0
+  resume: "E:/LD-CT SR/Outputs/ns_n2n_experiments/unet3d_transformer_baseline/ckpts/best_model.pth"
 
-# S1B Output Directory:
-E:\LD-CT SR\Outputs\n2n_experiments\n2n_wavelet_20251126_140829
-
-  # S1B 튜닝 포인트 (Conversation)
-  wavelet_weight: 0.020          # S1A=0.025 → S1B=0.020 (전체 세기 ↓)
-  wavelet_threshold: 40
-  wavelet_levels: 3
-  edge_weight: 0.10               # S1A와 동일 (blur 방지 안정)
-  adaptive_weight_range: [0.8, 4.0]   # LN 덜 aggressive
-  target_noise: 0.012             # 동일
-
-
-
-
-# ---------------------------------------------------------------------------
-# S2 : edge-protective 최적화 기록 (pretrained model from S1B best.pth 사용)
-# E:\LD-CT SR\Outputs\n2n_experiments\n2n_wavelet_20251126_140829\checkpoints\best_model.pth
-# ---------------------------------------------------------------------------
-
-# S2A
-CUDA_VISIBLE_DEVICES=0 python _scripts_4_wavelet/train_n2n.py --config "config/config_s2a.yaml" --exp S2_A
-
-# S1A Output Directory:
-
-
-  # S2A 튜닝 포인트 (main)
-  wavelet_weight:       0.010     # ↓ reduce smoothing pressure
-  wavelet_threshold:    38        # slightly relaxed
-  wavelet_levels:       3
-  edge_weight:          0.18      # ↑ stronger boundary preservation
-  adaptive_weight_range: [0.5, 2.0]   # narrow → stability
-  target_noise:         0.010     # neutral (don’t chase lower HU)
-  entropy_weight:       0.05      # NEW: prevent texture collapse (optional)
-
-
-# -----------------------------------------------------------------------
-
-# S1B
-CUDA_VISIBLE_DEVICES=1 python _scripts_4_wavelet/train_n2n.py --config "config/config_s1b.yaml" --exp S1_B
-
-# S1B Output Directory:
-
-
-  # S2B 튜닝 포인트 (Aggressive Sharpness)
-  wavelet_weight:       0.005     # ↓↓↓ disable smoothing except coarse noise
-  wavelet_threshold:    30        # keep high frequency
-  wavelet_levels:       2         # shallower → better microstructure retention
-  edge_weight:          0.25      # ↑↑ strong structure enforcement
-  adaptive_weight_range: [1.0, 5.0]   # higher flexibility (experimental)
-  target_noise:         0.010     # same
-  freq_consistency_weight: 0.10   # NEW (optional DCT loss for texture realism)
-
-
+# 1차 fine-tuning
+loss:
+  lambda_rc: 0.6     # 구조 유지는 약간만 줄이고
+  lambda_ic: 0.15
+  lambda_noise: 0.7  # 노이즈 감소 비중 조금 올리고
+  lambda_edge: 0.2
+  lambda_hf: 0.1
