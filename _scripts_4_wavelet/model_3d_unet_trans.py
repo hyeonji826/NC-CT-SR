@@ -226,13 +226,16 @@ class UNet3DTransformer(nn.Module):
         
         # Final output: extract center slice
         self.out_conv = nn.Conv3d(base_channels, 1, 3, padding=1)
+        self.out_activation = nn.Tanh()  # Limit noise to [-1, 1] range
     
     def forward(self, x):
         """
+        Residual Learning: Predict NOISE, then subtract from input
+        
         Args:
             x: (B, 1, D, H, W) where D=5
         Returns:
-            out: (B, 1, 1, H, W) - center slice only
+            denoised: (B, 1, 1, H, W) - Input center - predicted noise
         """
         # Encoder
         e1 = self.enc1(x)           # (B, 32, D, H, W)
@@ -256,15 +259,21 @@ class UNet3DTransformer(nn.Module):
         d1 = torch.cat([d1, e1], dim=1)  # (B, 64, D, H, W)
         d1 = self.dec1(d1)          # (B, 32, D, H, W)
         
-        # Final output
-        out = self.out_conv(d1)     # (B, 1, D, H, W)
+        # Predict NOISE map with limited range
+        noise_map = self.out_conv(d1)  # (B, 1, D, H, W)
+        noise_map = self.out_activation(noise_map) * 0.3  # Scale to [-0.3, 0.3]
         
-        # Extract center slice only
-        D = out.shape[2]
-        center = D // 2
-        out_center = out[:, :, center:center+1, :, :]  # (B, 1, 1, H, W)
+        # Extract center slice from noise and input
+        D_dim = noise_map.shape[2]
+        center_idx = D_dim // 2
+        noise_center = noise_map[:, :, center_idx:center_idx+1, :, :]  # (B, 1, 1, H, W)
+        input_center = x[:, :, center_idx:center_idx+1, :, :]  # (B, 1, 1, H, W)
         
-        return out_center
+        # Residual: Clean = Input - Noise
+        denoised = input_center - noise_center
+        denoised = torch.clamp(denoised, 0.0, 1.0)
+        
+        return denoised
 
 
 def count_parameters(model: nn.Module) -> int:

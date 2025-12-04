@@ -108,27 +108,29 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     return epoch, loss
 
 def save_sample_images(noisy_input, denoised_output, save_path, epoch, metrics=None):
-    """HN + LN 비교 (2열: Noisy, Denoised)"""
-    num_samples = noisy_input.shape[0]
+    """
+    Simple 2x2 grid: LN and HN, each showing Noisy vs Denoised
+    """
+    # Only show first 2 samples (LN and HN)
+    num_display = min(2, noisy_input.shape[0])
     
-    fig, axes = plt.subplots(num_samples, 2, figsize=(14, 6*num_samples + 1))
-    if num_samples == 1:
-        axes = axes.reshape(1, -1)
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
     
-    for idx in range(num_samples):
+    for idx in range(num_display):
         noisy_np = noisy_input[idx, 0].cpu().numpy()
         denoised_np = denoised_output[idx, 0].detach().cpu().numpy()
         
         noisy_np = np.rot90(noisy_np, k=1)
         denoised_np = np.rot90(denoised_np, k=1)
         
+        # Get metrics
         if metrics and idx < len(metrics):
             m = metrics[idx]
             label = m.get('label', f'Sample {idx+1}')
             orig_noise = m.get('original_noise_hu', 0)
             final_noise = m.get('estimated_noise_hu', 0)
         else:
-            label = f'Sample {idx+1}'
+            label = 'HN' if idx == 0 else 'LN'
             tissue_mask = (noisy_np > 0.2) & (noisy_np < 0.8)
             if tissue_mask.sum() > 100:
                 orig_noise = noisy_np[tissue_mask].std() * 400
@@ -137,30 +139,31 @@ def save_sample_images(noisy_input, denoised_output, save_path, epoch, metrics=N
                 orig_noise = final_noise = 0
         
         label_color = 'red' if label == 'HN' else 'blue'
+        reduction = ((orig_noise - final_noise) / orig_noise * 100) if orig_noise > 0 else 0
         
-        # Noisy
+        # Noisy image
         axes[idx, 0].imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
-        title_str = f'[{label}] Noisy\nNoise: {orig_noise:.1f} HU'
-        axes[idx, 0].set_title(title_str, fontsize=12, fontweight='bold', color=label_color)
+        axes[idx, 0].set_title(f'[{label}] Noisy - {orig_noise:.1f} HU', 
+                               fontsize=13, fontweight='bold', color=label_color)
         axes[idx, 0].axis('off')
         
-        # Denoised
+        # Denoised image
         axes[idx, 1].imshow(denoised_np, cmap='gray', vmin=0, vmax=1)
-        reduction = ((orig_noise - final_noise) / orig_noise * 100) if orig_noise > 0 else 0
-        title_str = f'[{label}] Denoised (Epoch {epoch})\nNoise: {final_noise:.1f} HU ({reduction:.1f}% ↓)'
-        axes[idx, 1].set_title(title_str, fontsize=12, fontweight='bold', color=label_color)
+        axes[idx, 1].set_title(f'[{label}] Denoised - {final_noise:.1f} HU ({reduction:.1f}% ↓)', 
+                               fontsize=13, fontweight='bold', color=label_color)
         axes[idx, 1].axis('off')
     
-    title = f'Epoch {epoch} - Enhanced NS-N2N'
+    # Overall title
+    title = f'Epoch {epoch} - Residual Learning Denoising'
     if metrics and len(metrics) >= 2:
         hn_noise = metrics[0].get('estimated_noise_hu', 0)
         ln_noise = metrics[1].get('estimated_noise_hu', 0)
         if hn_noise > 0 and ln_noise > 0:
-            title += f'\nFinal - HN: {hn_noise:.1f} HU | LN: {ln_noise:.1f} HU'
+            title += f'\nHN: {hn_noise:.1f} HU | LN: {ln_noise:.1f} HU'
     
-    plt.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+    plt.suptitle(title, fontsize=15, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
 def cleanup_old_checkpoints(ckpt_dir, keep_last_n=5):

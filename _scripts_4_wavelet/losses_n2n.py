@@ -1,8 +1,8 @@
-# losses_n2n.py
-# High-Quality NS-N2N Loss for Ultra-Low-Dose CT Enhancement
-# Comprehensive loss combining structure preservation, noise control, and artifact suppression
+"""
+Loss functions for Residual-based NS-N2N CT Denoising
 
-from __future__ import annotations
+Optimized for residual learning where model predicts noise map.
+"""
 
 import torch
 import torch.nn as nn
@@ -11,188 +11,179 @@ import torch.nn.functional as F
 
 class HighQualityNSN2NLoss(nn.Module):
     """
-    High-quality CT denoising loss for NS-N2N framework
+    Multi-term loss for high-quality CT denoising with residual learning
     
-    Model output interpretation: y_i = F(x_i_aug) where y_i is the denoised/enhanced image
-    
-    Loss Components:
-      1. L_flat  : Aggressive denoising in flat regions - (y_i ≈ x_{i+1}) * W * M_flat
-      2. L_rc    : Self-consistency - y_i ≈ x_i (content preservation in matched regions)
-      3. L_edge  : Edge structure preservation - gradient similarity in NON-ARTIFACT regions
-      4. L_hf    : High-frequency regularization - prevents over-sharpening and residual noise
-      5. L_noise : Noise level control - body region std(y_i) ≈ target_ratio * std(x_i)
-      6. L_art   : Artifact suppression - selective smoothing of gradient outlier regions
-    
-    Key Design Decision (FLAT vs EDGE separation):
-      - M_flat: Low gradient regions (< threshold) → aggressive noise removal
-      - M_edge: High gradient regions (≥ threshold) → structure preservation priority
-      - This addresses the core NS-N2N assumption violation: adjacent slices differ at edges
-      - Flat regions: noise only (same structure) → strong denoising
-      - Edge regions: structure change + noise → conservative, preserve boundaries
-    
-    All parameters are configurable via config.yaml
+    Loss components:
+    1. Reconstruction: L1 between denoised and target
+    2. Noise control: Encourage target noise level in denoised output
+    3. Edge preservation: Gradient similarity
+    4. HU preservation: Prevent global intensity drift in body regions
+    5. High-frequency: Minimal smoothing artifacts
+    6. Artifact suppression: Penalize unusual gradients
     """
-
+    
     def __init__(
         self,
-        lambda_rc: float = 0.5,
-        lambda_ic: float = 0.3,
-        lambda_noise: float = 0.5,
-        lambda_edge: float = 0.2,
-        lambda_hf: float = 0.1,
-        target_noise_ratio: float = 0.6,
+        lambda_rc: float = 0.1,
+        lambda_noise: float = 2.5,
+        lambda_edge: float = 0.15,
+        lambda_hf: float = 0.02,
+        lambda_hu: float = 0.03,
+        lambda_ic: float = 0.1,
+        target_noise_ratio: float = 0.35,
         min_body_pixels: int = 512,
-        artifact_grad_factor: float = 2.0,
-        flat_threshold: float = 0.05,
-    ) -> None:
-        super().__init__()
-        self.lambda_rc = float(lambda_rc)
-        self.lambda_ic = float(lambda_ic)
-        self.lambda_noise = float(lambda_noise)
-        self.lambda_edge = float(lambda_edge)
-        self.lambda_hf = float(lambda_hf)
-
-        self.target_noise_ratio = float(target_noise_ratio)
-        self.min_body_pixels = int(min_body_pixels)
-        self.artifact_grad_factor = float(artifact_grad_factor)
-        self.flat_threshold = float(flat_threshold)
-
-    def sobel_gradient(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute Sobel gradient magnitude for edge detection"""
-        sobel_x = torch.tensor(
-            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-            dtype=x.dtype, device=x.device
-        ).view(1, 1, 3, 3)
-        sobel_y = torch.tensor(
-            [[-1, -2, -1], [ 0, 0, 0], [ 1, 2, 1]],
-            dtype=x.dtype, device=x.device
-        ).view(1, 1, 3, 3)
-
-        grad_x = F.conv2d(x, sobel_x, padding=1)
-        grad_y = F.conv2d(x, sobel_y, padding=1)
-        grad = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
-        return grad
-
-    def low_pass(self, x: torch.Tensor) -> torch.Tensor:
-        """Simple low-pass filter using local mean (5x5 kernel)"""
-        x_pad = F.pad(x, (2, 2, 2, 2), mode="reflect")
-        lp = F.avg_pool2d(x_pad, kernel_size=5, stride=1)
-        return lp
-
-    def high_freq(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract high-frequency components"""
-        lp = self.low_pass(x)
-        return x - lp
-
-    def forward(
-        self,
-        noise_pred: torch.Tensor,
-        x_i: torch.Tensor,
-        x_i_aug: torch.Tensor,
-        x_ip1: torch.Tensor,
-        x_mid: torch.Tensor,
-        W: torch.Tensor,
-        noise_synthetic: torch.Tensor,
+        artifact_grad_factor: float = 1.9,
+        flat_threshold: float = 0.15,
     ):
-        """
-        Forward pass with FLAT vs EDGE separation
+        super().__init__()
+        self.lambda_rc = lambda_rc
+        self.lambda_noise = lambda_noise
+        self.lambda_edge = lambda_edge
+        self.lambda_hf = lambda_hf
+        self.lambda_hu = lambda_hu
+        self.lambda_ic = lambda_ic
         
+        self.target_noise_ratio = target_noise_ratio
+        self.min_body_pixels = min_body_pixels
+        self.artifact_grad_factor = artifact_grad_factor
+        self.flat_threshold = flat_threshold
+    
+    def forward(self, y_pred, batch_dict):
+        """
         Args:
-            noise_pred: Model output (denoised image y_i)
-            x_i: Original noisy slice i
-            x_i_aug: Augmented input (for training variance)
-            x_ip1: Adjacent noisy slice i+1
-            x_mid: Average of x_i and x_ip1 (compatibility, unused)
-            W: Weight map (matched regions mask, 0-1)
-            noise_synthetic: Synthetic noise added (compatibility, unused)
+            y_pred: (B, 1, 1, H, W) - denoised output from model
+            batch_dict: Dictionary containing:
+                - x_i: (B, 1, H, W) - input center slice
+                - x_ip1: (B, 1, H, W) - neighbor slice
+                - x_mid: (B, 1, H, W) - average of x_i and x_ip1
+                - W: (B, 1, H, W) - matched region weight map
+                - noise_synthetic: (B, 1, H, W) - synthetic noise
         
         Returns:
-            total_loss: Weighted sum of all components
-            log_dict: Individual loss values for monitoring
+            total_loss, loss_dict
         """
-        W = W.detach()
-        y_i = noise_pred
-
-        # Compute gradient magnitude for flat/edge separation
-        grad_x = self.sobel_gradient(x_i)
-        M_flat = (grad_x < self.flat_threshold).float()
-        M_edge = (grad_x >= self.flat_threshold).float()
-
-        # 1) L_flat: Aggressive denoising in flat regions (NS-N2N principle)
-        # Flat regions have minimal structure change between slices → noise dominates
-        diff_flat = (y_i - x_ip1) * W * M_flat
-        l_flat = diff_flat.pow(2).mean()
-
-        # 2) Self-consistency: y_i ≈ x_i for content preservation
-        diff_rc = (y_i - x_i) * W
-        l_rc = diff_rc.pow(2).mean()
-
-        # Prepare body mask for subsequent losses
-        body_mask = (W > 0.5).float()
-
-        # 6) Artifact suppression (compute before edge to get artifact mask)
-        grad_x_full = self.sobel_gradient(x_i)
-        mean_g = grad_x_full.mean(dim=[2, 3], keepdim=True)
-        std_g = grad_x_full.std(dim=[2, 3], keepdim=True)
-        thr = mean_g + self.artifact_grad_factor * std_g
-
-        A = (grad_x_full > thr).float()
-        A = A * body_mask
-        non_artifact = (1.0 - A)
-
-        if A.sum() > 0:
-            lp_x = self.low_pass(x_i)
-            l_art = ((y_i - lp_x).abs() * A).mean()
+        # Squeeze depth dimension from y_pred: (B, 1, 1, H, W) -> (B, 1, H, W)
+        y_pred = y_pred.squeeze(2)
+        
+        x_i = batch_dict["x_i"]
+        x_ip1 = batch_dict["x_ip1"]
+        x_mid = batch_dict["x_mid"]
+        W = batch_dict["W"]
+        
+        # 1. Reconstruction Loss (L1 to target)
+        # Target: x_mid (average of adjacent slices with independent noise)
+        loss_rc = F.l1_loss(y_pred * W, x_mid * W)
+        
+        # 2. Noise Control Loss
+        # Estimate noise in denoised output and compare to target
+        tissue_mask = (y_pred > 0.2) & (y_pred < 0.8)
+        if tissue_mask.sum() > self.min_body_pixels:
+            denoised_std = y_pred[tissue_mask].std()
+            input_std = x_i[tissue_mask].std()
+            target_std = input_std * self.target_noise_ratio
+            loss_noise = F.l1_loss(denoised_std, target_std)
         else:
-            l_art = torch.zeros_like(l_flat)
-
-        # 3) Edge preservation (only in non-artifact AND edge regions)
-        # Edge regions: structure preservation is priority, noise removal is secondary
-        grad_y = self.sobel_gradient(y_i)
-        edge_protection_mask = non_artifact * M_edge
-        l_edge = F.mse_loss(grad_y * edge_protection_mask, grad_x * edge_protection_mask)
-
-        # 4) High-frequency regularization
-        hf = self.high_freq(y_i)
-        l_hf = hf.abs().mean()
-
-        # 5) Noise level control
-        num_body = int(body_mask.sum().item())
-
-        if num_body >= self.min_body_pixels:
-            x_body = x_i * body_mask
-            y_body = y_i * body_mask
-
-            x_vals = x_body[body_mask > 0.5]
-            y_vals = y_body[body_mask > 0.5]
-
-            sigma_in = x_vals.std()
-            sigma_out = y_vals.std()
-
-            target = self.target_noise_ratio * sigma_in.detach()
-            l_noise = (sigma_out - target).pow(2)
+            loss_noise = torch.tensor(0.0, device=y_pred.device)
+        
+        # 3. Edge Preservation Loss
+        # Sobel gradients
+        grad_x_pred = self._sobel_x(y_pred)
+        grad_y_pred = self._sobel_y(y_pred)
+        grad_x_input = self._sobel_x(x_i)
+        grad_y_input = self._sobel_y(x_i)
+        
+        loss_edge = F.l1_loss(grad_x_pred, grad_x_input) + F.l1_loss(grad_y_pred, grad_y_input)
+        
+        # 4. HU Preservation Loss
+        # Prevent global mean shift in body regions
+        body_mask = (x_i > 0.15) & (x_i < 0.85)
+        if body_mask.sum() > self.min_body_pixels:
+            mean_input = x_i[body_mask].mean()
+            mean_pred = y_pred[body_mask].mean()
+            loss_hu = F.l1_loss(mean_pred, mean_input)
         else:
-            l_noise = torch.zeros_like(l_flat)
-
-        # Total loss (L_recon replaced by L_flat)
-        total = (
-            l_flat +
-            self.lambda_rc * l_rc +
-            self.lambda_edge * l_edge +
-            self.lambda_hf * l_hf +
-            self.lambda_noise * l_noise +
-            self.lambda_ic * l_art
+            loss_hu = torch.tensor(0.0, device=y_pred.device)
+        
+        # 5. High-Frequency Loss
+        # Penalize excessive smoothing via Laplacian
+        laplacian_pred = self._laplacian(y_pred)
+        laplacian_input = self._laplacian(x_i)
+        loss_hf = F.l1_loss(laplacian_pred, laplacian_input)
+        
+        # 6. Artifact Suppression Loss
+        # Detect and penalize abnormal gradients (potential artifacts)
+        grad_mag_pred = torch.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-8)
+        grad_mag_input = torch.sqrt(grad_x_input**2 + grad_y_input**2 + 1e-8)
+        
+        # Find flat regions in input
+        flat_mask = (grad_mag_input < self.flat_threshold)
+        if flat_mask.sum() > 100:
+            # Penalize if output has strong gradients where input is flat
+            artifact_penalty = torch.clamp(
+                grad_mag_pred[flat_mask] - self.artifact_grad_factor * grad_mag_input[flat_mask],
+                min=0
+            ).mean()
+            loss_ic = artifact_penalty
+        else:
+            loss_ic = torch.tensor(0.0, device=y_pred.device)
+        
+        # Total loss
+        total_loss = (
+            self.lambda_rc * loss_rc +
+            self.lambda_noise * loss_noise +
+            self.lambda_edge * loss_edge +
+            self.lambda_hf * loss_hf +
+            self.lambda_hu * loss_hu +
+            self.lambda_ic * loss_ic
         )
-
-        log = {
-            "flat": float(l_flat.item()),
-            "rc": float(l_rc.item()),
-            "ic": float(l_art.item()),
-            "noise": float(l_noise.item()),
-            "edge": float(l_edge.item()),
-            "hf": float(l_hf.item()),
-            "total": float(total.item()),
-            "flat_ratio": float(M_flat.mean().item()),
-            "edge_ratio": float(M_edge.mean().item()),
+        
+        loss_dict = {
+            "total": total_loss.item(),
+            "rc": loss_rc.item(),
+            "noise": loss_noise.item() if isinstance(loss_noise, torch.Tensor) else 0.0,
+            "edge": loss_edge.item(),
+            "hf": loss_hf.item(),
+            "hu": loss_hu.item() if isinstance(loss_hu, torch.Tensor) else 0.0,
+            "ic": loss_ic.item() if isinstance(loss_ic, torch.Tensor) else 0.0,
         }
-        return total, log
+        
+        return total_loss, loss_dict
+    
+    def _sobel_x(self, x):
+        """Sobel operator for horizontal gradients"""
+        kernel = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        return F.conv2d(x, kernel, padding=1)
+    
+    def _sobel_y(self, x):
+        """Sobel operator for vertical gradients"""
+        kernel = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        return F.conv2d(x, kernel, padding=1)
+    
+    def _laplacian(self, x):
+        """Laplacian operator for high-frequency detection"""
+        kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], 
+                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        return F.conv2d(x, kernel, padding=1)
+
+
+if __name__ == "__main__":
+    # Quick test
+    loss_fn = HighQualityNSN2NLoss()
+    
+    # Dummy data
+    B, H, W = 2, 128, 128
+    y_pred = torch.randn(B, 1, 1, H, W)
+    batch_dict = {
+        "x_i": torch.randn(B, 1, H, W),
+        "x_ip1": torch.randn(B, 1, H, W),
+        "x_mid": torch.randn(B, 1, H, W),
+        "W": torch.ones(B, 1, H, W),
+        "noise_synthetic": torch.randn(B, 1, H, W),
+    }
+    
+    total_loss, loss_dict = loss_fn(y_pred, batch_dict)
+    print("Loss components:")
+    for k, v in loss_dict.items():
+        print(f"  {k}: {v:.4f}")

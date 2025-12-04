@@ -482,14 +482,18 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=use_amp):
-                # 3D UNet forward: (B, 1, 5, H, W) → (B, 1, 1, H, W)
-                output = model(x_i_aug)
-                
-                # Squeeze depth dimension: (B, 1, 1, H, W) → (B, 1, H, W)
-                noise_pred = output.squeeze(2)
-                            
+                out_5d = model(x_i_aug)          # (B,1,1,H,W)
+                noise_map = out_5d.squeeze(2)    # (B,1,H,W) ← predicted_noise
+
+                # center noisy slice (네트워크가 실제로 본 입력)
+                x_center = x_i_aug[:, :, 2, :, :]    # (B,1,H,W)
+
+                # residual denoising
+                denoised = x_center - noise_map
+                denoised = torch.clamp(denoised, 0.0, 1.0)
+
                 loss, loss_dict = criterion(
-                    noise_pred=noise_pred,
+                    noise_pred=denoised,   # y_i = denoised
                     x_i=x_i,
                     x_i_aug=x_i_aug,
                     x_ip1=x_ip1,
@@ -498,6 +502,9 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
                     noise_synthetic=noise_synthetic,
                 )
 
+                
+                # Compute loss
+                loss, loss_dict = criterion(denoised, batch_dict)
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -557,22 +564,22 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
                 val_W_count += 1
 
                 with autocast(enabled=use_amp):
-                    # 3D UNet forward
-                    output = model(x_i_aug)
-                    denoised_pred = output.squeeze(2)  # (B, 1, 1, H, W) → (B, 1, H, W)
+                    # Model returns denoised image
+                    denoised = model(x_i_aug)  # (B, 1, 1, H, W)
                     
-                    val_loss, _ = criterion(
-                        noise_pred=denoised_pred,
-                        x_i=x_i,
-                        x_i_aug=x_i_aug,
-                        x_ip1=x_ip1,
-                        x_mid=x_mid,
-                        W=W,
-                        noise_synthetic=noise_synthetic,
-                    )
-
+                    # Prepare batch_dict
+                    batch_dict = {
+                        "x_i": x_i,
+                        "x_ip1": x_ip1,
+                        "x_mid": x_mid,
+                        "W": W,
+                        "noise_synthetic": noise_synthetic,
+                    }
+                    
+                    val_loss, _ = criterion(denoised, batch_dict)
 
                 val_losses.append(float(val_loss.item()))
+
 
         avg_val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
         avg_val_W = val_W_sum / val_W_count if val_W_count > 0 else 0.0
@@ -628,13 +635,13 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
                 noisy_5slice = load_fixed_full_slice(info["file"], info["z"], hu_window).to(device)
                 with torch.no_grad():
                     denoised = model(noisy_5slice)  # (1, 1, 1, H, W)
-                    denoised = denoised.squeeze(2)  # (1, 1, H, W)
-                
+
                 # Extract center slice from input for visualization
                 noisy_center = noisy_5slice[:, :, 2, :, :]  # (1, 1, H, W) - center of 5 slices
                 
+                # Store for visualization
                 fixed_samples.append(noisy_center.cpu())
-                denoised_list.append(denoised.cpu())
+                denoised_list.append(denoised.squeeze(2).cpu())  # (1, 1, H, W)
 
                 noisy_hu_std = compute_roi_noise_hu(
                     noisy_center.cpu(), hu_window,
@@ -643,7 +650,7 @@ def train_n2n(config_path: str = "config_n2n.yaml") -> None:
                     roi_w=config["noise_analysis"]["roi_w"]
                 )
                 den_hu_std = compute_roi_noise_hu(
-                    denoised.cpu(), hu_window,
+                    denoised.squeeze(2).cpu(), hu_window,
                     body_hu_range=tuple(config["noise_analysis"]["body_hu_range_roi"]),
                     roi_h=config["noise_analysis"]["roi_h"],
                     roi_w=config["noise_analysis"]["roi_w"]
