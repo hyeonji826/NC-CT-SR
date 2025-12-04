@@ -113,14 +113,14 @@ class HighQualityNSN2NLoss(nn.Module):
         flat_mask = (grad_mag_input < self.flat_threshold)
         
         if flat_mask.sum() > 100:
-            # In flat regions: output HF should be LESS than input HF
-            # This removes noise without affecting structure
+            # In flat regions: actively reduce high-freq (noise)
             lap_input_abs = torch.abs(lap_input[flat_mask])
             lap_pred_abs = torch.abs(lap_pred[flat_mask])
             
-            # Penalize if output has MORE high-freq than input
-            # Target: lap_pred < 0.5 * lap_input
-            loss_hf_noise = torch.clamp(lap_pred_abs - 0.5 * lap_input_abs, min=0).mean()
+            # Target: output HF should be 30% of input HF
+            # This actively removes noise while keeping some texture
+            target_hf = 0.3 * lap_input_abs
+            loss_hf_noise = F.l1_loss(lap_pred_abs, target_hf)
         else:
             loss_hf_noise = torch.tensor(0.0, device=y_pred.device)
         

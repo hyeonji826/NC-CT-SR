@@ -78,22 +78,24 @@ def compute_noise_hu(
     w_margin = int(W * (1.0 - roi_w) / 2.0)
     roi = arr[h_margin:H - h_margin, w_margin:W - w_margin]
     
-    # Convert to HU
-    roi_hu = roi * (hu_max - hu_min) + hu_min
+    # Body mask in NORMALIZED space (exclude background/air)
+    # Typical body tissue in normalized [0, 1]: 0.2 ~ 0.8
+    body_mask_norm = (roi > 0.15) & (roi < 0.85)
     
-    # Body mask (should match the windowing range!)
-    body_mask = (roi_hu >= body_hu_range[0]) & (roi_hu <= body_hu_range[1])
-    if body_mask.sum() < 100:
+    if body_mask_norm.sum() < 100:
         return 0.0
     
+    # Convert ONLY body region to HU
+    roi_hu = roi * (hu_max - hu_min) + hu_min
+    
     # Raw std (default, more interpretable)
-    raw_std_hu = float(roi_hu[body_mask].std())
+    raw_std_hu = float(roi_hu[body_mask_norm].std())
     
     if use_highpass:
         # High-pass filter (optional, less interpretable)
         lp = gaussian_filter(roi_hu, sigma=1.0)
         hp = roi_hu - lp
-        hp_std_hu = float(hp[body_mask].std())
+        hp_std_hu = float(hp[body_mask_norm].std())
         noise_std_hu = hp_std_hu
         
         if debug:

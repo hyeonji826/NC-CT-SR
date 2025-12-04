@@ -18,16 +18,16 @@ from scipy.ndimage import gaussian_filter, median_filter
 class NSN2NDataset(Dataset):
     """
     NS-N2N Dataset with Synthetic Noise Augmentation
-    
+
     Principle: Adjacent CT slices share anatomical structure but have independent noise
     This enables Noise2Noise training without clean ground truth
-    
+
     Key Features:
     - Neighbor slice pairing for noise-independent targets
     - Matched region identification via low-pass filtering
-    - Rician noise augmentation for training robustness
+    - **Physical CT-like noise augmentation (soft-tissue based)**
     - Adaptive noise estimation from tissue regions
-    
+
     All parameters are configurable via config.yaml
     """
 
@@ -39,8 +39,9 @@ class NSN2NDataset(Dataset):
         min_body_fraction: float = 0.08,
         lpf_sigma: float = 1.0,
         lpf_median_size: int = 3,
+        # NOTE: noise_aug_ratio는 이제 "soft noise gain" (예: 1.5)로 사용
         match_threshold: float = 0.005,
-        noise_aug_ratio: float = 0.15,
+        noise_aug_ratio: float = 1.5,
         body_hu_range: Tuple[float, float] = (-500.0, 500.0),
         noise_roi_margin_ratio: float = 0.25,
         noise_tissue_range: Tuple[float, float] = (0.2, 0.8),
@@ -56,8 +57,17 @@ class NSN2NDataset(Dataset):
         self.lpf_sigma = float(lpf_sigma)
         self.lpf_median_size = int(lpf_median_size)
         self.match_threshold = float(match_threshold)
-        self.noise_aug_ratio = float(noise_aug_ratio)
         self.mode = mode
+
+        # === 노이즈 관련 파라미터 ===
+        # base_std(기존 NC 노이즈) * noise_gain_soft ≈ 저선량 std
+        # 옵션 B: noise_gain_soft ≈ 1.4 ~ 1.6 → config에서 1.5로 설정
+        self.noise_gain_soft = float(noise_aug_ratio)
+        # 폐는 soft보다 살짝만 증폭 (너무 과하면 구조 깨짐)
+        self.noise_gain_lung = 1.0 + 0.25 * (self.noise_gain_soft - 1.0)
+        # 뼈/공기는 증폭하지 않음 (weight에서 거의 0 처리)
+        self.noise_gain_bone = 1.0
+        self.noise_gain_air = 1.0
 
         self.body_hu_min, self.body_hu_max = float(body_hu_range[0]), float(body_hu_range[1])
 
@@ -129,7 +139,7 @@ class NSN2NDataset(Dataset):
     def _compute_weight_map(self, x_i: np.ndarray, x_ip1: np.ndarray) -> np.ndarray:
         """
         Compute matched region weight map W
-        
+
         Regions where low-pass filtered adjacent slices are similar (< threshold)
         indicate matched anatomical structure with independent noise
         """
@@ -174,7 +184,7 @@ class NSN2NDataset(Dataset):
     def _estimate_noise_std(self, x: np.ndarray) -> float:
         """
         Estimate noise level from tissue region (normalized 0-1 scale)
-        
+
         Uses central ROI to avoid edge artifacts
         Tissue range ensures measurement from soft tissue, not air or bone
         """
@@ -191,33 +201,87 @@ class NSN2NDataset(Dataset):
 
         return float(roi[tissue_mask].std())
 
-    def _generate_rician_noise(self, shape: Tuple[int, int], sigma: float) -> np.ndarray:
+    # ===== 새 물리 기반 노이즈 생성 함수 =====
+    def _generate_ct_noise_physical(
+        self,
+        x_norm: np.ndarray,
+        base_std: float,
+    ) -> np.ndarray:
         """
-        Generate Rician noise appropriate for CT imaging
-        
-        CT reconstruction produces Rician-distributed noise in the magnitude domain
-        Bias correction removes the mean shift inherent to Rician distribution
-        """
-        real = np.random.normal(0, sigma, shape)
-        imag = np.random.normal(0, sigma, shape)
-        magnitude = np.sqrt(real**2 + imag**2)
+        CT-like noise augmentation in image domain.
 
-        bias = sigma * np.sqrt(np.pi / 2)
-        noise = magnitude - bias
+        - Soft tissue를 기준으로 base_std * noise_gain_soft 만큼 증폭
+        - HU 기반 weight로 lung / bone / air에선 영향 줄임
+        - noise는 전역 mean 0 → 밝기 / HU shift 없음
+        """
+
+        # x_norm: [0,1] normalized center slice
+        H, W_img = x_norm.shape
+
+        # 1) 구조를 대략적으로 나타내는 low-pass (attenuation surrogate)
+        lp = gaussian_filter(x_norm, sigma=1.0)
+        att = np.clip(lp, 0.0, 1.0)
+
+        # 2) normalized value → HU 대략 추정 (window [-160,240] 기준)
+        hu = att * (self.hu_max - self.hu_min) + self.hu_min
+
+        # 3) 영역별 weight (soft 중심)
+        #   - soft:   -150 ~ +200 정도 → high weight
+        #   - lung:   -900 ~ -400 → 낮은 weight
+        #   - bone:   > 300       → 거의 0
+        #   - air:    < -900      → 0
+        soft_mask = (hu > -150.0) & (hu < 200.0)
+        lung_mask = (hu > -900.0) & (hu < -400.0)
+        bone_mask = hu > 300.0
+        air_mask = hu < -900.0
+
+        # 부드러운 soft weight (0~1)
+        soft_weight = np.zeros_like(att, dtype=np.float32)
+        soft_weight[soft_mask] = 1.0
+
+        lung_weight = np.zeros_like(att, dtype=np.float32)
+        lung_weight[lung_mask] = 0.4  # soft보다 훨씬 약하게
+
+        bone_weight = np.zeros_like(att, dtype=np.float32)
+        bone_weight[bone_mask] = 0.05  # 거의 영향 없음
+
+        air_weight = np.zeros_like(att, dtype=np.float32)
+        air_weight[air_mask] = 0.0
+
+        weight_map = soft_weight + lung_weight + bone_weight + air_weight
+        weight_map = gaussian_filter(weight_map, sigma=1.0)  # 부드럽게 transition
+
+        # 4) target std 설정 (옵션 B: ≈1.5배)
+        nc_std = base_std  # 기존 NC 노이즈 (정규화 스케일)
+        target_std_soft = nc_std * self.noise_gain_soft
+
+        # weight_map^2 평균을 이용해 global scale 계산
+        mean_w2 = float((weight_map ** 2).mean()) + 1e-8
+        global_scale = target_std_soft / np.sqrt(mean_w2)
+
+        sigma_map = global_scale * weight_map  # 위치별 σ
+
+        # 5) white Gaussian noise 샘플링 후 σ_map 적용
+        white = np.random.normal(0.0, 1.0, size=(H, W_img)).astype(np.float32)
+        noise = white * sigma_map.astype(np.float32)
+
+        # 6) 살짝 high-frequency 강조 (너무 블러된 noise 방지)
+        #    noise_hp = noise - low-pass(noise)
+        noise_lp = gaussian_filter(noise, sigma=0.8)
+        noise_hp = noise - noise_lp
+        noise = 0.7 * noise_hp + 0.3 * noise  # hp 비율 ≈ 70%
+
+        # 7) 전역 mean 0 보정 → brightness shift 방지
+        noise = noise - noise.mean().astype(np.float32)
 
         return noise.astype(np.float32)
 
     def __getitem__(self, idx: int):
         """
         Return 5 consecutive slices as true 3D volume for 3D UNet + Transformer
-        
+
         Input format: (1, 5, H, W) where 5 = z-2, z-1, z, z+1, z+2
         Output: Denoised center slice (z)
-        
-        This TRUE 3D approach (not just channel stacking) enables:
-            - 3D convolutions capture inter-slice structure
-            - 3D attention models z-axis dependency  
-            - Superior noise/structure separation vs 2D or 2.5D methods
         """
         vol_idx, z = self.pairs[idx]
         vol = self.volumes[vol_idx]
@@ -228,11 +292,11 @@ class NSN2NDataset(Dataset):
         for offset in [-2, -1, 0, 1, 2]:
             z_idx = np.clip(z + offset, 0, D - 1)
             slices.append(vol[:, :, z_idx])
-        
+
         # For paired slice (NS-N2N target) - keep at z+1
         s_pair = vol[:, :, min(z + 1, D - 1)]
 
-        # Window and normalize all slices using existing method
+        # Window and normalize all slices
         x_5slices = np.stack([self._window_and_normalize(s) for s in slices], axis=0)  # (5, H, W)
         x_center = x_5slices[2]  # Center slice for loss calculation
         x_pair = self._window_and_normalize(s_pair)
@@ -241,43 +305,47 @@ class NSN2NDataset(Dataset):
         # Weight map: compare center slice with pair
         W = self._compute_weight_map(x_center, x_pair)
 
-        # Noise augmentation (apply to center slice only in 3D volume)
+        # Noise augmentation (only in train mode)
         if self.mode == "train":
+            # NC 노이즈 추정 (soft tissue 기준, normalized)
             noise_std = self._estimate_noise_std(x_center)
-            aug_sigma = noise_std * self.noise_aug_ratio
-            noise_synthetic = self._generate_rician_noise(x_center.shape, aug_sigma)
+
+            # 물리기반 CT 노이즈 생성 (저선량 시뮬레이션, 옵션 B: ≈1.5배)
+            noise_synthetic = self._generate_ct_noise_physical(
+                x_center,
+                base_std=noise_std,
+            )
+
+            # Additive, zero-mean → brightness 유지
             x_center_aug = np.clip(x_center + noise_synthetic, 0.0, 1.0)
-            
-            # Replace center in 5-slice volume
+
+            # Replace center slice in 5-slice volume
             x_5slices_aug = x_5slices.copy()
             x_5slices_aug[2] = x_center_aug
         else:
-            noise_synthetic = np.zeros_like(x_center)
+            noise_synthetic = np.zeros_like(x_center, dtype=np.float32)
             x_5slices_aug = x_5slices.copy()
 
-        # Random crop (all slices together + 2D arrays)
-        # Crop 3D volume
+        # Random crop (3D volume + 2D arrays 함께)
         if self.patch_size > 0:
             H, W_img = x_5slices.shape[1], x_5slices.shape[2]
             if H > self.patch_size and W_img > self.patch_size:
                 h = np.random.randint(0, H - self.patch_size + 1)
                 w = np.random.randint(0, W_img - self.patch_size + 1)
-                
-                x_5slices = x_5slices[:, h:h+self.patch_size, w:w+self.patch_size]
-                x_5slices_aug = x_5slices_aug[:, h:h+self.patch_size, w:w+self.patch_size]
-                x_center = x_center[h:h+self.patch_size, w:w+self.patch_size]
-                x_pair = x_pair[h:h+self.patch_size, w:w+self.patch_size]
-                x_mid = x_mid[h:h+self.patch_size, w:w+self.patch_size]
-                W = W[h:h+self.patch_size, w:w+self.patch_size]
-                noise_synthetic = noise_synthetic[h:h+self.patch_size, w:w+self.patch_size]
+
+                x_5slices = x_5slices[:, h:h + self.patch_size, w:w + self.patch_size]
+                x_5slices_aug = x_5slices_aug[:, h:h + self.patch_size, w:w + self.patch_size]
+                x_center = x_center[h:h + self.patch_size, w:w + self.patch_size]
+                x_pair = x_pair[h:h + self.patch_size, w:w + self.patch_size]
+                x_mid = x_mid[h:h + self.patch_size, w:w + self.patch_size]
+                W = W[h:h + self.patch_size, w:w + self.patch_size]
+                noise_synthetic = noise_synthetic[h:h + self.patch_size, w:w + self.patch_size]
 
         # Convert to torch tensors
-        # Input: (1, 5, H, W) for 3D UNet
-        x_5slices_t = torch.from_numpy(x_5slices).unsqueeze(0).float()  # (1, 5, H, W)
-        x_5slices_aug_t = torch.from_numpy(x_5slices_aug).unsqueeze(0).float()  # (1, 5, H, W)
-        
-        # Loss calculation tensors (2D)
-        x_center_t = torch.from_numpy(x_center).unsqueeze(0)  # (1, H, W)
+        x_5slices_t = torch.from_numpy(x_5slices).unsqueeze(0).float()       # (1, 5, H, W)
+        x_5slices_aug_t = torch.from_numpy(x_5slices_aug).unsqueeze(0).float()
+
+        x_center_t = torch.from_numpy(x_center).unsqueeze(0)                 # (1, H, W)
         x_pair_t = torch.from_numpy(x_pair).unsqueeze(0)
         x_mid_t = torch.from_numpy(x_mid).unsqueeze(0)
         W_t = torch.from_numpy(W).unsqueeze(0)
