@@ -8,12 +8,13 @@ Plan B: Structure/HU preservation FIRST, noise reduction LATER
 
 import sys
 import random
+import argparse
 from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 # Import project modules
@@ -94,8 +95,8 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     loss_components = {
-        'rc': 0.0, 'noise': 0.0, 'edge': 0.0,
-        'hf': 0.0, 'hu': 0.0, 'ic': 0.0
+        'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
+        'texture': 0.0, 'hf_noise': 0.0, 'ic': 0.0
     }
     
     for batch_idx, batch in enumerate(train_loader):
@@ -109,7 +110,7 @@ def train_epoch(
         optimizer.zero_grad()
         
         # Forward pass with AMP
-        with autocast(enabled=use_amp):
+        with autocast('cuda', enabled=use_amp):
             # Model already outputs denoised image (residual learning inside model)
             denoised = model(x_i_aug)  # (B, 1, 1, H, W)
             
@@ -151,8 +152,8 @@ def validate(model, val_loader, criterion, device, use_amp):
     model.eval()
     total_loss = 0.0
     loss_components = {
-        'rc': 0.0, 'noise': 0.0, 'edge': 0.0,
-        'hf': 0.0, 'hu': 0.0, 'ic': 0.0
+        'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
+        'texture': 0.0, 'hf_noise': 0.0, 'ic': 0.0
     }
     
     with torch.no_grad():
@@ -164,7 +165,7 @@ def validate(model, val_loader, criterion, device, use_amp):
             W = batch["W"].to(device)
             noise_synthetic = batch["noise_synthetic"].to(device)
             
-            with autocast(enabled=use_amp):
+            with autocast('cuda', enabled=use_amp):
                 denoised = model(x_i_aug)
                 
                 batch_dict = {
@@ -190,9 +191,37 @@ def validate(model, val_loader, criterion, device, use_amp):
 
 
 def main():
-    # Load configuration
-    config_path = Path(__file__).parent / "config_n2n.yaml"
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Train NS-N2N CT Denoising Model')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to config file (default: looks for config/config_n2n.yaml or config_n2n.yaml)')
+    args = parser.parse_args()
+    
+    # Load configuration - try multiple paths
+    if args.config:
+        config_path = Path(args.config)
+    else:
+        # Try config folder first, then same directory
+        script_dir = Path(__file__).parent
+        possible_paths = [
+            script_dir / "config" / "config_n2n.yaml",
+            script_dir / "config_n2n.yaml",
+        ]
+        config_path = None
+        for p in possible_paths:
+            if p.exists():
+                config_path = p
+                break
+        
+        if config_path is None:
+            raise FileNotFoundError(
+                f"Config file not found. Tried:\n" + 
+                "\n".join(f"  - {p}" for p in possible_paths) +
+                "\nPlease specify with --config flag"
+            )
+    
     config = load_config(str(config_path))
+    print(f"Loaded config from: {config_path}")
     
     # Set seed
     set_seed(config["training"]["seed"])
@@ -200,7 +229,7 @@ def main():
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*70}")
-    print(f"Plan B Training: Structure-First, Then Noise Reduction")
+    print(f"TRUE Noise Removal: High-Frequency Targeting")
     print(f"{'='*70}")
     print(f"Device: {device}")
     
@@ -234,25 +263,23 @@ def main():
     # Create loss function
     criterion = HighQualityNSN2NLoss(
         lambda_rc=config["loss"]["lambda_rc"],
-        lambda_noise=config["loss"]["lambda_noise"],
-        lambda_edge=config["loss"]["lambda_edge"],
-        lambda_hf=config["loss"]["lambda_hf"],
         lambda_hu=config["loss"]["lambda_hu"],
+        lambda_edge=config["loss"]["lambda_edge"],
+        lambda_texture=config["loss"]["lambda_texture"],
+        lambda_hf_noise=config["loss"]["lambda_hf_noise"],
         lambda_ic=config["loss"]["lambda_ic"],
-        target_noise_ratio=config["loss"]["target_noise_ratio"],
         min_body_pixels=config["loss"]["min_body_pixels"],
         artifact_grad_factor=config["loss"]["artifact_grad_factor"],
         flat_threshold=config["loss"]["flat_threshold"],
     ).to(device)
     
-    # Save base lambdas for Plan B scheduling
+    # Save base lambdas (for potential future adjustments)
     base_lambda_rc = criterion.lambda_rc
     base_lambda_hu = criterion.lambda_hu
     base_lambda_edge = criterion.lambda_edge
-    base_lambda_noise = criterion.lambda_noise
-    base_lambda_hf = criterion.lambda_hf
+    base_lambda_texture = criterion.lambda_texture
+    base_lambda_hf_noise = criterion.lambda_hf_noise
     base_lambda_ic = criterion.lambda_ic
-    noise_warmup_epochs = config["training"]["noise_warmup_epochs"]
     
     # Optimizer and scheduler
     optimizer = torch.optim.AdamW(
@@ -269,7 +296,7 @@ def main():
     )
     
     # AMP scaler
-    scaler = GradScaler(enabled=config["training"]["use_amp"])
+    scaler = GradScaler('cuda', enabled=config["training"]["use_amp"])
     
     # TensorBoard writer
     writer = SummaryWriter(log_dir)
@@ -294,33 +321,14 @@ def main():
     # Training loop
     print(f"\n{'='*70}")
     print(f"Starting training from epoch {start_epoch}")
-    print(f"Plan B Schedule: Warmup {noise_warmup_epochs} epochs (structure-first)")
+    print(f"Strategy: TRUE noise removal (high-freq targeting)")
     print(f"{'='*70}\n")
     
     best_val_loss = float('inf')
     num_epochs = config["training"]["num_epochs"]
     
     for epoch in range(start_epoch, num_epochs + 1):
-        # ===== PLAN B: Lambda scheduling =====
-        if epoch <= noise_warmup_epochs:
-            # Early phase: Emphasize structure/HU, suppress noise term
-            criterion.lambda_rc = base_lambda_rc * 1.5
-            criterion.lambda_hu = base_lambda_hu * 1.5
-            criterion.lambda_edge = base_lambda_edge * 1.2
-            criterion.lambda_ic = base_lambda_ic * 1.2
-            criterion.lambda_noise = base_lambda_noise * 0.1
-            criterion.lambda_hf = base_lambda_hf
-            phase = "Structure-First"
-        else:
-            # Later phase: Gradually increase noise term
-            t = min(1.0, (epoch - noise_warmup_epochs) / max(1, num_epochs - noise_warmup_epochs))
-            criterion.lambda_noise = base_lambda_noise * (0.3 + 0.7 * t)
-            criterion.lambda_rc = base_lambda_rc
-            criterion.lambda_hu = base_lambda_hu
-            criterion.lambda_edge = base_lambda_edge
-            criterion.lambda_ic = base_lambda_ic
-            criterion.lambda_hf = base_lambda_hf
-            phase = f"Noise-Ramp ({t*100:.0f}%)"
+        # No dynamic lambda scheduling - new loss targets true noise directly
         
         # Train
         train_loss, train_comps = train_epoch(
@@ -337,18 +345,20 @@ def main():
         scheduler.step()
         
         # Print progress
-        print(f"Epoch {epoch:03d}/{num_epochs} [{phase}] | "
+        print(f"Epoch {epoch:03d}/{num_epochs} | "
               f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
               f"LR: {optimizer.param_groups[0]['lr']:.2e}")
-        print(f"  Lambdas: RC={criterion.lambda_rc:.2f}, Noise={criterion.lambda_noise:.3f}, "
-              f"Edge={criterion.lambda_edge:.2f}, HU={criterion.lambda_hu:.2f}")
+        print(f"  Lambdas: RC={criterion.lambda_rc:.2f}, HU={criterion.lambda_hu:.2f}, "
+              f"Edge={criterion.lambda_edge:.2f}, Texture={criterion.lambda_texture:.2f}, "
+              f"HF_Noise={criterion.lambda_hf_noise:.2f}")
         
         # TensorBoard logging
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
-        writer.add_scalar('Lambda/noise', criterion.lambda_noise, epoch)
-        writer.add_scalar('Lambda/rc', criterion.lambda_rc, epoch)
+        writer.add_scalar('Lambda/hu', criterion.lambda_hu, epoch)
+        writer.add_scalar('Lambda/texture', criterion.lambda_texture, epoch)
+        writer.add_scalar('Lambda/hf_noise', criterion.lambda_hf_noise, epoch)
         
         for key, val in train_comps.items():
             writer.add_scalar(f'Train/{key}', val, epoch)
@@ -371,19 +381,49 @@ def main():
         if epoch % config["training"]["sample_interval"] == 0:
             model.eval()
             with torch.no_grad():
-                # Get first batch from validation
-                sample_batch = next(iter(val_loader))
-                x_i = sample_batch["x_i"].to(device)
-                x_i_aug = sample_batch["x_i_aug"].to(device)
+                # Create temporary dataset without cropping for full image visualization
+                dataset_full_img = NSN2NDataset(
+                    nc_ct_dir=config["data"]["nc_ct_dir"],
+                    hu_window=tuple(config["preprocessing"]["hu_window"]),
+                    patch_size=0,  # No cropping for visualization
+                    min_body_fraction=config["preprocessing"]["min_body_fraction"],
+                    lpf_sigma=config["dataset"]["lpf_sigma"],
+                    lpf_median_size=config["dataset"]["lpf_median_size"],
+                    match_threshold=config["preprocessing"]["match_threshold"],
+                    noise_aug_ratio=0.0,  # No noise augmentation for clean visualization
+                    body_hu_range=tuple(config["dataset"]["body_hu_range"]),
+                    noise_roi_margin_ratio=config["dataset"]["noise_roi_margin_ratio"],
+                    noise_tissue_range=tuple(config["dataset"]["noise_tissue_range"]),
+                    noise_default_std=config["dataset"]["noise_default_std"],
+                    mode="val",
+                )
                 
-                with autocast(enabled=config["training"]["use_amp"]):
-                    denoised = model(x_i_aug).squeeze(2)  # (B, 1, H, W)
+                # Get first 2 samples (HN and LN typically)
+                sample_indices = [0, len(dataset_full_img) // 2]  # First and middle samples
+                
+                noisy_list = []
+                denoised_list = []
+                
+                for idx in sample_indices[:2]:  # Only first 2
+                    sample = dataset_full_img[idx]
+                    x_i = sample["x_i"].unsqueeze(0).to(device)
+                    x_i_aug = sample["x_i_aug"].unsqueeze(0).to(device)
+                    
+                    with autocast('cuda', enabled=config["training"]["use_amp"]):
+                        denoised_out = model(x_i_aug).squeeze(2)  # (1, 1, H, W)
+                    
+                    noisy_list.append(x_i.cpu())
+                    denoised_list.append(denoised_out.cpu())
+                
+                # Stack into batch format
+                noisy_batch = torch.cat(noisy_list, dim=0)
+                denoised_batch = torch.cat(denoised_list, dim=0)
                 
                 # Save samples
                 print(f"\n  Saving samples for epoch {epoch}:")
                 save_simple_samples(
-                    noisy=x_i.cpu(),
-                    denoised=denoised.cpu(),
+                    noisy=noisy_batch,
+                    denoised=denoised_batch,
                     origin_dir=origin_dir,
                     denoise_dir=denoise_dir,
                     epoch=epoch,

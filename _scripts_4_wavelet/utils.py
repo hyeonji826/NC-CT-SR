@@ -52,20 +52,19 @@ def compute_noise_hu(
     body_hu_range: Tuple[float, float],
     roi_h: float = 0.6,
     roi_w: float = 0.6,
+    use_highpass: bool = False,
+    debug: bool = False,
 ) -> float:
     """
-    Compute noise in HU using high-pass residual (Plan B)
-    
-    This prevents "scale-down cheating" by:
-    1. Removing low-frequency structure via Gaussian filter
-    2. Measuring std only on high-pass residual
-    3. True noise reduction shows in HP residual, not just global darkening
+    Compute noise in HU (default: raw std, more interpretable for medical imaging)
     
     Args:
         x_01: Tensor in [0, 1] range, shape (B, C, H, W)
         hu_window: (min, max) HU window for denormalization
-        body_hu_range: (min, max) HU range for body mask
+        body_hu_range: (min, max) HU range for body mask (should match hu_window!)
         roi_h, roi_w: ROI size as fraction of image
+        use_highpass: If True, use high-pass filtering (less interpretable)
+        debug: If True, print diagnostic info
     
     Returns:
         noise_std_hu: Noise level in HU units
@@ -82,17 +81,30 @@ def compute_noise_hu(
     # Convert to HU
     roi_hu = roi * (hu_max - hu_min) + hu_min
     
-    # Body mask
+    # Body mask (should match the windowing range!)
     body_mask = (roi_hu >= body_hu_range[0]) & (roi_hu <= body_hu_range[1])
     if body_mask.sum() < 100:
         return 0.0
     
-    # High-pass filter: Remove structure, keep only noise
-    lp = gaussian_filter(roi_hu, sigma=1.0)
-    hp = roi_hu - lp
+    # Raw std (default, more interpretable)
+    raw_std_hu = float(roi_hu[body_mask].std())
     
-    # Measure std on high-pass residual only
-    noise_std_hu = float(hp[body_mask].std())
+    if use_highpass:
+        # High-pass filter (optional, less interpretable)
+        lp = gaussian_filter(roi_hu, sigma=1.0)
+        hp = roi_hu - lp
+        hp_std_hu = float(hp[body_mask].std())
+        noise_std_hu = hp_std_hu
+        
+        if debug:
+            print(f"    [DEBUG] Raw std: {raw_std_hu:.1f} HU | HP std: {hp_std_hu:.1f} HU | Ratio: {hp_std_hu/raw_std_hu:.2%}")
+    else:
+        # Use raw std (recommended for medical imaging)
+        noise_std_hu = raw_std_hu
+        
+        if debug:
+            print(f"    [DEBUG] Raw std: {raw_std_hu:.1f} HU (no HP filtering)")
+    
     return noise_std_hu
 
 
@@ -113,7 +125,7 @@ def save_simple_samples(
             epoch_10_HN.png
             epoch_10_LN.png
         denoise/
-            epoch_10_HN.png  (with noise HU in filename would be ideal, but keeping simple)
+            epoch_10_HN.png
             epoch_10_LN.png
     
     Args:
@@ -133,41 +145,54 @@ def save_simple_samples(
     for idx in range(min(2, noisy.shape[0])):
         label = labels[idx]
         
-        # Extract and rotate images
+        # Extract images
         noisy_np = noisy[idx, 0].cpu().numpy()
         denoised_np = denoised[idx, 0].detach().cpu().numpy()
         
+        # Rotate for better visualization
         noisy_np = np.rot90(noisy_np, k=1)
         denoised_np = np.rot90(denoised_np, k=1)
         
         # Calculate noise HU for console logging
         noisy_hu = compute_noise_hu(
-            noisy[idx:idx+1], hu_window, body_hu_range
+            noisy[idx:idx+1], hu_window, body_hu_range, 
+            use_highpass=False, debug=True
         )
         denoised_hu = compute_noise_hu(
-            denoised[idx:idx+1], hu_window, body_hu_range
+            denoised[idx:idx+1], hu_window, body_hu_range,
+            use_highpass=False, debug=True
         )
         
         # Print to console
         reduction = ((noisy_hu - denoised_hu) / noisy_hu * 100) if noisy_hu > 0 else 0
-        print(f"  [{label}] Original: {noisy_hu:.1f} HU → Denoised: {denoised_hu:.1f} HU ({reduction:.1f}% reduction)")
+        print(f"  [{label}] Original: {noisy_hu:.1f} HU → Denoised: {denoised_hu:.1f} HU "
+              f"({reduction:.1f}% reduction) | Shape: {noisy_np.shape}")
+        
+        # Determine figure size based on image aspect ratio
+        h, w = noisy_np.shape
+        aspect_ratio = w / h
+        fig_height = 8
+        fig_width = fig_height * aspect_ratio
         
         # Save origin
-        plt.figure(figsize=(6, 6))
-        plt.imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
-        plt.axis('off')
-        plt.tight_layout(pad=0)
+        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+        ax.imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
+        ax.axis('off')
+        ax.set_title(f'{label} Original - {noisy_hu:.1f} HU', fontsize=14, pad=10)
+        plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
         origin_path = origin_dir / f"epoch_{epoch}_{label}.png"
-        plt.savefig(origin_path, dpi=150, bbox_inches='tight', pad_inches=0)
+        plt.savefig(origin_path, dpi=150, bbox_inches='tight')
         plt.close()
         
         # Save denoised
-        plt.figure(figsize=(6, 6))
-        plt.imshow(denoised_np, cmap='gray', vmin=0, vmax=1)
-        plt.axis('off')
-        plt.tight_layout(pad=0)
+        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+        ax.imshow(denoised_np, cmap='gray', vmin=0, vmax=1)
+        ax.axis('off')
+        ax.set_title(f'{label} Denoised - {denoised_hu:.1f} HU ({reduction:.1f}% ↓)', 
+                     fontsize=14, pad=10)
+        plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
         denoise_path = denoise_dir / f"epoch_{epoch}_{label}.png"
-        plt.savefig(denoise_path, dpi=150, bbox_inches='tight', pad_inches=0)
+        plt.savefig(denoise_path, dpi=150, bbox_inches='tight')
         plt.close()
 
 
