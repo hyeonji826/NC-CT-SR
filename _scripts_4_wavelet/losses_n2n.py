@@ -1,7 +1,7 @@
 """
 Loss functions for Residual-based NS-N2N CT Denoising
 
-Optimized for residual learning where model predicts noise map.
+Plan B: Input-based ROI to prevent "scale-down" cheating
 """
 
 import torch
@@ -11,26 +11,23 @@ import torch.nn.functional as F
 
 class HighQualityNSN2NLoss(nn.Module):
     """
-    Multi-term loss for high-quality CT denoising with residual learning
+    Plan B Loss: Structure/HU preservation FIRST, noise reduction LATER
     
-    Loss components:
-    1. Reconstruction: L1 between denoised and target
-    2. Noise control: Encourage target noise level in denoised output
-    3. Edge preservation: Gradient similarity
-    4. HU preservation: Prevent global intensity drift in body regions
-    5. High-frequency: Minimal smoothing artifacts
-    6. Artifact suppression: Penalize unusual gradients
+    Key changes from original:
+    1. Noise loss uses INPUT-based ROI (not output-based)
+    2. Flat region detection prevents structure/edge confusion
+    3. Mean-centered std measurement blocks HU scale manipulation
     """
     
     def __init__(
         self,
-        lambda_rc: float = 0.1,
-        lambda_noise: float = 2.5,
-        lambda_edge: float = 0.15,
-        lambda_hf: float = 0.02,
-        lambda_hu: float = 0.03,
+        lambda_rc: float = 2.0,
+        lambda_noise: float = 0.05,
+        lambda_edge: float = 0.7,
+        lambda_hf: float = 0.05,
+        lambda_hu: float = 1.0,
         lambda_ic: float = 0.1,
-        target_noise_ratio: float = 0.35,
+        target_noise_ratio: float = 0.7,
         min_body_pixels: int = 512,
         artifact_grad_factor: float = 1.9,
         flat_threshold: float = 0.15,
@@ -52,12 +49,7 @@ class HighQualityNSN2NLoss(nn.Module):
         """
         Args:
             y_pred: (B, 1, 1, H, W) - denoised output from model
-            batch_dict: Dictionary containing:
-                - x_i: (B, 1, H, W) - input center slice
-                - x_ip1: (B, 1, H, W) - neighbor slice
-                - x_mid: (B, 1, H, W) - average of x_i and x_ip1
-                - W: (B, 1, H, W) - matched region weight map
-                - noise_synthetic: (B, 1, H, W) - synthetic noise
+            batch_dict: Dictionary containing x_i, x_ip1, x_mid, W, noise_synthetic
         
         Returns:
             total_loss, loss_dict
@@ -70,32 +62,42 @@ class HighQualityNSN2NLoss(nn.Module):
         x_mid = batch_dict["x_mid"]
         W = batch_dict["W"]
         
-        # 1. Reconstruction Loss (L1 to target)
-        # Target: x_mid (average of adjacent slices with independent noise)
+        # ===== 1. RECONSTRUCTION LOSS (Structure preservation) =====
         loss_rc = F.l1_loss(y_pred * W, x_mid * W)
         
-        # 2. Noise Control Loss
-        # Estimate noise in denoised output and compare to target
-        tissue_mask = (y_pred > 0.2) & (y_pred < 0.8)
-        if tissue_mask.sum() > self.min_body_pixels:
-            denoised_std = y_pred[tissue_mask].std()
-            input_std = x_i[tissue_mask].std()
+        # ===== 2. NOISE CONTROL LOSS (Plan B: Input-based flat ROI) =====
+        # Use INPUT-based tissue mask (not output-based!)
+        tissue_mask = (x_i > 0.2) & (x_i < 0.8)
+        
+        # Detect flat regions in INPUT using gradients
+        grad_x_input = self._sobel_x(x_i)
+        grad_y_input = self._sobel_y(x_i)
+        grad_mag_input = torch.sqrt(grad_x_input**2 + grad_y_input**2 + 1e-8)
+        flat_mask = (grad_mag_input < self.flat_threshold)
+        
+        # Noise ROI = body AND flat (avoid edges/structure)
+        noise_roi = tissue_mask & flat_mask
+        
+        if noise_roi.sum() > self.min_body_pixels:
+            # Mean-centered std measurement (blocks HU scale manipulation)
+            yp_roi = y_pred[noise_roi]
+            xi_roi = x_i[noise_roi]
+            
+            denoised_std = (yp_roi - yp_roi.mean()).std()
+            input_std = (xi_roi - xi_roi.mean()).std()
             target_std = input_std * self.target_noise_ratio
+            
             loss_noise = F.l1_loss(denoised_std, target_std)
         else:
             loss_noise = torch.tensor(0.0, device=y_pred.device)
         
-        # 3. Edge Preservation Loss
-        # Sobel gradients
+        # ===== 3. EDGE PRESERVATION LOSS =====
         grad_x_pred = self._sobel_x(y_pred)
         grad_y_pred = self._sobel_y(y_pred)
-        grad_x_input = self._sobel_x(x_i)
-        grad_y_input = self._sobel_y(x_i)
         
         loss_edge = F.l1_loss(grad_x_pred, grad_x_input) + F.l1_loss(grad_y_pred, grad_y_input)
         
-        # 4. HU Preservation Loss
-        # Prevent global mean shift in body regions
+        # ===== 4. HU PRESERVATION LOSS =====
         body_mask = (x_i > 0.15) & (x_i < 0.85)
         if body_mask.sum() > self.min_body_pixels:
             mean_input = x_i[body_mask].mean()
@@ -104,21 +106,16 @@ class HighQualityNSN2NLoss(nn.Module):
         else:
             loss_hu = torch.tensor(0.0, device=y_pred.device)
         
-        # 5. High-Frequency Loss
-        # Penalize excessive smoothing via Laplacian
+        # ===== 5. HIGH-FREQUENCY LOSS =====
         laplacian_pred = self._laplacian(y_pred)
         laplacian_input = self._laplacian(x_i)
         loss_hf = F.l1_loss(laplacian_pred, laplacian_input)
         
-        # 6. Artifact Suppression Loss
-        # Detect and penalize abnormal gradients (potential artifacts)
+        # ===== 6. ARTIFACT SUPPRESSION LOSS =====
         grad_mag_pred = torch.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-8)
-        grad_mag_input = torch.sqrt(grad_x_input**2 + grad_y_input**2 + 1e-8)
         
-        # Find flat regions in input
-        flat_mask = (grad_mag_input < self.flat_threshold)
         if flat_mask.sum() > 100:
-            # Penalize if output has strong gradients where input is flat
+            # Penalize strong gradients in flat regions
             artifact_penalty = torch.clamp(
                 grad_mag_pred[flat_mask] - self.artifact_grad_factor * grad_mag_input[flat_mask],
                 min=0
@@ -127,7 +124,7 @@ class HighQualityNSN2NLoss(nn.Module):
         else:
             loss_ic = torch.tensor(0.0, device=y_pred.device)
         
-        # Total loss
+        # ===== TOTAL LOSS =====
         total_loss = (
             self.lambda_rc * loss_rc +
             self.lambda_noise * loss_noise +
@@ -166,24 +163,3 @@ class HighQualityNSN2NLoss(nn.Module):
         kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], 
                               dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
         return F.conv2d(x, kernel, padding=1)
-
-
-if __name__ == "__main__":
-    # Quick test
-    loss_fn = HighQualityNSN2NLoss()
-    
-    # Dummy data
-    B, H, W = 2, 128, 128
-    y_pred = torch.randn(B, 1, 1, H, W)
-    batch_dict = {
-        "x_i": torch.randn(B, 1, H, W),
-        "x_ip1": torch.randn(B, 1, H, W),
-        "x_mid": torch.randn(B, 1, H, W),
-        "W": torch.ones(B, 1, H, W),
-        "noise_synthetic": torch.randn(B, 1, H, W),
-    }
-    
-    total_loss, loss_dict = loss_fn(y_pred, batch_dict)
-    print("Loss components:")
-    for k, v in loss_dict.items():
-        print(f"  {k}: {v:.4f}")

@@ -1,77 +1,25 @@
-# E:\LD-CT SR\_scripts_4_wavelet\utils.py
+"""
+Utility functions for NS-N2N training
+"""
 
 import torch
 import yaml
-from pathlib import Path
-import matplotlib.pyplot as plt
-import shutil
-import warnings
 import numpy as np
-from skimage.metrics import structural_similarity as ssim
-
-import yaml
-
-def load_yaml_config(path: str):
-    """
-    Load YAML config file safely.
-    """
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    return cfg
-
-warnings.filterwarnings('ignore')
-
-def calculate_psnr(img1, img2, data_range=1.0):
-    """Calculate PSNR between two images"""
-    if isinstance(img1, torch.Tensor):
-        img1 = img1.detach().cpu().numpy()
-    if isinstance(img2, torch.Tensor):
-        img2 = img2.detach().cpu().numpy()
-    
-    mse = np.mean((img1 - img2) ** 2)
-    if mse == 0:
-        return float('inf')
-    
-    psnr = 10 * np.log10(data_range ** 2 / mse)
-    return psnr
-
-def calculate_ssim(img1, img2, data_range=1.0):
-    """Calculate SSIM between two images"""
-    if isinstance(img1, torch.Tensor):
-        img1 = img1.detach().cpu().numpy()
-    if isinstance(img2, torch.Tensor):
-        img2 = img2.detach().cpu().numpy()
-    
-    # Handle batch dimension
-    if img1.ndim == 4:
-        ssim_values = []
-        for i in range(img1.shape[0]):
-            s = ssim(img1[i, 0], img2[i, 0], data_range=data_range)
-            ssim_values.append(s)
-        return np.mean(ssim_values)
-    else:
-        return ssim(img1[0], img2[0], data_range=data_range)
+from pathlib import Path
+from scipy.ndimage import gaussian_filter
+import matplotlib.pyplot as plt
+from typing import Tuple
 
 
-def load_config(config_path):
-    """Load YAML config with absolute path support"""
-    config_path = Path(config_path)
-    if not config_path.exists():
-        # Try relative to script directory
-        script_dir = Path(__file__).parent
-        config_path = script_dir / config_path.name
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    
+def load_config(config_path: str) -> dict:
+    """Load YAML configuration file"""
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    
-    print(f"Loaded config from: {config_path}")
     return config
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, is_best=False):
-    """Save model checkpoint"""
+
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path):
+    """Save training checkpoint"""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -79,20 +27,12 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, is_best
         'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
         'loss': loss,
     }
-    
     torch.save(checkpoint, save_path)
-    print(f"Checkpoint saved: {save_path}")
-    
-    # Save best model
-    if is_best:
-        best_path = save_path.parent / 'best_model.pth'
-        shutil.copyfile(save_path, best_path)
-        print(f"Best model saved: {best_path}")
+
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     """Load checkpoint"""
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    
     model.load_state_dict(checkpoint['model_state_dict'])
     
     if optimizer and 'optimizer_state_dict' in checkpoint:
@@ -103,88 +43,144 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
     
     epoch = checkpoint.get('epoch', 0)
     loss = checkpoint.get('loss', float('inf'))
-    
-    print(f"Loaded checkpoint from epoch {epoch}, loss: {loss:.4f}")
     return epoch, loss
 
-def save_sample_images(noisy_input, denoised_output, save_path, epoch, metrics=None):
+
+def compute_noise_hu(
+    x_01: torch.Tensor,
+    hu_window: Tuple[float, float],
+    body_hu_range: Tuple[float, float],
+    roi_h: float = 0.6,
+    roi_w: float = 0.6,
+) -> float:
     """
-    Simple 2x2 grid: LN and HN, each showing Noisy vs Denoised
+    Compute noise in HU using high-pass residual (Plan B)
+    
+    This prevents "scale-down cheating" by:
+    1. Removing low-frequency structure via Gaussian filter
+    2. Measuring std only on high-pass residual
+    3. True noise reduction shows in HP residual, not just global darkening
+    
+    Args:
+        x_01: Tensor in [0, 1] range, shape (B, C, H, W)
+        hu_window: (min, max) HU window for denormalization
+        body_hu_range: (min, max) HU range for body mask
+        roi_h, roi_w: ROI size as fraction of image
+    
+    Returns:
+        noise_std_hu: Noise level in HU units
     """
-    # Only show first 2 samples (LN and HN)
-    num_display = min(2, noisy_input.shape[0])
+    hu_min, hu_max = hu_window
+    arr = x_01[0, 0].detach().cpu().numpy()
+    H, W = arr.shape
     
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+    # Extract central ROI
+    h_margin = int(H * (1.0 - roi_h) / 2.0)
+    w_margin = int(W * (1.0 - roi_w) / 2.0)
+    roi = arr[h_margin:H - h_margin, w_margin:W - w_margin]
     
-    for idx in range(num_display):
-        noisy_np = noisy_input[idx, 0].cpu().numpy()
-        denoised_np = denoised_output[idx, 0].detach().cpu().numpy()
+    # Convert to HU
+    roi_hu = roi * (hu_max - hu_min) + hu_min
+    
+    # Body mask
+    body_mask = (roi_hu >= body_hu_range[0]) & (roi_hu <= body_hu_range[1])
+    if body_mask.sum() < 100:
+        return 0.0
+    
+    # High-pass filter: Remove structure, keep only noise
+    lp = gaussian_filter(roi_hu, sigma=1.0)
+    hp = roi_hu - lp
+    
+    # Measure std on high-pass residual only
+    noise_std_hu = float(hp[body_mask].std())
+    return noise_std_hu
+
+
+def save_simple_samples(
+    noisy: torch.Tensor,
+    denoised: torch.Tensor,
+    origin_dir: Path,
+    denoise_dir: Path,
+    epoch: int,
+    hu_window: Tuple[float, float],
+    body_hu_range: Tuple[float, float],
+):
+    """
+    Save samples as individual images in separate folders (Plan B)
+    
+    Structure:
+        origin/
+            epoch_10_HN.png
+            epoch_10_LN.png
+        denoise/
+            epoch_10_HN.png  (with noise HU in filename would be ideal, but keeping simple)
+            epoch_10_LN.png
+    
+    Args:
+        noisy: (B, 1, H, W) noisy input
+        denoised: (B, 1, H, W) denoised output
+        origin_dir: Directory for noisy images
+        denoise_dir: Directory for denoised images
+        epoch: Current epoch number
+        hu_window: HU window for noise calculation
+        body_hu_range: Body HU range for noise calculation
+    """
+    origin_dir.mkdir(parents=True, exist_ok=True)
+    denoise_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Process first 2 samples (HN and LN)
+    labels = ['HN', 'LN']
+    for idx in range(min(2, noisy.shape[0])):
+        label = labels[idx]
+        
+        # Extract and rotate images
+        noisy_np = noisy[idx, 0].cpu().numpy()
+        denoised_np = denoised[idx, 0].detach().cpu().numpy()
         
         noisy_np = np.rot90(noisy_np, k=1)
         denoised_np = np.rot90(denoised_np, k=1)
         
-        # Get metrics
-        if metrics and idx < len(metrics):
-            m = metrics[idx]
-            label = m.get('label', f'Sample {idx+1}')
-            orig_noise = m.get('original_noise_hu', 0)
-            final_noise = m.get('estimated_noise_hu', 0)
-        else:
-            label = 'HN' if idx == 0 else 'LN'
-            tissue_mask = (noisy_np > 0.2) & (noisy_np < 0.8)
-            if tissue_mask.sum() > 100:
-                orig_noise = noisy_np[tissue_mask].std() * 400
-                final_noise = denoised_np[tissue_mask].std() * 400
-            else:
-                orig_noise = final_noise = 0
+        # Calculate noise HU for console logging
+        noisy_hu = compute_noise_hu(
+            noisy[idx:idx+1], hu_window, body_hu_range
+        )
+        denoised_hu = compute_noise_hu(
+            denoised[idx:idx+1], hu_window, body_hu_range
+        )
         
-        label_color = 'red' if label == 'HN' else 'blue'
-        reduction = ((orig_noise - final_noise) / orig_noise * 100) if orig_noise > 0 else 0
+        # Print to console
+        reduction = ((noisy_hu - denoised_hu) / noisy_hu * 100) if noisy_hu > 0 else 0
+        print(f"  [{label}] Original: {noisy_hu:.1f} HU → Denoised: {denoised_hu:.1f} HU ({reduction:.1f}% reduction)")
         
-        # Noisy image
-        axes[idx, 0].imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
-        axes[idx, 0].set_title(f'[{label}] Noisy - {orig_noise:.1f} HU', 
-                               fontsize=13, fontweight='bold', color=label_color)
-        axes[idx, 0].axis('off')
+        # Save origin
+        plt.figure(figsize=(6, 6))
+        plt.imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
+        plt.axis('off')
+        plt.tight_layout(pad=0)
+        origin_path = origin_dir / f"epoch_{epoch}_{label}.png"
+        plt.savefig(origin_path, dpi=150, bbox_inches='tight', pad_inches=0)
+        plt.close()
         
-        # Denoised image
-        axes[idx, 1].imshow(denoised_np, cmap='gray', vmin=0, vmax=1)
-        axes[idx, 1].set_title(f'[{label}] Denoised - {final_noise:.1f} HU ({reduction:.1f}% ↓)', 
-                               fontsize=13, fontweight='bold', color=label_color)
-        axes[idx, 1].axis('off')
-    
-    # Overall title
-    title = f'Epoch {epoch} - Residual Learning Denoising'
-    if metrics and len(metrics) >= 2:
-        hn_noise = metrics[0].get('estimated_noise_hu', 0)
-        ln_noise = metrics[1].get('estimated_noise_hu', 0)
-        if hn_noise > 0 and ln_noise > 0:
-            title += f'\nHN: {hn_noise:.1f} HU | LN: {ln_noise:.1f} HU'
-    
-    plt.suptitle(title, fontsize=15, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+        # Save denoised
+        plt.figure(figsize=(6, 6))
+        plt.imshow(denoised_np, cmap='gray', vmin=0, vmax=1)
+        plt.axis('off')
+        plt.tight_layout(pad=0)
+        denoise_path = denoise_dir / f"epoch_{epoch}_{label}.png"
+        plt.savefig(denoise_path, dpi=150, bbox_inches='tight', pad_inches=0)
+        plt.close()
 
-def cleanup_old_checkpoints(ckpt_dir, keep_last_n=5):
-    """Keep only the last N checkpoints"""
-    checkpoints = sorted(ckpt_dir.glob('model_epoch_*.pth'))
-    
-    if len(checkpoints) > keep_last_n:
-        for old_ckpt in checkpoints[:-keep_last_n]:
-            if 'best' not in old_ckpt.name:
-                old_ckpt.unlink()
 
 class EarlyStopping:
     """Early stopping handler"""
-    def __init__(self, patience=30, min_delta=0.0001):
+    def __init__(self, patience: int = 50, min_delta: float = 0.00003):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
     
-    def __call__(self, val_loss):
+    def __call__(self, val_loss: float) -> bool:
         if self.best_loss is None:
             self.best_loss = val_loss
         elif val_loss > self.best_loss - self.min_delta:
@@ -194,24 +190,4 @@ class EarlyStopping:
         else:
             self.best_loss = val_loss
             self.counter = 0
-        
         return self.early_stop
-
-class WarmupScheduler:
-    """Learning rate warmup"""
-    def __init__(self, optimizer, warmup_epochs, warmup_lr, base_lr):
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.warmup_lr = warmup_lr
-        self.base_lr = base_lr
-        self.current_epoch = 0
-    
-    def step(self):
-        if self.current_epoch < self.warmup_epochs:
-            lr = self.warmup_lr + (self.base_lr - self.warmup_lr) * (self.current_epoch / self.warmup_epochs)
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = lr
-        self.current_epoch += 1
-    
-    def is_warmup(self):
-        return self.current_epoch < self.warmup_epochs
