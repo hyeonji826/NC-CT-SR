@@ -66,8 +66,8 @@ class HighQualityNSN2NLoss(nn.Module):
         x_mid = batch_dict["x_mid"]
         W = batch_dict["W"]
         
-        # ===== 1. RECONSTRUCTION LOSS (Structure preservation) =====
-        loss_rc = F.l1_loss(y_pred * W, x_mid * W)
+        # ===== 1. RECONSTRUCTION LOSS (Supervised: target = clean origin) =====
+        loss_rc = F.l1_loss(y_pred * W, x_i * W)
         
         # ===== 2. STRONG HU PRESERVATION (Prevent darkening!) =====
         body_mask = (x_i > 0.15) & (x_i < 0.85)

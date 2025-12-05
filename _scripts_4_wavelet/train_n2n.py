@@ -241,9 +241,9 @@ def main():
 
     origin_dir = sample_dir / "origin"
     noised_dir = sample_dir / "noised"
-    denoise_dir = sample_dir / "denoise"  # 이 안에 HN / LN 하위 폴더
+    denoise_dir = sample_dir / "denoise"
 
-    for d in [ckpt_dir, log_dir, sample_dir]:
+    for d in [ckpt_dir, log_dir, sample_dir, origin_dir, noised_dir, denoise_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     # Create dataloaders
@@ -381,7 +381,7 @@ def main():
             print(f"  ★ New best model saved! Val Loss: {val_loss:.4f}")
         
         # Save sample images
-        if epoch % config["training"]["sample_interval"] == 0:
+        if epoch == 1 or epoch % config["training"]["sample_interval"] == 0:
             model.eval()
             with torch.no_grad():
                 dataset_full_img = NSN2NDataset(
@@ -409,18 +409,19 @@ def main():
                 for idx in sample_indices[:2]:
                     sample = dataset_full_img[idx]
 
-                    # clean center slice (target)
+                    # Clean center slice (origin)
                     x_clean = sample["x_i"].unsqueeze(0).to(device)          # (1,1,H,W)
 
                     # 5-slice volume with synthetic noise (input)
                     x_5_aug = sample["x_i_aug"].unsqueeze(0).to(device)      # (1,1,5,H,W)
 
-                    # noisy center slice for visualization/HU
-                    x_noisy_center = sample["x_i_aug"][:, 2:3]               # (1,1,H,W)
+                    # Extract noisy center slice for visualization
+                    # x_i_aug shape: (1, 5, H, W) -> center at index 2
+                    x_noisy_center = sample["x_i_aug"][:, 2:3, :, :].to(device)  # (1,1,H,W)
 
                     with autocast('cuda', enabled=config["training"]["use_amp"]):
                         denoised_out, _ = model(x_5_aug)
-                        denoised_out = denoised_out.squeeze(2)
+                        denoised_out = denoised_out.squeeze(2)  # (1,1,H,W)
 
                     origin_list.append(x_clean.cpu())
                     noisy_list.append(x_noisy_center.cpu())
@@ -434,6 +435,7 @@ def main():
                 print(f"\n  Saving samples for epoch {epoch}:")
 
                 if epoch == 1:
+                    print("  → Saving origin & noised reference images (once only):")
                     save_origin_noised_samples(
                         origin=origin_batch,
                         noised=noisy_batch,
@@ -442,11 +444,13 @@ def main():
                         hu_window=tuple(config["preprocessing"]["hu_window"]),
                         body_hu_range=tuple(config["noise_analysis"]["body_hu_range_roi"]),
                     )
+                    print(f"     Saved to: {origin_dir} and {noised_dir}")
 
+                print(f"  → Saving denoised samples for epoch {epoch}:")
                 save_simple_samples(
                     noisy=noisy_batch,
                     denoised=denoised_batch,
-                    origin_dir=origin_dir,   # 이제 안 써도 되지만 시그니처 유지용
+                    origin_dir=origin_dir,
                     denoise_dir=denoise_dir,
                     epoch=epoch,
                     hu_window=tuple(config["preprocessing"]["hu_window"]),
