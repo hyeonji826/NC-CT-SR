@@ -197,13 +197,17 @@ class NSN2NDataset(Dataset):
 
         return (vol5, *arrays)
 
-    def _add_ct_like_noise(self, hu: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _add_ct_like_noise(self, hu: np.ndarray, scale: float = 1.5) -> Tuple[np.ndarray, np.ndarray]:
         """
         실제 NC-CT의 NPS/통계를 흉내내는 synthetic CT-like noise 추가.
         - 중/고주파 correlated Gaussian noise
         - 저주파 shading
         - 수직/수평 streak artifact
 
+        Args:
+            hu: HU 공간의 입력 이미지
+            scale: 노이즈 배율 (1.0 = 원본 수준, 1.5 = 1.5배 noisy)
+        
         입력/출력은 HU 공간.
         """
         hu = hu.astype(np.float32)
@@ -212,13 +216,14 @@ class NSN2NDataset(Dataset):
         body = self._make_body_mask(hu)
         body_vals = hu[body > 0.5]
         if body_vals.size < 100:
-            noise = np.random.normal(0.0, 5.0, size=hu.shape).astype(np.float32)
+            noise = np.random.normal(0.0, 5.0 * scale, size=hu.shape).astype(np.float32)
             return hu + noise, noise
 
         sigma_origin = float(body_vals.std())
 
-        # origin std보다 약간 더 noisy 하게 (도메인 갭 완화용)
-        target_mult = np.random.uniform(1.2, 1.6)
+        # scale 파라미터를 사용하여 노이즈 강도 조절
+        # scale=1.0이면 원본과 비슷한 수준, scale=1.5면 1.5배 noisy
+        target_mult = np.random.uniform(1.2, 1.6) * scale
         target_sigma = sigma_origin * target_mult
 
         # 1) correlated Gaussian noise (중/고주파)
@@ -311,8 +316,9 @@ class NSN2NDataset(Dataset):
         x_mid = self._window_and_normalize(hu_mid)
 
         # synthetic CT-like noise: center slice에만 추가 (입력만 더 noisy)
-        if self.mode == "train" and random.random() < self.noise_aug_ratio:
-            noisy_hu, noise_hu = self._add_ct_like_noise(hu_center)
+        # noise_aug_ratio를 스케일로 사용 (1.0 = 원본과 동일, 1.5 = 1.5배 noisy)
+        if self.mode == "train":
+            noisy_hu, noise_hu = self._add_ct_like_noise(hu_center, scale=self.noise_aug_ratio)
             x_center_noisy = self._window_and_normalize(noisy_hu)
             noise_synthetic = (x_center_noisy - x_center).astype(np.float32)
         else:

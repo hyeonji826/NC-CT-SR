@@ -41,34 +41,57 @@ def set_seed(seed: int):
 
 
 def create_dataloaders(config: dict):
-    """Create train and validation dataloaders"""
-    dataset_full = NSN2NDataset(
-        nc_ct_dir=config["data"]["nc_ct_dir"],
-        hu_window=tuple(config["preprocessing"]["hu_window"]),
-        patch_size=config["preprocessing"]["patch_size"],
-        min_body_fraction=config["preprocessing"]["min_body_fraction"],
-        lpf_sigma=config["dataset"]["lpf_sigma"],
-        lpf_median_size=config["dataset"]["lpf_median_size"],
-        match_threshold=config["preprocessing"]["match_threshold"],
-        noise_aug_ratio=config["dataset"]["noise_aug_ratio"],
-        body_hu_range=tuple(config["dataset"]["body_hu_range"]),
-        noise_roi_margin_ratio=config["dataset"]["noise_roi_margin_ratio"],
-        noise_tissue_range=tuple(config["dataset"]["noise_tissue_range"]),
-        noise_default_std=config["dataset"]["noise_default_std"],
-        mode="train",
+    """Create train and validation dataloaders with separate datasets"""
+    
+    # 공통 파라미터
+    common_params = {
+        "nc_ct_dir": config["data"]["nc_ct_dir"],
+        "hu_window": tuple(config["preprocessing"]["hu_window"]),
+        "patch_size": config["preprocessing"]["patch_size"],
+        "min_body_fraction": config["preprocessing"]["min_body_fraction"],
+        "lpf_sigma": config["dataset"]["lpf_sigma"],
+        "lpf_median_size": config["dataset"]["lpf_median_size"],
+        "match_threshold": config["preprocessing"]["match_threshold"],
+        "noise_aug_ratio": config["dataset"]["noise_aug_ratio"],
+        "body_hu_range": tuple(config["dataset"]["body_hu_range"]),
+        "noise_roi_margin_ratio": config["dataset"]["noise_roi_margin_ratio"],
+        "noise_tissue_range": tuple(config["dataset"]["noise_tissue_range"]),
+        "noise_default_std": config["dataset"]["noise_default_std"],
+    }
+    
+    # 1. Train Dataset: augmentation ON, synthetic noise ON
+    train_dataset = NSN2NDataset(
+        **common_params,
+        mode="train",  # flip augmentation + synthetic noise
     )
     
-    # Split dataset
-    total_size = len(dataset_full)
-    val_size = int(total_size * config["training"]["val_split"])
-    train_size = total_size - val_size
-    
-    train_dataset, val_dataset = random_split(
-        dataset_full,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(config["training"]["seed"])
+    # 2. Validation Dataset: augmentation OFF, clean evaluation
+    val_dataset = NSN2NDataset(
+        **common_params,
+        mode="val",  # no flip, no synthetic noise
     )
     
+    # 파일 단위로 train/val 분할
+    total_pairs = len(train_dataset.pairs)
+    val_size = int(total_pairs * config["training"]["val_split"])
+    
+    # Seed 기반 셔플
+    indices = list(range(total_pairs))
+    random.seed(config["training"]["seed"])
+    random.shuffle(indices)
+    
+    # 인덱스 분할
+    val_indices = indices[:val_size]
+    train_indices = indices[val_size:]
+    
+    # Pairs 재할당
+    original_pairs = train_dataset.pairs.copy()
+    train_dataset.pairs = [original_pairs[i] for i in train_indices]
+    val_dataset.pairs = [original_pairs[i] for i in val_indices]
+    
+    print(f"[DATA] Train pairs: {len(train_dataset.pairs)}, Val pairs: {len(val_dataset.pairs)}")
+    
+    # DataLoaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["training"]["batch_size"],
