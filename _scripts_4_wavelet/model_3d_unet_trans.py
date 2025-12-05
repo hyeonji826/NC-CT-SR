@@ -262,7 +262,7 @@ class UNet3DTransformer(nn.Module):
         
         # Predict NOISE map with limited range
         noise_map = self.out_conv(d1)  # (B, 1, D, H, W)
-        noise_map = self.out_activation(noise_map) * 0.3  # Scale to [-0.3, 0.3]
+        noise_map = self.out_activation(noise_map) * 0.15  # Reduced from 0.3
         
         # Extract center slice from noise and input
         D_dim = noise_map.shape[2]

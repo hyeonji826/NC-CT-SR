@@ -12,6 +12,23 @@ from typing import Tuple
 
 
 # -------------------------------------------------------------------------
+# HU conversion and windowing
+# -------------------------------------------------------------------------
+
+def denormalize_to_hu(x_norm: np.ndarray, hu_min: float = -160, hu_max: float = 240) -> np.ndarray:
+    """Convert normalized [0,1] to HU range"""
+    return x_norm * (hu_max - hu_min) + hu_min
+
+
+def apply_window(hu_img: np.ndarray, wl: float = 40, ww: float = 400) -> np.ndarray:
+    """Apply CT windowing for visualization"""
+    lo = wl - ww // 2
+    hi = wl + ww // 2
+    hu_img_clip = np.clip(hu_img, lo, hi)
+    return (hu_img_clip - lo) / (hi - lo)
+
+
+# -------------------------------------------------------------------------
 # Config / checkpoint
 # -------------------------------------------------------------------------
 
@@ -61,45 +78,43 @@ def compute_noise_hu(
     body_hu_range: Tuple[float, float],
     roi_h: float = 0.6,
     roi_w: float = 0.6,
-    use_highpass: bool = False,
+    use_highpass: bool = True,
     debug: bool = False,
 ) -> float:
     hu_min, hu_max = hu_window
     arr = x_01[0, 0].detach().cpu().numpy()
     H, W = arr.shape
 
-    # 중앙 ROI
+    # Center ROI
     h_margin = int(H * (1.0 - roi_h) / 2.0)
     w_margin = int(W * (1.0 - roi_w) / 2.0)
     roi = arr[h_margin : H - h_margin, w_margin : W - w_margin]
 
-    # Normalized 공간에서 body mask (air/background 제외)
+    # Body mask
     body_mask_norm = (roi > 0.15) & (roi < 0.85)
     if body_mask_norm.sum() < 100:
         return 0.0
 
-    # body 영역만 HU로 변환
+    # Convert to HU
     roi_hu = roi * (hu_max - hu_min) + hu_min
 
-    # Raw std (의미 해석이 제일 쉬움)
-    raw_std_hu = float(roi_hu[body_mask_norm].std())
-
     if use_highpass:
+        # High-pass filtering to measure only noise
         lp = gaussian_filter(roi_hu, sigma=1.0)
         hp = roi_hu - lp
-        hp_std_hu = float(hp[body_mask_norm].std())
-        noise_std_hu = hp_std_hu
-
+        noise_std_hu = float(hp[body_mask_norm].std())
+        
         if debug:
-            ratio = hp_std_hu / raw_std_hu if raw_std_hu > 0 else 0.0
+            raw_std_hu = float(roi_hu[body_mask_norm].std())
+            ratio = noise_std_hu / raw_std_hu if raw_std_hu > 0 else 0.0
             print(
                 f"    [DEBUG] Raw std: {raw_std_hu:.1f} HU | "
-                f"HP std: {hp_std_hu:.1f} HU | Ratio: {ratio:.2%}"
+                f"HP std: {noise_std_hu:.1f} HU | Ratio: {ratio:.2%}"
             )
     else:
-        noise_std_hu = raw_std_hu
+        noise_std_hu = float(roi_hu[body_mask_norm].std())
         if debug:
-            print(f"    [DEBUG] Raw std: {raw_std_hu:.1f} HU (no HP filtering)")
+            print(f"    [DEBUG] Raw std: {noise_std_hu:.1f} HU (no HP filtering)")
 
     return noise_std_hu
 
@@ -123,54 +138,64 @@ def save_simple_samples(
     for idx in range(min(2, noisy.shape[0])):
         label = labels[idx]
 
-        noisy_np = noisy[idx, 0].cpu().numpy()
-        denoised_np = denoised[idx, 0].detach().cpu().numpy()
+        # Normalized arrays
+        noisy_norm = noisy[idx, 0].cpu().numpy()
+        denoised_norm = denoised[idx, 0].detach().cpu().numpy()
 
-        # 보기 좋게 회전
-        noisy_np = np.rot90(noisy_np, k=1)
-        denoised_np = np.rot90(denoised_np, k=1)
+        # Convert to HU
+        hu_min, hu_max = hu_window
+        noisy_hu = denormalize_to_hu(noisy_norm, hu_min, hu_max)
+        denoised_hu = denormalize_to_hu(denoised_norm, hu_min, hu_max)
 
-        # HU 기반 noise 계산
-        noisy_hu = compute_noise_hu(
+        # Apply windowing for visualization
+        noisy_win = apply_window(noisy_hu, wl=40, ww=400)
+        denoised_win = apply_window(denoised_hu, wl=40, ww=400)
+
+        # Rotate for display
+        noisy_win = np.rot90(noisy_win, k=1)
+        denoised_win = np.rot90(denoised_win, k=1)
+
+        # Compute noise (high-pass)
+        noisy_hu_std = compute_noise_hu(
             noisy[idx : idx + 1],
             hu_window,
             body_hu_range,
-            use_highpass=False,
-            debug=True,
+            use_highpass=True,
+            debug=False,
         )
-        denoised_hu = compute_noise_hu(
+        denoised_hu_std = compute_noise_hu(
             denoised[idx : idx + 1],
             hu_window,
             body_hu_range,
-            use_highpass=False,
-            debug=True,
+            use_highpass=True,
+            debug=False,
         )
 
         reduction = (
-            (noisy_hu - denoised_hu) / noisy_hu * 100 if noisy_hu > 0 else 0.0
+            (noisy_hu_std - denoised_hu_std) / noisy_hu_std * 100 if noisy_hu_std > 0 else 0.0
         )
         print(
-            f"  [{label}] Original: {noisy_hu:.1f} HU → "
-            f"Denoised: {denoised_hu:.1f} HU "
-            f"({reduction:.1f}% reduction) | Shape: {noisy_np.shape}"
+            f"  [{label}] Noisy: {noisy_hu_std:.1f} HU → "
+            f"Denoised: {denoised_hu_std:.1f} HU "
+            f"({reduction:.1f}% reduction)"
         )
 
-        # figure 크기
-        h, w = noisy_np.shape
+        # Figure size
+        h, w = noisy_win.shape
         aspect_ratio = w / h
         fig_height = 8
         fig_width = fig_height * aspect_ratio
 
-        # 라벨별 하위 폴더 (HN / LN)
+        # Save by label
         label_dir = denoise_dir / label
         label_dir.mkdir(parents=True, exist_ok=True)
 
-        # denoised 이미지만 저장 (epoch별)
+        # Save denoised image
         fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-        ax.imshow(denoised_np, cmap="gray", vmin=0, vmax=1)
+        ax.imshow(denoised_win, cmap="gray", vmin=0, vmax=1)
         ax.axis("off")
         ax.set_title(
-            f"{label} Denoised - {denoised_hu:.1f} HU ({reduction:.1f}% ↓)",
+            f"{label} Denoised - {denoised_hu_std:.1f} HU ({reduction:.1f}% ↓)",
             fontsize=14,
             pad=10,
         )
@@ -181,24 +206,14 @@ def save_simple_samples(
 
 
 def save_origin_noised_samples(
-    origin: torch.Tensor,      # (B,1,H,W) clean (NC)
-    noised: torch.Tensor,      # (B,1,H,W) synthetic LD
+    origin: torch.Tensor,
+    noised: torch.Tensor,
     origin_dir: Path,
     noised_dir: Path,
     hu_window: Tuple[float, float],
     body_hu_range: Tuple[float, float],
 ):
-    """
-    Origin(깨끗한 NC)과 synthetic noised 이미지를 한 번만 저장하는 함수.
-
-    Folder 구조:
-        origin/
-          HN.png
-          LN.png
-        noised/
-          HN.png
-          LN.png
-    """
+    """Save origin (clean NC) and synthetic noised images once"""
     origin_dir.mkdir(parents=True, exist_ok=True)
     noised_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,45 +221,60 @@ def save_origin_noised_samples(
     for idx in range(min(2, origin.shape[0])):
         label = labels[idx]
 
-        origin_np = np.rot90(origin[idx, 0].cpu().numpy(), k=1)
-        noised_np = np.rot90(noised[idx, 0].cpu().numpy(), k=1)
+        # Normalized arrays
+        origin_norm = origin[idx, 0].cpu().numpy()
+        noised_norm = noised[idx, 0].cpu().numpy()
 
-        origin_hu = compute_noise_hu(
+        # Convert to HU
+        hu_min, hu_max = hu_window
+        origin_hu_img = denormalize_to_hu(origin_norm, hu_min, hu_max)
+        noised_hu_img = denormalize_to_hu(noised_norm, hu_min, hu_max)
+
+        # Apply windowing
+        origin_win = apply_window(origin_hu_img, wl=40, ww=400)
+        noised_win = apply_window(noised_hu_img, wl=40, ww=400)
+
+        # Rotate
+        origin_win = np.rot90(origin_win, k=1)
+        noised_win = np.rot90(noised_win, k=1)
+
+        # Compute noise
+        origin_hu_std = compute_noise_hu(
             origin[idx : idx + 1],
             hu_window,
             body_hu_range,
-            use_highpass=False,
-            debug=True,
+            use_highpass=True,
+            debug=False,
         )
-        noised_hu = compute_noise_hu(
+        noised_hu_std = compute_noise_hu(
             noised[idx : idx + 1],
             hu_window,
             body_hu_range,
-            use_highpass=False,
-            debug=True,
+            use_highpass=True,
+            debug=False,
         )
 
-        print(f"  [{label}] Clean: {origin_hu:.1f} HU → Noised: {noised_hu:.1f} HU")
+        print(f"  [{label}] Origin: {origin_hu_std:.1f} HU → Noised: {noised_hu_std:.1f} HU")
 
-        h, w = origin_np.shape
+        h, w = origin_win.shape
         aspect = w / h
         fig_height = 8
         fig_width = fig_height * aspect
 
-        # origin
+        # Save origin
         fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-        ax.imshow(origin_np, cmap="gray", vmin=0, vmax=1)
+        ax.imshow(origin_win, cmap="gray", vmin=0, vmax=1)
         ax.axis("off")
-        ax.set_title(f"{label} Origin - {origin_hu:.1f} HU", fontsize=14, pad=10)
+        ax.set_title(f"{label} Origin - {origin_hu_std:.1f} HU", fontsize=14, pad=10)
         plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
         plt.savefig(origin_dir / f"{label}.png", dpi=150, bbox_inches="tight")
         plt.close()
 
-        # noised
+        # Save noised
         fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-        ax.imshow(noised_np, cmap="gray", vmin=0, vmax=1)
+        ax.imshow(noised_win, cmap="gray", vmin=0, vmax=1)
         ax.axis("off")
-        ax.set_title(f"{label} Noised - {noised_hu:.1f} HU", fontsize=14, pad=10)
+        ax.set_title(f"{label} Noised - {noised_hu_std:.1f} HU", fontsize=14, pad=10)
         plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
         plt.savefig(noised_dir / f"{label}.png", dpi=150, bbox_inches="tight")
         plt.close()
