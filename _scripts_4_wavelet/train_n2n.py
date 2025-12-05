@@ -294,10 +294,13 @@ def main():
         lambda_hf_noise=config["loss"]["lambda_hf_noise"],
         lambda_syn=config["loss"]["lambda_syn"],
         lambda_ic=config["loss"]["lambda_ic"],
+        lambda_mid_noise=config["loss"]["lambda_mid_noise"],
+        lambda_lf_artifact=config["loss"]["lambda_lf_artifact"],
         min_body_pixels=config["loss"]["min_body_pixels"],
         artifact_grad_factor=config["loss"]["artifact_grad_factor"],
         flat_threshold=config["loss"]["flat_threshold"],
     ).to(device)
+
     
     # Save base lambdas (for potential future adjustments)
     base_lambda_rc = criterion.lambda_rc

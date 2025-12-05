@@ -11,28 +11,21 @@ import torch.nn.functional as F
 
 
 class HighQualityNSN2NLoss(nn.Module):
-    """
-    Loss designed to remove ACTUAL noise patterns, not just reduce std
-    
-    Problem: Global std reduction can be achieved by:
-      - A. Removing noise (correct) ✓
-      - B. Darkening entire image (wrong) ✗
-    
-    Solution: Target high-frequency components in flat regions only
-    """
-    
     def __init__(
         self,
         lambda_rc: float = 2.0,
         lambda_hu: float = 1.5,
         lambda_edge: float = 1.0,
         lambda_texture: float = 0.8,
-        lambda_hf_noise: float = 0.3,
-        lambda_syn: float = 1.0,          # NEW: Synthetic noise supervision
-        lambda_ic: float = 0.1,
-        min_body_pixels: int = 512,
-        artifact_grad_factor: float = 1.9,
-        flat_threshold: float = 0.15,
+        lambda_hf_noise: float = 1.5,
+        lambda_syn: float = 1.0,
+        lambda_ic: float = 0.8,
+        # ★ 추가: 중주파 / 저주파 가중치
+        lambda_mid_noise: float = 0.8,
+        lambda_lf_artifact: float = 0.6,
+        min_body_pixels: int = 4096,
+        artifact_grad_factor: float = 2.0,
+        flat_threshold: float = 0.03,
     ):
         super().__init__()
         self.lambda_rc = lambda_rc
@@ -42,10 +35,14 @@ class HighQualityNSN2NLoss(nn.Module):
         self.lambda_hf_noise = lambda_hf_noise
         self.lambda_syn = lambda_syn
         self.lambda_ic = lambda_ic
-        
+        # ★ 추가
+        self.lambda_mid_noise = lambda_mid_noise
+        self.lambda_lf_artifact = lambda_lf_artifact
+
         self.min_body_pixels = min_body_pixels
         self.artifact_grad_factor = artifact_grad_factor
         self.flat_threshold = flat_threshold
+
     
     def forward(self, y_pred, noise_pred, batch_dict):
         """
@@ -107,15 +104,42 @@ class HighQualityNSN2NLoss(nn.Module):
             loss_texture = F.l1_loss(grad_mag_pred[texture_mask], grad_mag_input[texture_mask])
         else:
             loss_texture = torch.tensor(0.0, device=y_pred.device)
+
+        # ===== 4.5 MULTI-BAND NOISE / ARTIFACT REDUCTION =====
+        # flat + body 영역에서 저주파 shading, 중주파 banding 까지 제어
+        flat_mask = (grad_mag_input < self.flat_threshold)
+        flat_body_mask = flat_mask & body_mask
+
+        if flat_body_mask.sum() > 100:
+            # --- Low-frequency (shading) component ---
+            low_sigma = 3.0
+            low_input = self._gaussian_blur(x_i, low_sigma)
+            low_pred  = self._gaussian_blur(y_pred, low_sigma)
+            low_mid   = self._gaussian_blur(x_mid, low_sigma)  # neighbor 평균
+
+            # 이웃(slice 평균)과의 저주파 차이가 줄어들도록 (banding/shading 완화)
+            lf_input = (low_input - low_mid)[flat_body_mask]
+            lf_pred  = (low_pred  - low_mid)[flat_body_mask]
+            loss_lf_artifact = F.l1_loss(lf_pred, lf_input * 0.3)  # 30%로 줄이기
+
+            # --- Mid-frequency (banding) component ---
+            mid_sigma = 1.0
+            mid_input = self._gaussian_blur(x_i, mid_sigma) - low_input
+            mid_pred  = self._gaussian_blur(y_pred, mid_sigma) - low_pred
+
+            mid_input_abs = torch.abs(mid_input[flat_body_mask])
+            mid_pred_abs  = torch.abs(mid_pred[flat_body_mask])
+            target_mid = 0.3 * mid_input_abs  # mid-band 도 30% 수준으로
+            loss_mid_noise = F.l1_loss(mid_pred_abs, target_mid)
+        else:
+            loss_lf_artifact = torch.tensor(0.0, device=y_pred.device)
+            loss_mid_noise   = torch.tensor(0.0, device=y_pred.device)
         
         # ===== 5. HIGH-FREQ NOISE REMOVAL (Target ACTUAL noise) =====
         # Use Laplacian (2nd derivative) to detect high-frequency components
         lap_input = self._laplacian(x_i)
         lap_pred = self._laplacian(y_pred)
-        
-        # Flat regions = where noise dominates (not structure)
-        flat_mask = (grad_mag_input < self.flat_threshold)
-        
+
         if flat_mask.sum() > 100:
             # In flat regions: actively reduce high-freq (noise)
             lap_input_abs = torch.abs(lap_input[flat_mask])
@@ -151,14 +175,17 @@ class HighQualityNSN2NLoss(nn.Module):
         
         # ===== TOTAL LOSS =====
         total_loss = (
-            self.lambda_rc * loss_rc +
-            self.lambda_hu * loss_hu +
-            self.lambda_edge * loss_edge +
-            self.lambda_texture * loss_texture +
-            self.lambda_hf_noise * loss_hf_noise +
-            self.lambda_syn * loss_syn +
-            self.lambda_ic * loss_ic
+            self.lambda_rc * loss_rc
+            + self.lambda_hu * loss_hu
+            + self.lambda_edge * loss_edge
+            + self.lambda_texture * loss_texture
+            + self.lambda_hf_noise * loss_hf_noise
+            + self.lambda_mid_noise * loss_mid_noise
+            + self.lambda_lf_artifact * loss_lf_artifact
+            + self.lambda_syn * loss_syn
+            + self.lambda_ic * loss_ic
         )
+
         
         loss_dict = {
             "total": total_loss.item(),
@@ -167,6 +194,8 @@ class HighQualityNSN2NLoss(nn.Module):
             "edge": loss_edge.item(),
             "texture": loss_texture.item() if isinstance(loss_texture, torch.Tensor) else 0.0,
             "hf_noise": loss_hf_noise.item() if isinstance(loss_hf_noise, torch.Tensor) else 0.0,
+            "mid_noise": loss_mid_noise.item() if isinstance(loss_mid_noise, torch.Tensor) else 0.0,
+            "lf_artifact": loss_lf_artifact.item() if isinstance(loss_lf_artifact, torch.Tensor) else 0.0,
             "syn": loss_syn.item() if isinstance(loss_syn, torch.Tensor) else 0.0,
             "ic": loss_ic.item() if isinstance(loss_ic, torch.Tensor) else 0.0,
         }
@@ -190,3 +219,19 @@ class HighQualityNSN2NLoss(nn.Module):
         kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], 
                               dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
         return F.conv2d(x, kernel, padding=1)
+
+    def _gaussian_blur(self, x, sigma: float):
+        """
+        Simple 2D Gaussian blur using depthwise conv2d.
+        x: (B,1,H,W)
+        """
+        # kernel size ≈ 6*sigma+1
+        k = int(6 * sigma + 1)
+        if k % 2 == 0:
+            k += 1
+        coords = torch.arange(k, dtype=x.dtype, device=x.device) - k // 2
+        gauss_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        kernel_2d = gauss_1d[:, None] * gauss_1d[None, :]
+        kernel_2d = kernel_2d.view(1, 1, k, k)
+        return F.conv2d(x, kernel_2d, padding=k // 2)

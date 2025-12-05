@@ -257,11 +257,11 @@ class NSN2NDataset(Dataset):
 
         if sigma_raw > 0.0 and target_sigma > sigma_origin:
             desired_increase = target_sigma - sigma_origin
-            scale = desired_increase / sigma_raw
+            scale_factor = desired_increase / sigma_raw
         else:
-            scale = 0.0
+            scale_factor = 0.0
 
-        noise = noise_raw * scale
+        noise = noise_raw * scale_factor
         noisy_hu = hu + noise
 
         return noisy_hu.astype(np.float32), noise.astype(np.float32)
