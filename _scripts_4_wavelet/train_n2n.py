@@ -27,6 +27,7 @@ from utils import (
     save_checkpoint,
     load_checkpoint,
     save_simple_samples,
+    save_origin_noised_samples,
     EarlyStopping,
 )
 
@@ -96,7 +97,7 @@ def train_epoch(
     total_loss = 0.0
     loss_components = {
         'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
-        'texture': 0.0, 'hf_noise': 0.0, 'ic': 0.0
+        'texture': 0.0, 'hf_noise': 0.0, 'syn': 0.0, 'ic': 0.0
     }
     
     for batch_idx, batch in enumerate(train_loader):
@@ -111,8 +112,7 @@ def train_epoch(
         
         # Forward pass with AMP
         with autocast('cuda', enabled=use_amp):
-            # Model already outputs denoised image (residual learning inside model)
-            denoised = model(x_i_aug)  # (B, 1, 1, H, W)
+            denoised, noise_pred = model(x_i_aug)
             
             # Prepare batch dict for loss
             batch_dict = {
@@ -124,7 +124,7 @@ def train_epoch(
             }
             
             # Calculate loss
-            loss, loss_dict = criterion(denoised, batch_dict)
+            loss, loss_dict = criterion(denoised, noise_pred, batch_dict)
         
         # Backward pass
         scaler.scale(loss).backward()
@@ -153,7 +153,7 @@ def validate(model, val_loader, criterion, device, use_amp):
     total_loss = 0.0
     loss_components = {
         'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
-        'texture': 0.0, 'hf_noise': 0.0, 'ic': 0.0
+        'texture': 0.0, 'hf_noise': 0.0, 'syn': 0.0, 'ic': 0.0
     }
     
     with torch.no_grad():
@@ -166,7 +166,7 @@ def validate(model, val_loader, criterion, device, use_amp):
             noise_synthetic = batch["noise_synthetic"].to(device)
             
             with autocast('cuda', enabled=use_amp):
-                denoised = model(x_i_aug)
+                denoised, noise_pred = model(x_i_aug)
                 
                 batch_dict = {
                     "x_i": x_i,
@@ -176,7 +176,7 @@ def validate(model, val_loader, criterion, device, use_amp):
                     "noise_synthetic": noise_synthetic,
                 }
                 
-                loss, loss_dict = criterion(denoised, batch_dict)
+                loss, loss_dict = criterion(denoised, noise_pred, batch_dict)
             
             total_loss += loss.item()
             for key in loss_components:
@@ -234,16 +234,18 @@ def main():
     print(f"Device: {device}")
     
     # Create output directories
-    exp_dir = Path(config["data"]["output_dir"]) / config["training"]["exp_name"]
-    ckpt_dir = exp_dir / "checkpoints"
-    log_dir = exp_dir / "logs"
+    exp_dir   = Path(config["data"]["output_dir"]) / config["training"]["exp_name"]
+    ckpt_dir  = exp_dir / "checkpoints"
+    log_dir   = exp_dir / "logs"
     sample_dir = exp_dir / "samples"
+
     origin_dir = sample_dir / "origin"
-    denoise_dir = sample_dir / "denoise"
-    
-    for d in [ckpt_dir, log_dir, origin_dir, denoise_dir]:
+    noised_dir = sample_dir / "noised"
+    denoise_dir = sample_dir / "denoise"  # 이 안에 HN / LN 하위 폴더
+
+    for d in [ckpt_dir, log_dir, sample_dir]:
         d.mkdir(parents=True, exist_ok=True)
-    
+
     # Create dataloaders
     print("\nCreating dataloaders...")
     train_loader, val_loader = create_dataloaders(config)
@@ -267,6 +269,7 @@ def main():
         lambda_edge=config["loss"]["lambda_edge"],
         lambda_texture=config["loss"]["lambda_texture"],
         lambda_hf_noise=config["loss"]["lambda_hf_noise"],
+        lambda_syn=config["loss"]["lambda_syn"],
         lambda_ic=config["loss"]["lambda_ic"],
         min_body_pixels=config["loss"]["min_body_pixels"],
         artifact_grad_factor=config["loss"]["artifact_grad_factor"],
@@ -381,56 +384,75 @@ def main():
         if epoch % config["training"]["sample_interval"] == 0:
             model.eval()
             with torch.no_grad():
-                # Create temporary dataset without cropping for full image visualization
                 dataset_full_img = NSN2NDataset(
                     nc_ct_dir=config["data"]["nc_ct_dir"],
                     hu_window=tuple(config["preprocessing"]["hu_window"]),
-                    patch_size=0,  # No cropping for visualization
+                    patch_size=0,  # 풀슬라이스
                     min_body_fraction=config["preprocessing"]["min_body_fraction"],
                     lpf_sigma=config["dataset"]["lpf_sigma"],
                     lpf_median_size=config["dataset"]["lpf_median_size"],
                     match_threshold=config["preprocessing"]["match_threshold"],
-                    noise_aug_ratio=0.0,  # No noise augmentation for clean visualization
+                    noise_aug_ratio=config["dataset"]["noise_aug_ratio"],  # ★ 훈련이랑 동일 gain
                     body_hu_range=tuple(config["dataset"]["body_hu_range"]),
                     noise_roi_margin_ratio=config["dataset"]["noise_roi_margin_ratio"],
                     noise_tissue_range=tuple(config["dataset"]["noise_tissue_range"]),
                     noise_default_std=config["dataset"]["noise_default_std"],
-                    mode="val",
+                    mode="train",   # ★ train 모드 → synthetic noise 들어감
                 )
                 
-                # Get first 2 samples (HN and LN typically)
-                sample_indices = [0, len(dataset_full_img) // 2]  # First and middle samples
-                
+                sample_indices = [0, len(dataset_full_img) // 2]
+
+                origin_list = []
                 noisy_list = []
                 denoised_list = []
-                
-                for idx in sample_indices[:2]:  # Only first 2
+
+                for idx in sample_indices[:2]:
                     sample = dataset_full_img[idx]
-                    x_i = sample["x_i"].unsqueeze(0).to(device)
-                    x_i_aug = sample["x_i_aug"].unsqueeze(0).to(device)
-                    
+
+                    # clean center slice (target)
+                    x_clean = sample["x_i"].unsqueeze(0).to(device)          # (1,1,H,W)
+
+                    # 5-slice volume with synthetic noise (input)
+                    x_5_aug = sample["x_i_aug"].unsqueeze(0).to(device)      # (1,1,5,H,W)
+
+                    # noisy center slice for visualization/HU
+                    x_noisy_center = sample["x_i_aug"][:, 2:3]               # (1,1,H,W)
+
                     with autocast('cuda', enabled=config["training"]["use_amp"]):
-                        denoised_out = model(x_i_aug).squeeze(2)  # (1, 1, H, W)
-                    
-                    noisy_list.append(x_i.cpu())
+                        denoised_out, _ = model(x_5_aug)
+                        denoised_out = denoised_out.squeeze(2)
+
+                    origin_list.append(x_clean.cpu())
+                    noisy_list.append(x_noisy_center.cpu())
                     denoised_list.append(denoised_out.cpu())
+
+                origin_batch = torch.cat(origin_list, dim=0)     # (2,1,H,W)
+                noisy_batch = torch.cat(noisy_list, dim=0)       # (2,1,H,W)
+                denoised_batch = torch.cat(denoised_list, dim=0) # (2,1,H,W)
+
                 
-                # Stack into batch format
-                noisy_batch = torch.cat(noisy_list, dim=0)
-                denoised_batch = torch.cat(denoised_list, dim=0)
-                
-                # Save samples
                 print(f"\n  Saving samples for epoch {epoch}:")
+
+                if epoch == 1:
+                    save_origin_noised_samples(
+                        origin=origin_batch,
+                        noised=noisy_batch,
+                        origin_dir=origin_dir,
+                        noised_dir=noised_dir,
+                        hu_window=tuple(config["preprocessing"]["hu_window"]),
+                        body_hu_range=tuple(config["noise_analysis"]["body_hu_range_roi"]),
+                    )
+
                 save_simple_samples(
                     noisy=noisy_batch,
                     denoised=denoised_batch,
-                    origin_dir=origin_dir,
+                    origin_dir=origin_dir,   # 이제 안 써도 되지만 시그니처 유지용
                     denoise_dir=denoise_dir,
                     epoch=epoch,
                     hu_window=tuple(config["preprocessing"]["hu_window"]),
                     body_hu_range=tuple(config["noise_analysis"]["body_hu_range_roi"]),
                 )
-                print()
+
         
         # Early stopping check
         if early_stopping(val_loss):

@@ -24,10 +24,11 @@ class HighQualityNSN2NLoss(nn.Module):
     def __init__(
         self,
         lambda_rc: float = 2.0,
-        lambda_hu: float = 1.5,          # STRONGER: Prevent darkening
-        lambda_edge: float = 1.0,         # STRONGER: Preserve structure
-        lambda_texture: float = 0.8,      # NEW: Preserve fine structure
-        lambda_hf_noise: float = 0.3,     # NEW: Target high-freq noise
+        lambda_hu: float = 1.5,
+        lambda_edge: float = 1.0,
+        lambda_texture: float = 0.8,
+        lambda_hf_noise: float = 0.3,
+        lambda_syn: float = 1.0,          # NEW: Synthetic noise supervision
         lambda_ic: float = 0.1,
         min_body_pixels: int = 512,
         artifact_grad_factor: float = 1.9,
@@ -39,23 +40,26 @@ class HighQualityNSN2NLoss(nn.Module):
         self.lambda_edge = lambda_edge
         self.lambda_texture = lambda_texture
         self.lambda_hf_noise = lambda_hf_noise
+        self.lambda_syn = lambda_syn
         self.lambda_ic = lambda_ic
         
         self.min_body_pixels = min_body_pixels
         self.artifact_grad_factor = artifact_grad_factor
         self.flat_threshold = flat_threshold
     
-    def forward(self, y_pred, batch_dict):
+    def forward(self, y_pred, noise_pred, batch_dict):
         """
         Args:
-            y_pred: (B, 1, 1, H, W) - denoised output from model
+            y_pred: (B, 1, 1, H, W) - denoised output
+            noise_pred: (B, 1, 1, H, W) - predicted noise
             batch_dict: Dictionary containing x_i, x_ip1, x_mid, W, noise_synthetic
         
         Returns:
             total_loss, loss_dict
         """
-        # Squeeze depth dimension from y_pred: (B, 1, 1, H, W) -> (B, 1, H, W)
+        # Squeeze depth dimension
         y_pred = y_pred.squeeze(2)
+        noise_pred = noise_pred.squeeze(2)
         
         x_i = batch_dict["x_i"]
         x_ip1 = batch_dict["x_ip1"]
@@ -124,7 +128,17 @@ class HighQualityNSN2NLoss(nn.Module):
         else:
             loss_hf_noise = torch.tensor(0.0, device=y_pred.device)
         
-        # ===== 6. ARTIFACT SUPPRESSION LOSS =====
+        # ===== 6. SYNTHETIC NOISE SUPERVISION =====
+        noise_synthetic = batch_dict["noise_synthetic"]
+        flat_body_mask = flat_mask & body_mask
+        
+        if flat_body_mask.sum() > 100:
+            # Direct supervision: predicted noise should match synthetic noise
+            loss_syn = F.l1_loss(noise_pred[flat_body_mask], noise_synthetic[flat_body_mask])
+        else:
+            loss_syn = torch.tensor(0.0, device=y_pred.device)
+        
+        # ===== 7. ARTIFACT SUPPRESSION LOSS =====
         if flat_mask.sum() > 100:
             # Penalize strong gradients where input is flat
             artifact_penalty = torch.clamp(
@@ -142,6 +156,7 @@ class HighQualityNSN2NLoss(nn.Module):
             self.lambda_edge * loss_edge +
             self.lambda_texture * loss_texture +
             self.lambda_hf_noise * loss_hf_noise +
+            self.lambda_syn * loss_syn +
             self.lambda_ic * loss_ic
         )
         
@@ -152,6 +167,7 @@ class HighQualityNSN2NLoss(nn.Module):
             "edge": loss_edge.item(),
             "texture": loss_texture.item() if isinstance(loss_texture, torch.Tensor) else 0.0,
             "hf_noise": loss_hf_noise.item() if isinstance(loss_hf_noise, torch.Tensor) else 0.0,
+            "syn": loss_syn.item() if isinstance(loss_syn, torch.Tensor) else 0.0,
             "ic": loss_ic.item() if isinstance(loss_ic, torch.Tensor) else 0.0,
         }
         

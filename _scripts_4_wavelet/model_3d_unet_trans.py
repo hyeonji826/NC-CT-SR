@@ -235,7 +235,8 @@ class UNet3DTransformer(nn.Module):
         Args:
             x: (B, 1, D, H, W) where D=5
         Returns:
-            denoised: (B, 1, 1, H, W) - Input center - predicted noise
+            denoised: (B, 1, 1, H, W)
+            noise_center: (B, 1, 1, H, W) - Predicted noise for supervision
         """
         # Encoder
         e1 = self.enc1(x)           # (B, 32, D, H, W)
@@ -273,7 +274,7 @@ class UNet3DTransformer(nn.Module):
         denoised = input_center - noise_center
         denoised = torch.clamp(denoised, 0.0, 1.0)
         
-        return denoised
+        return denoised, noise_center
 
 
 def count_parameters(model: nn.Module) -> int:

@@ -11,40 +11,49 @@ import matplotlib.pyplot as plt
 from typing import Tuple
 
 
+# -------------------------------------------------------------------------
+# Config / checkpoint
+# -------------------------------------------------------------------------
+
 def load_config(config_path: str) -> dict:
-    """Load YAML configuration file"""
-    with open(config_path, 'r', encoding='utf-8') as f:
+    """Load YAML configuration file."""
+    with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path):
-    """Save training checkpoint"""
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path: Path):
+    """Save training checkpoint."""
     checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'loss': loss,
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+        "loss": loss,
     }
     torch.save(checkpoint, save_path)
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None):
-    """Load checkpoint"""
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    if optimizer and 'optimizer_state_dict' in checkpoint:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    epoch = checkpoint.get('epoch', 0)
-    loss = checkpoint.get('loss', float('inf'))
+def load_checkpoint(checkpoint_path: Path, model, optimizer=None, scheduler=None):
+    """Load checkpoint and restore model / optimizer / scheduler."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if optimizer is not None and "optimizer_state_dict" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+    if scheduler is not None and "scheduler_state_dict" in checkpoint:
+        if checkpoint["scheduler_state_dict"] is not None:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+    epoch = checkpoint.get("epoch", 0)
+    loss = checkpoint.get("loss", float("inf"))
     return epoch, loss
 
+
+# -------------------------------------------------------------------------
+# Noise metric (HU)
+# -------------------------------------------------------------------------
 
 def compute_noise_hu(
     x_01: torch.Tensor,
@@ -55,60 +64,49 @@ def compute_noise_hu(
     use_highpass: bool = False,
     debug: bool = False,
 ) -> float:
-    """
-    Compute noise in HU (default: raw std, more interpretable for medical imaging)
-    
-    Args:
-        x_01: Tensor in [0, 1] range, shape (B, C, H, W)
-        hu_window: (min, max) HU window for denormalization
-        body_hu_range: (min, max) HU range for body mask (should match hu_window!)
-        roi_h, roi_w: ROI size as fraction of image
-        use_highpass: If True, use high-pass filtering (less interpretable)
-        debug: If True, print diagnostic info
-    
-    Returns:
-        noise_std_hu: Noise level in HU units
-    """
     hu_min, hu_max = hu_window
     arr = x_01[0, 0].detach().cpu().numpy()
     H, W = arr.shape
-    
-    # Extract central ROI
+
+    # 중앙 ROI
     h_margin = int(H * (1.0 - roi_h) / 2.0)
     w_margin = int(W * (1.0 - roi_w) / 2.0)
-    roi = arr[h_margin:H - h_margin, w_margin:W - w_margin]
-    
-    # Body mask in NORMALIZED space (exclude background/air)
-    # Typical body tissue in normalized [0, 1]: 0.2 ~ 0.8
+    roi = arr[h_margin : H - h_margin, w_margin : W - w_margin]
+
+    # Normalized 공간에서 body mask (air/background 제외)
     body_mask_norm = (roi > 0.15) & (roi < 0.85)
-    
     if body_mask_norm.sum() < 100:
         return 0.0
-    
-    # Convert ONLY body region to HU
+
+    # body 영역만 HU로 변환
     roi_hu = roi * (hu_max - hu_min) + hu_min
-    
-    # Raw std (default, more interpretable)
+
+    # Raw std (의미 해석이 제일 쉬움)
     raw_std_hu = float(roi_hu[body_mask_norm].std())
-    
+
     if use_highpass:
-        # High-pass filter (optional, less interpretable)
         lp = gaussian_filter(roi_hu, sigma=1.0)
         hp = roi_hu - lp
         hp_std_hu = float(hp[body_mask_norm].std())
         noise_std_hu = hp_std_hu
-        
+
         if debug:
-            print(f"    [DEBUG] Raw std: {raw_std_hu:.1f} HU | HP std: {hp_std_hu:.1f} HU | Ratio: {hp_std_hu/raw_std_hu:.2%}")
+            ratio = hp_std_hu / raw_std_hu if raw_std_hu > 0 else 0.0
+            print(
+                f"    [DEBUG] Raw std: {raw_std_hu:.1f} HU | "
+                f"HP std: {hp_std_hu:.1f} HU | Ratio: {ratio:.2%}"
+            )
     else:
-        # Use raw std (recommended for medical imaging)
         noise_std_hu = raw_std_hu
-        
         if debug:
             print(f"    [DEBUG] Raw std: {raw_std_hu:.1f} HU (no HP filtering)")
-    
+
     return noise_std_hu
 
+
+# -------------------------------------------------------------------------
+# Sample saving
+# -------------------------------------------------------------------------
 
 def save_simple_samples(
     noisy: torch.Tensor,
@@ -119,94 +117,153 @@ def save_simple_samples(
     hu_window: Tuple[float, float],
     body_hu_range: Tuple[float, float],
 ):
-    """
-    Save samples as individual images in separate folders (Plan B)
-    
-    Structure:
-        origin/
-            epoch_10_HN.png
-            epoch_10_LN.png
-        denoise/
-            epoch_10_HN.png
-            epoch_10_LN.png
-    
-    Args:
-        noisy: (B, 1, H, W) noisy input
-        denoised: (B, 1, H, W) denoised output
-        origin_dir: Directory for noisy images
-        denoise_dir: Directory for denoised images
-        epoch: Current epoch number
-        hu_window: HU window for noise calculation
-        body_hu_range: Body HU range for noise calculation
-    """
-    origin_dir.mkdir(parents=True, exist_ok=True)
     denoise_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Process first 2 samples (HN and LN)
-    labels = ['HN', 'LN']
+
+    labels = ["HN", "LN"]
     for idx in range(min(2, noisy.shape[0])):
         label = labels[idx]
-        
-        # Extract images
+
         noisy_np = noisy[idx, 0].cpu().numpy()
         denoised_np = denoised[idx, 0].detach().cpu().numpy()
-        
-        # Rotate for better visualization
+
+        # 보기 좋게 회전
         noisy_np = np.rot90(noisy_np, k=1)
         denoised_np = np.rot90(denoised_np, k=1)
-        
-        # Calculate noise HU for console logging
+
+        # HU 기반 noise 계산
         noisy_hu = compute_noise_hu(
-            noisy[idx:idx+1], hu_window, body_hu_range, 
-            use_highpass=False, debug=True
+            noisy[idx : idx + 1],
+            hu_window,
+            body_hu_range,
+            use_highpass=False,
+            debug=True,
         )
         denoised_hu = compute_noise_hu(
-            denoised[idx:idx+1], hu_window, body_hu_range,
-            use_highpass=False, debug=True
+            denoised[idx : idx + 1],
+            hu_window,
+            body_hu_range,
+            use_highpass=False,
+            debug=True,
         )
-        
-        # Print to console
-        reduction = ((noisy_hu - denoised_hu) / noisy_hu * 100) if noisy_hu > 0 else 0
-        print(f"  [{label}] Original: {noisy_hu:.1f} HU → Denoised: {denoised_hu:.1f} HU "
-              f"({reduction:.1f}% reduction) | Shape: {noisy_np.shape}")
-        
-        # Determine figure size based on image aspect ratio
+
+        reduction = (
+            (noisy_hu - denoised_hu) / noisy_hu * 100 if noisy_hu > 0 else 0.0
+        )
+        print(
+            f"  [{label}] Original: {noisy_hu:.1f} HU → "
+            f"Denoised: {denoised_hu:.1f} HU "
+            f"({reduction:.1f}% reduction) | Shape: {noisy_np.shape}"
+        )
+
+        # figure 크기
         h, w = noisy_np.shape
         aspect_ratio = w / h
         fig_height = 8
         fig_width = fig_height * aspect_ratio
-        
-        # Save origin
+
+        # 라벨별 하위 폴더 (HN / LN)
+        label_dir = denoise_dir / label
+        label_dir.mkdir(parents=True, exist_ok=True)
+
+        # denoised 이미지만 저장 (epoch별)
         fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-        ax.imshow(noisy_np, cmap='gray', vmin=0, vmax=1)
-        ax.axis('off')
-        ax.set_title(f'{label} Original - {noisy_hu:.1f} HU', fontsize=14, pad=10)
+        ax.imshow(denoised_np, cmap="gray", vmin=0, vmax=1)
+        ax.axis("off")
+        ax.set_title(
+            f"{label} Denoised - {denoised_hu:.1f} HU ({reduction:.1f}% ↓)",
+            fontsize=14,
+            pad=10,
+        )
         plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
-        origin_path = origin_dir / f"epoch_{epoch}_{label}.png"
-        plt.savefig(origin_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        # Save denoised
-        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-        ax.imshow(denoised_np, cmap='gray', vmin=0, vmax=1)
-        ax.axis('off')
-        ax.set_title(f'{label} Denoised - {denoised_hu:.1f} HU ({reduction:.1f}% ↓)', 
-                     fontsize=14, pad=10)
-        plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
-        denoise_path = denoise_dir / f"epoch_{epoch}_{label}.png"
-        plt.savefig(denoise_path, dpi=150, bbox_inches='tight')
+        denoise_path = label_dir / f"epoch_{epoch:03d}.png"
+        plt.savefig(denoise_path, dpi=150, bbox_inches="tight")
         plt.close()
 
+
+def save_origin_noised_samples(
+    origin: torch.Tensor,      # (B,1,H,W) clean (NC)
+    noised: torch.Tensor,      # (B,1,H,W) synthetic LD
+    origin_dir: Path,
+    noised_dir: Path,
+    hu_window: Tuple[float, float],
+    body_hu_range: Tuple[float, float],
+):
+    """
+    Origin(깨끗한 NC)과 synthetic noised 이미지를 한 번만 저장하는 함수.
+
+    Folder 구조:
+        origin/
+          HN.png
+          LN.png
+        noised/
+          HN.png
+          LN.png
+    """
+    origin_dir.mkdir(parents=True, exist_ok=True)
+    noised_dir.mkdir(parents=True, exist_ok=True)
+
+    labels = ["HN", "LN"]
+    for idx in range(min(2, origin.shape[0])):
+        label = labels[idx]
+
+        origin_np = np.rot90(origin[idx, 0].cpu().numpy(), k=1)
+        noised_np = np.rot90(noised[idx, 0].cpu().numpy(), k=1)
+
+        origin_hu = compute_noise_hu(
+            origin[idx : idx + 1],
+            hu_window,
+            body_hu_range,
+            use_highpass=False,
+            debug=True,
+        )
+        noised_hu = compute_noise_hu(
+            noised[idx : idx + 1],
+            hu_window,
+            body_hu_range,
+            use_highpass=False,
+            debug=True,
+        )
+
+        print(f"  [{label}] Clean: {origin_hu:.1f} HU → Noised: {noised_hu:.1f} HU")
+
+        h, w = origin_np.shape
+        aspect = w / h
+        fig_height = 8
+        fig_width = fig_height * aspect
+
+        # origin
+        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+        ax.imshow(origin_np, cmap="gray", vmin=0, vmax=1)
+        ax.axis("off")
+        ax.set_title(f"{label} Origin - {origin_hu:.1f} HU", fontsize=14, pad=10)
+        plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
+        plt.savefig(origin_dir / f"{label}.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+        # noised
+        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+        ax.imshow(noised_np, cmap="gray", vmin=0, vmax=1)
+        ax.axis("off")
+        ax.set_title(f"{label} Noised - {noised_hu:.1f} HU", fontsize=14, pad=10)
+        plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
+        plt.savefig(noised_dir / f"{label}.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+
+# -------------------------------------------------------------------------
+# Early stopping
+# -------------------------------------------------------------------------
 
 class EarlyStopping:
-    """Early stopping handler"""
+    """Early stopping handler."""
+
     def __init__(self, patience: int = 50, min_delta: float = 0.00003):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
         self.best_loss = None
         self.early_stop = False
-    
+
     def __call__(self, val_loss: float) -> bool:
         if self.best_loss is None:
             self.best_loss = val_loss
