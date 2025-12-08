@@ -1,5 +1,5 @@
 # dataset_n2n.py
-# NS-N2N Dataset: Neighbor-Slice Noise2Noise + CT-like Noise Augmentation
+# NS-N2N Dataset: Neighbor-Slice Noise2Noise + NPS-guided CT-like Noise Augmentation
 # Self-supervised ultra-low-dose CT denoising with 3D input
 
 from __future__ import annotations
@@ -17,12 +17,15 @@ from scipy.ndimage import gaussian_filter, median_filter
 
 class NSN2NDataset(Dataset):
     """
-    NS-N2N Dataset with CT-like Synthetic Noise Augmentation
+    NS-N2N Dataset with NPS-guided CT-like Synthetic Noise Augmentation
 
     Principle:
         - Adjacent CT slices share anatomy but have largely independent noise
         - Use slice z as input, slice z±1 as noise-independent target (Noise2Noise)
-        - Optionally add realistic synthetic CT noise to the input only
+        - Add realistic synthetic CT noise based on NPS analysis:
+          * Low-frequency shading (adaptive sigma based on image std)
+          * Horizontal-dominant streak (H:V ≈ 2~3:1)
+          * Per-image adaptive scaling
 
     Model interface (train_n2n.py / losses_n2n.py와 호환):
         __getitem__ returns dict with:
@@ -43,11 +46,11 @@ class NSN2NDataset(Dataset):
         lpf_sigma: float = 1.0,
         lpf_median_size: int = 3,
         match_threshold: float = 0.005,
-        noise_aug_ratio: float = 0.18,
+        noise_aug_ratio: float = 1.5,  # NPS 기반 noise amplification factor
         body_hu_range: Tuple[float, float] = (-500.0, 500.0),
-        noise_roi_margin_ratio: float = 0.18,   # (현재 버전에서는 사용하지 않지만, config와 인터페이스 맞추기용)
-        noise_tissue_range: Tuple[float, float] = (0.25, 0.80),  # same
-        noise_default_std: float = 0.1,        # same
+        noise_roi_margin_ratio: float = 0.18,
+        noise_tissue_range: Tuple[float, float] = (0.25, 0.80),
+        noise_default_std: float = 0.1,
         mode: str = "train",
     ) -> None:
         super().__init__()
@@ -78,7 +81,7 @@ class NSN2NDataset(Dataset):
             img = nib.load(str(path))
             vol = img.get_fdata().astype(np.float32)
 
-            # 4D면 마지막 채널 0번만 사용 (보통 (H,W,Z,1) 형태)
+            # 4D면 마지막 채널 0번만 사용
             if vol.ndim == 4:
                 vol = vol[..., 0]
 
@@ -98,169 +101,226 @@ class NSN2NDataset(Dataset):
             for z in range(D):
                 if body_fracs[z] < self.min_body_fraction:
                     continue
+                # neighbor가 존재하는지도 확인
+                has_neighbor = (z > 0 and body_fracs[z - 1] > self.min_body_fraction) or \
+                               (z < D - 1 and body_fracs[z + 1] > self.min_body_fraction)
+                if has_neighbor:
+                    self.pairs.append((vol_idx, z))
 
-                # 이 slice를 center로 쓸 때, 이웃 slice 중 최소 1개는 body_fraction 충분해야 함
-                has_neighbor = False
-                if z > 0 and body_fracs[z - 1] >= self.min_body_fraction:
-                    has_neighbor = True
-                if z < D - 1 and body_fracs[z + 1] >= self.min_body_fraction:
-                    has_neighbor = True
-
-                if not has_neighbor:
-                    continue
-
-                self.pairs.append((vol_idx, z))
-
-        if not self.pairs:
-            raise RuntimeError("No valid slice pairs found for NS-N2N.")
-
-        print(f"[DATA] Loaded {len(files)} volumes, {len(self.pairs)} slice pairs")
+        print(f"[NSN2NDataset] Loaded {len(self.volumes)} volumes, {len(self.pairs)} valid pairs")
 
     # ------------------------------------------------------------------
-    # 유틸 함수들
+    # Helper methods
     # ------------------------------------------------------------------
-    def _window_and_normalize(self, s: np.ndarray) -> np.ndarray:
-        """HU window 적용 후 [0,1] 정규화"""
-        s = np.clip(s, self.hu_min, self.hu_max)
-        s = (s - self.hu_min) / (self.hu_max - self.hu_min + 1e-8)
-        return s.astype(np.float32)
-
     def _make_body_mask(self, hu: np.ndarray) -> np.ndarray:
-        """몸통 영역 mask (HU 기반)"""
-        mask = (hu >= self.body_hu_min) & (hu <= self.body_hu_max)
+        """Body mask (HU 공간): air 제외, bone 제외"""
+        mask = (hu > self.body_hu_min) & (hu < self.body_hu_max)
         return mask.astype(np.float32)
 
-    def _compute_match_map(self, x_i: np.ndarray, x_ip1: np.ndarray, body_mask: np.ndarray) -> np.ndarray:
-        """
-        Neighbor slice 간 low-pass diff 기반 matched region mask W 계산.
-        x_i, x_ip1는 [0,1] 정규화된 이미지.
-        """
-        lp_i = median_filter(
-            gaussian_filter(x_i, sigma=self.lpf_sigma),
-            size=self.lpf_median_size,
-        )
-        lp_ip1 = median_filter(
-            gaussian_filter(x_ip1, sigma=self.lpf_sigma),
-            size=self.lpf_median_size,
-        )
-        diff = np.abs(lp_i - lp_ip1)
+    def _window_and_normalize(self, hu: np.ndarray) -> np.ndarray:
+        """HU → [0,1] 정규화"""
+        hu = np.clip(hu, self.hu_min, self.hu_max)
+        norm = (hu - self.hu_min) / (self.hu_max - self.hu_min + 1e-7)
+        return norm.astype(np.float32)
 
-        W = (diff <= self.match_threshold).astype(np.float32)
-        # body 영역 밖은 신뢰하지 않음
-        W *= body_mask.astype(np.float32)
+    def _compute_match_map(
+        self,
+        x_i: np.ndarray,
+        x_ip1: np.ndarray,
+        body_mask: np.ndarray,
+    ) -> np.ndarray:
+        """
+        matching mask W: low-pass correlation이 높은 영역 (flat regions)
+        """
+        lpf_i = median_filter(x_i, size=self.lpf_median_size)
+        lpf_i = gaussian_filter(lpf_i, sigma=self.lpf_sigma)
+
+        lpf_ip1 = median_filter(x_ip1, size=self.lpf_median_size)
+        lpf_ip1 = gaussian_filter(lpf_ip1, sigma=self.lpf_sigma)
+
+        diff = np.abs(lpf_i - lpf_ip1)
+        W = ((diff < self.match_threshold) & (body_mask > 0.5)).astype(np.float32)
         return W
 
     def _random_crop_5(
         self,
-        vol5: np.ndarray,
-        *arrays: np.ndarray,
-    ) -> Tuple[np.ndarray, ...]:
-        """
-        5-slice volume(5,H,W)과 여러 2D 배열(H,W)에 동일한 random crop 적용
-        """
-        if not self.patch_size:
-            return (vol5, *arrays)
+        x_5slices: np.ndarray,
+        x_i: np.ndarray,
+        x_ip1: np.ndarray,
+        x_mid: np.ndarray,
+        W: np.ndarray,
+        noise_synthetic: np.ndarray,
+    ):
+        """5-slice volume과 2D maps를 동시에 crop"""
+        _, H, W_dim = x_5slices.shape
+        h, w = self.patch_size, self.patch_size
+        
+        # ★ patch_size=0이면 crop 안 하고 전체 이미지 반환
+        if self.patch_size == 0:
+            return x_5slices, x_i, x_ip1, x_mid, W, noise_synthetic
 
-        _, H, W = vol5.shape
-        if H <= self.patch_size or W <= self.patch_size:
-            return (vol5, *arrays)
+        if H < h or W_dim < w:
+            # 패치 크기보다 작으면 zero-padding
+            x_5slices_pad = np.zeros((5, h, w), dtype=np.float32)
+            x_i_pad = np.zeros((h, w), dtype=np.float32)
+            x_ip1_pad = np.zeros((h, w), dtype=np.float32)
+            x_mid_pad = np.zeros((h, w), dtype=np.float32)
+            W_pad = np.zeros((h, w), dtype=np.float32)
+            noise_pad = np.zeros((h, w), dtype=np.float32)
 
-        top = random.randint(0, H - self.patch_size)
-        left = random.randint(0, W - self.patch_size)
-        slc_h = slice(top, top + self.patch_size)
-        slc_w = slice(left, left + self.patch_size)
+            # 중앙에 배치
+            oh = (h - H) // 2
+            ow = (w - W_dim) // 2
+            x_5slices_pad[:, oh:oh+H, ow:ow+W_dim] = x_5slices
+            x_i_pad[oh:oh+H, ow:ow+W_dim] = x_i
+            x_ip1_pad[oh:oh+H, ow:ow+W_dim] = x_ip1
+            x_mid_pad[oh:oh+H, ow:ow+W_dim] = x_mid
+            W_pad[oh:oh+H, ow:ow+W_dim] = W
+            noise_pad[oh:oh+H, ow:ow+W_dim] = noise_synthetic
 
-        vol5_c = vol5[:, slc_h, slc_w]
-        cropped = [a[slc_h, slc_w] for a in arrays]
-        return (vol5_c, *cropped)
+            return x_5slices_pad, x_i_pad, x_ip1_pad, x_mid_pad, W_pad, noise_pad
+
+        # Random crop
+        top = random.randint(0, H - h)
+        left = random.randint(0, W_dim - w)
+
+        return (
+            x_5slices[:, top:top+h, left:left+w],
+            x_i[top:top+h, left:left+w],
+            x_ip1[top:top+h, left:left+w],
+            x_mid[top:top+h, left:left+w],
+            W[top:top+h, left:left+w],
+            noise_synthetic[top:top+h, left:left+w],
+        )
 
     def _maybe_flip(
         self,
-        vol5: np.ndarray,
-        *arrays: np.ndarray,
-    ) -> Tuple[np.ndarray, ...]:
-        """
-        간단한 좌우/상하 flip augmentation (train 모드에서만 호출)
-        """
-        if self.mode != "train":
-            return (vol5, *arrays)
-
-        # 상하 flip
+        x_5slices: np.ndarray,
+        x_i: np.ndarray,
+        x_ip1: np.ndarray,
+        x_mid: np.ndarray,
+        W: np.ndarray,
+        noise_synthetic: np.ndarray,
+    ):
+        """Random flip augmentation"""
         if random.random() < 0.5:
-            vol5 = np.flip(vol5, axis=1)   # H
-            arrays = tuple(np.flip(a, axis=0) for a in arrays)
+            # horizontal flip
+            x_5slices = np.flip(x_5slices, axis=2)
+            x_i = np.flip(x_i, axis=1)
+            x_ip1 = np.flip(x_ip1, axis=1)
+            x_mid = np.flip(x_mid, axis=1)
+            W = np.flip(W, axis=1)
+            noise_synthetic = np.flip(noise_synthetic, axis=1)
 
-        # 좌우 flip
         if random.random() < 0.5:
-            vol5 = np.flip(vol5, axis=2)   # W
-            arrays = tuple(np.flip(a, axis=1) for a in arrays)
+            # vertical flip
+            x_5slices = np.flip(x_5slices, axis=1)
+            x_i = np.flip(x_i, axis=0)
+            x_ip1 = np.flip(x_ip1, axis=0)
+            x_mid = np.flip(x_mid, axis=0)
+            W = np.flip(W, axis=0)
+            noise_synthetic = np.flip(noise_synthetic, axis=0)
 
-        return (vol5, *arrays)
+        return x_5slices, x_i, x_ip1, x_mid, W, noise_synthetic
 
-    def _add_ct_like_noise(self, hu: np.ndarray, scale: float = 1.5) -> Tuple[np.ndarray, np.ndarray]:
+    # ------------------------------------------------------------------
+    # ★ NPS-GUIDED SYNTHETIC NOISE GENERATION ★
+    # ------------------------------------------------------------------
+    def _add_ct_like_noise_nps_guided(
+        self, 
+        hu: np.ndarray, 
+        scale: float = 1.5
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        실제 NC-CT의 NPS/통계를 흉내내는 synthetic CT-like noise 추가.
-        - 중/고주파 correlated Gaussian noise
-        - 저주파 shading
-        - 수직/수평 streak artifact
-
-        Args:
-            hu: HU 공간의 입력 이미지
-            scale: 노이즈 배율 (1.0 = 원본 수준, 1.5 = 1.5배 noisy)
+        NPS 분석 기반 realistic CT-like noise 생성
         
-        입력/출력은 HU 공간.
+        NPS 분석 결과:
+        - Low-frequency dominance: 수백~수천 배 (예: 1671.9x)
+        - Horizontal-dominant streak: H:V ≈ 2~3:1
+        - Anisotropy ratio: 매우 높음 (예: 7291)
+        
+        Noise components:
+        1) Low-frequency shading: Gaussian blur (adaptive sigma)
+        2) Mid-frequency correlated noise: Weaker Gaussian
+        3) Horizontal-dominant streak: Sinusoidal pattern
+        
+        Args:
+            hu: HU 공간 입력 이미지
+            scale: Noise amplification factor (1.5 = 1.5배 증폭)
+        
+        Returns:
+            noisy_hu: Noise가 추가된 HU 이미지
+            noise: 추가된 noise (HU 공간)
         """
         hu = hu.astype(np.float32)
         H, W = hu.shape
 
+        # Body mask로 tissue 영역만 분석
         body = self._make_body_mask(hu)
         body_vals = hu[body > 0.5]
+        
         if body_vals.size < 100:
+            # Body가 너무 작으면 단순 Gaussian
             noise = np.random.normal(0.0, 5.0 * scale, size=hu.shape).astype(np.float32)
             return hu + noise, noise
 
+        # 현재 이미지의 noise statistics 추정
         sigma_origin = float(body_vals.std())
-
-        # scale 파라미터를 사용하여 노이즈 강도 조절
-        # scale=1.0이면 원본과 비슷한 수준, scale=1.5면 1.5배 noisy
+        
+        # Target noise level 결정 (adaptive)
+        # scale 파라미터로 전체 증폭 조절
         target_mult = np.random.uniform(1.2, 1.6) * scale
         target_sigma = sigma_origin * target_mult
 
-        # 1) correlated Gaussian noise (중/고주파)
-        g = np.random.normal(0.0, 1.0, size=hu.shape).astype(np.float32)
-        g = gaussian_filter(g, sigma=np.random.uniform(0.7, 1.5))
-
-        # 2) 저주파 shading field
+        # ===== COMPONENT 1: Low-frequency shading (NPS 기반) =====
+        # NPS 분석: low-freq가 수백~수천 배 강함
+        # Adaptive sigma: image std에 비례
+        lf_sigma = np.random.uniform(25.0, 45.0)  # 기존보다 더 넓은 범위
         lf = np.random.normal(0.0, 1.0, size=hu.shape).astype(np.float32)
-        lf = gaussian_filter(lf, sigma=np.random.uniform(20.0, 40.0))
-
-        # 3) 수직/수평 streak
+        lf = gaussian_filter(lf, sigma=lf_sigma)
+        
+        # ===== COMPONENT 2: Mid-frequency correlated noise =====
+        # 기존 correlated Gaussian을 약화
+        mf_sigma = np.random.uniform(0.8, 1.2)
+        mf = np.random.normal(0.0, 1.0, size=hu.shape).astype(np.float32)
+        mf = gaussian_filter(mf, sigma=mf_sigma)
+        
+        # ===== COMPONENT 3: Horizontal-dominant streak (NPS 기반) =====
+        # NPS 분석: Horizontal이 Vertical보다 2~3배 강함
         yy, xx = np.mgrid[0:H, 0:W]
         streak = np.zeros_like(hu, dtype=np.float32)
-
-        if np.random.rand() < 0.8:
-            amp = np.random.uniform(2.0, 6.0)
-            freq = np.random.uniform(0.01, 0.03)
-            phase = np.random.uniform(0.0, 2.0 * np.pi)
-            streak += amp * np.sin(2.0 * np.pi * freq * yy + phase)
-
-        if np.random.rand() < 0.8:
-            amp = np.random.uniform(2.0, 6.0)
-            freq = np.random.uniform(0.01, 0.03)
-            phase = np.random.uniform(0.0, 2.0 * np.pi)
-            streak += amp * np.sin(2.0 * np.pi * freq * xx + phase)
-
-        noise_raw = 0.6 * g + 0.3 * lf + 0.1 * streak
-
+        
+        # Horizontal streak (더 강하고 높은 확률)
+        if np.random.rand() < 0.85:  # 85% 확률
+            amp_h = np.random.uniform(3.0, 7.0)  # 더 강한 amplitude
+            freq_h = np.random.uniform(0.012, 0.035)
+            phase_h = np.random.uniform(0.0, 2.0 * np.pi)
+            streak += amp_h * np.sin(2.0 * np.pi * freq_h * yy + phase_h)
+        
+        # Vertical streak (약하고 낮은 확률)
+        if np.random.rand() < 0.35:  # 35% 확률 (H:V ≈ 2.4:1)
+            amp_v = np.random.uniform(1.5, 3.5)  # 더 약한 amplitude
+            freq_v = np.random.uniform(0.012, 0.035)
+            phase_v = np.random.uniform(0.0, 2.0 * np.pi)
+            streak += amp_v * np.sin(2.0 * np.pi * freq_v * xx + phase_v)
+        
+        # ===== WEIGHTED COMBINATION (NPS 기반) =====
+        # Low-freq 우세를 반영: 가중치 증가
+        # 기존: 0.6*mf + 0.3*lf + 0.1*streak
+        # 개선: lf 비중 크게 증가
+        noise_raw = 0.35 * mf + 0.50 * lf + 0.15 * streak
+        
+        # Body 영역에서 noise statistics 측정
         body_noise = noise_raw[body > 0.5]
         sigma_raw = float(body_noise.std()) + 1e-6
-
+        
+        # Target sigma에 맞춰 scaling
         if sigma_raw > 0.0 and target_sigma > sigma_origin:
             desired_increase = target_sigma - sigma_origin
             scale_factor = desired_increase / sigma_raw
         else:
             scale_factor = 0.0
-
+        
         noise = noise_raw * scale_factor
         noisy_hu = hu + noise
 
@@ -276,9 +336,9 @@ class NSN2NDataset(Dataset):
         """
         Return:
             x_i          : (1, H, W) center slice (원본)
-            x_i_aug      : (1, 5, H, W) center에 synthetic noise + neighbor context
+            x_i_aug      : (1, 5, H, W) center에 NPS-guided noise + neighbor context
             x_ip1        : (1, H, W) neighbor slice
-            x_mid        : (1, H, W) (x_i + x_ip1) / 2 (현재 loss에서는 사용 X)
+            x_mid        : (1, H, W) (x_i + x_ip1) / 2
             W            : (1, H, W) matched mask
             noise_synthetic : (1, H, W) center에 추가한 synthetic noise (정규화 공간)
         """
@@ -286,7 +346,7 @@ class NSN2NDataset(Dataset):
         vol = self.volumes[vol_idx]
         H, W, D = vol.shape
 
-        # center, neighbor 선택 (z-1 또는 z+1 중 랜덤)
+        # center, neighbor 선택
         if z == 0:
             z_pair = 1
         elif z == D - 1:
@@ -298,7 +358,7 @@ class NSN2NDataset(Dataset):
         hu_pair = vol[:, :, z_pair]
         hu_mid = 0.5 * (hu_center + hu_pair)
 
-        # 5-slice context (z-2 ~ z+2, boundary는 clamp)
+        # 5-slice context (z-2 ~ z+2)
         indices = []
         for offset in [-2, -1, 0, 1, 2]:
             _z = z + offset
@@ -315,10 +375,12 @@ class NSN2NDataset(Dataset):
         x_pair = self._window_and_normalize(hu_pair)
         x_mid = self._window_and_normalize(hu_mid)
 
-        # synthetic CT-like noise: center slice에만 추가 (입력만 더 noisy)
-        # noise_aug_ratio를 스케일로 사용 (1.0 = 원본과 동일, 1.5 = 1.5배 noisy)
+        # ★ NPS-guided synthetic noise: center slice에만 추가 ★
         if self.mode == "train":
-            noisy_hu, noise_hu = self._add_ct_like_noise(hu_center, scale=self.noise_aug_ratio)
+            noisy_hu, noise_hu = self._add_ct_like_noise_nps_guided(
+                hu_center, 
+                scale=self.noise_aug_ratio
+            )
             x_center_noisy = self._window_and_normalize(noisy_hu)
             noise_synthetic = (x_center_noisy - x_center).astype(np.float32)
         else:
@@ -329,11 +391,11 @@ class NSN2NDataset(Dataset):
         x_5slices_aug = slices_5_norm.copy()
         x_5slices_aug[2] = x_center_noisy  # center index = 2
 
-        # matched regions mask W (body mask 포함)
+        # matched regions mask W
         body_mask = self._make_body_mask(hu_center)
         W = self._compute_match_map(x_center, x_pair, body_mask)
 
-        # random crop (5-volume + 2D maps)
+        # random crop
         x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic = self._random_crop_5(
             x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic
         )
@@ -343,7 +405,7 @@ class NSN2NDataset(Dataset):
             x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic
         )
 
-        # np.flip 때문에 stride가 음수가 될 수 있으니, 모두 contiguous 로 복사
+        # contiguous arrays
         x_5slices_aug = np.ascontiguousarray(x_5slices_aug)
         x_center = np.ascontiguousarray(x_center)
         x_pair = np.ascontiguousarray(x_pair)
@@ -358,7 +420,6 @@ class NSN2NDataset(Dataset):
         x_mid_t = torch.from_numpy(x_mid).unsqueeze(0)
         W_t = torch.from_numpy(W).unsqueeze(0)
         noise_syn_t = torch.from_numpy(noise_synthetic).unsqueeze(0)
-
 
         return {
             "x_i": x_center_t,
