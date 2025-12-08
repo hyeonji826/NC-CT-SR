@@ -57,7 +57,9 @@ def create_dataloaders(config: dict):
         "noise_roi_margin_ratio": config["dataset"]["noise_roi_margin_ratio"],
         "noise_tissue_range": tuple(config["dataset"]["noise_tissue_range"]),
         "noise_default_std": config["dataset"]["noise_default_std"],
+        "slice_noise_csv": config["dataset"].get("slice_noise_csv", None),
     }
+
     
     # 1. Train Dataset: augmentation ON, synthetic noise ON
     train_dataset = NSN2NDataset(

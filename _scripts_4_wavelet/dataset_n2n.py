@@ -7,9 +7,9 @@ from __future__ import annotations
 import random
 from pathlib import Path
 from typing import List, Tuple
-
 import nibabel as nib
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from scipy.ndimage import gaussian_filter, median_filter
@@ -52,7 +52,9 @@ class NSN2NDataset(Dataset):
         noise_tissue_range: Tuple[float, float] = (0.25, 0.80),
         noise_default_std: float = 0.1,
         mode: str = "train",
+        slice_noise_csv: str | None = None,
     ) -> None:
+
         super().__init__()
 
         # 기본 설정
@@ -68,9 +70,40 @@ class NSN2NDataset(Dataset):
 
         self.body_hu_min, self.body_hu_max = float(body_hu_range[0]), float(body_hu_range[1])
 
+        # NPS 기반 slice-level noise 표 (optional, per patient,z)
+        self.slice_noise_map: dict[tuple[str, int], float] = {}
+        self.slice_noise_mean: float | None = None
+        if slice_noise_csv is not None:
+            csv_path = Path(slice_noise_csv)
+            if not csv_path.exists():
+                print(f"[WARN] slice_noise_csv not found: {csv_path} (adaptive NPS noise OFF)")
+            else:
+                df_noise = pd.read_csv(csv_path)
+                if not {"patient", "z", "noise_std"}.issubset(df_noise.columns):
+                    print(
+                        f"[WARN] slice_noise_csv columns invalid: "
+                        f"{df_noise.columns.tolist()} (expected patient,z,noise_std)"
+                    )
+                else:
+                    df_noise["patient"] = df_noise["patient"].astype(str)
+                    self.slice_noise_mean = float(df_noise["noise_std"].mean())
+                    self.slice_noise_map = {
+                        (str(row.patient), int(row.z)): float(row.noise_std)
+                        for _, row in df_noise.iterrows()
+                    }
+                    print(
+                        f"[INFO] Loaded slice_noise_csv from {csv_path} "
+                        f"(mean noise_std={self.slice_noise_mean:.2f}, "
+                        f"entries={len(self.slice_noise_map)})"
+                    )
+
+        # 볼륨 인덱스 → patient ID 매핑 (ex. '25980_0000.nii.gz' → '25980')
+        self.volume_patient_ids: list[str] = []
+
         # NIfTI 파일 로드
         files = sorted(list(self.nc_ct_dir.glob("*.nii.gz")) +
                        list(self.nc_ct_dir.glob("*.nii")))
+
         if not files:
             raise FileNotFoundError(f"No NIfTI files found in {self.nc_ct_dir}")
 
@@ -80,6 +113,11 @@ class NSN2NDataset(Dataset):
         for vol_idx, path in enumerate(files):
             img = nib.load(str(path))
             vol = img.get_fdata().astype(np.float32)
+
+            # NIfTI 파일명에서 patient ID 추출 (예: '25980_0000.nii.gz' → '25980')
+            stem = path.stem  # '25980_0000'
+            patient_id = stem.split("_")[0]
+            self.volume_patient_ids.append(str(patient_id))
 
             # 4D면 마지막 채널 0번만 사용
             if vol.ndim == 4:
@@ -377,9 +415,24 @@ class NSN2NDataset(Dataset):
 
         # ★ NPS-guided synthetic noise: center slice에만 추가 ★
         if self.mode == "train":
+            # Adaptive scale: slice-level NPS (noise_std)에 따라 증폭/감쇠
+            scale = self.noise_aug_ratio
+            if self.slice_noise_map and self.slice_noise_mean and self.volume_patient_ids:
+                vol_idx, z = self.pairs[idx]
+                pid = self.volume_patient_ids[vol_idx]
+                key = (str(pid), int(z))
+                noise_std = self.slice_noise_map.get(key, None)
+                if noise_std is not None and self.slice_noise_mean > 0:
+                    base = float(noise_std) / float(self.slice_noise_mean)
+                    # base > 1: 이미 노이즈 많은 슬라이스 → 증폭 줄이고
+                    # base < 1: 상대적으로 깨끗한 슬라이스 → 증폭 키우기
+                    adaptive = 1.0 / (base + 1e-6)
+                    adaptive = float(np.clip(adaptive, 0.7, 1.5))
+                    scale = self.noise_aug_ratio * adaptive
+
             noisy_hu, noise_hu = self._add_ct_like_noise_nps_guided(
                 hu_center, 
-                scale=self.noise_aug_ratio
+                scale=scale,
             )
             x_center_noisy = self._window_and_normalize(noisy_hu)
             noise_synthetic = (x_center_noisy - x_center).astype(np.float32)
