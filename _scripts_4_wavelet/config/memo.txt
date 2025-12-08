@@ -1,7 +1,4 @@
 CUDA_VISIBLE_DEVICES=0 python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_n2n.yaml
-
-python _scripts_4_wavelet/analyze_tensorboard.py
-
 # 참고
 https://github.com/amir-aghdam/3D-UNet?tab=readme-ov-file
 

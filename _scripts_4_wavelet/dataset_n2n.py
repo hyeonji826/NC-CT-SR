@@ -267,7 +267,7 @@ class NSN2NDataset(Dataset):
     def _add_ct_like_noise_nps_guided(
         self, 
         hu: np.ndarray, 
-        scale: float = 1.5
+        scale: float = 0.0
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         NPS 분석 기반 realistic CT-like noise 생성

@@ -10,7 +10,7 @@ print("🔄 NC-CT DICOM → NIfTI 전처리 (Orientation 수정)")
 print("="*80)
 
 dicom_root = Path(r"E:\LD-CT SR\Data\HCC Abd NC-CT")
-output_dir = Path(r"E:\LD-CT SR\Data\Image_NC-CT_v2")
+output_dir = Path(r"E:\LD-CT SR\Data\Image_NC-CT")
 output_dir.mkdir(exist_ok=True, parents=True)
 
 patient_dirs = sorted([d for d in dicom_root.iterdir() if d.is_dir()])
@@ -55,7 +55,7 @@ for patient_dir in tqdm(patient_dirs, desc="Processing"):
         resampler.SetOutputSpacing(new_spacing)
         resampler.SetOutputOrigin(image.GetOrigin())
         resampler.SetOutputDirection(image.GetDirection())  # ← 핵심!
-        resampler.SetInterpolator(sitk.sitkLinear)
+        resampler.SetInterpolator(sitk.sitkBSpline)
         
         resampled_image = resampler.Execute(image)
         
