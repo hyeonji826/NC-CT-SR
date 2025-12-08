@@ -6,9 +6,6 @@ python _scripts_4_wavelet/analyze_tensorboard.py
 https://github.com/amir-aghdam/3D-UNet?tab=readme-ov-file
 
 
-python _scripts_4_wavelet/inference_n2n.py \
-  --config _scripts_4_wavelet/config/config_n2n.yaml \
-  --ckpt "E:\LD-CT SR\Outputs\ns_n2n_experiments\residual_denoising_v1\checkpoints\best_model.pth" \
-  --max_samples 20
+python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_noise.yaml
 
-
+python _scripts_4_wavelet/train_n2n.py --config _scripts_4_wavelet/config/config_artifact.yaml

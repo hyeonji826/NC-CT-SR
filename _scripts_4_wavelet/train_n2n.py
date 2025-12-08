@@ -21,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.append(str(Path(__file__).parent))
 from dataset_n2n import NSN2NDataset
 from model_3d_unet_trans import UNet3DTransformer
-from losses_n2n import HighQualityNSN2NLoss
+from losses_n2n import NoiseRemovalLoss, ArtifactRemovalLoss, HighQualityNSN2NLoss
 from utils import (
     load_config,
     save_checkpoint,
@@ -285,21 +285,61 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
     
-    # Create loss function
-    criterion = HighQualityNSN2NLoss(
-        lambda_rc=config["loss"]["lambda_rc"],
-        lambda_hu=config["loss"]["lambda_hu"],
-        lambda_edge=config["loss"]["lambda_edge"],
-        lambda_texture=config["loss"]["lambda_texture"],
-        lambda_hf_noise=config["loss"]["lambda_hf_noise"],
-        lambda_syn=config["loss"]["lambda_syn"],
-        lambda_ic=config["loss"]["lambda_ic"],
-        lambda_mid_noise=config["loss"]["lambda_mid_noise"],
-        lambda_lf_artifact=config["loss"]["lambda_lf_artifact"],
-        min_body_pixels=config["loss"]["min_body_pixels"],
-        artifact_grad_factor=config["loss"]["artifact_grad_factor"],
-        flat_threshold=config["loss"]["flat_threshold"],
-    ).to(device)
+    # ============================================================
+    # Create loss function based on config
+    # - "noise_removal": Stage 1 (random noise removal)
+    # - "artifact_removal": Stage 2 (directional streaks, shading)
+    # - default: HighQualityNSN2NLoss (legacy)
+    # ============================================================
+    loss_type = config["loss"].get("loss_type", "default")
+    
+    if loss_type == "noise_removal":
+        print("Using NoiseRemovalLoss (Stage 1: Random Noise Removal)")
+        criterion = NoiseRemovalLoss(
+            lambda_rc=config["loss"]["lambda_rc"],
+            lambda_hu=config["loss"]["lambda_hu"],
+            lambda_edge=config["loss"]["lambda_edge"],
+            lambda_texture=config["loss"]["lambda_texture"],
+            lambda_hf_noise=config["loss"]["lambda_hf_noise"],
+            lambda_mid_noise=config["loss"]["lambda_mid_noise"],
+            lambda_syn=config["loss"]["lambda_syn"],
+            lambda_ic=config["loss"]["lambda_ic"],
+            min_body_pixels=config["loss"]["min_body_pixels"],
+            artifact_grad_factor=config["loss"]["artifact_grad_factor"],
+            flat_threshold=config["loss"]["flat_threshold"],
+        ).to(device)
+    elif loss_type == "artifact_removal":
+        print("Using ArtifactRemovalLoss (Stage 2: Artifact Removal)")
+        criterion = ArtifactRemovalLoss(
+            lambda_rc=config["loss"]["lambda_rc"],
+            lambda_hu=config["loss"]["lambda_hu"],
+            lambda_edge=config["loss"]["lambda_edge"],
+            lambda_texture=config["loss"]["lambda_texture"],
+            lambda_h_streak=config["loss"]["lambda_h_streak"],
+            lambda_v_streak=config["loss"]["lambda_v_streak"],
+            lambda_lf_artifact=config["loss"]["lambda_lf_artifact"],
+            lambda_ic=config["loss"]["lambda_ic"],
+            min_body_pixels=config["loss"]["min_body_pixels"],
+            artifact_grad_factor=config["loss"]["artifact_grad_factor"],
+            flat_threshold=config["loss"]["flat_threshold"],
+        ).to(device)
+    else:
+        print("Using HighQualityNSN2NLoss (Default/Legacy)")
+        criterion = HighQualityNSN2NLoss(
+            lambda_rc=config["loss"]["lambda_rc"],
+            lambda_hu=config["loss"]["lambda_hu"],
+            lambda_edge=config["loss"]["lambda_edge"],
+            lambda_texture=config["loss"]["lambda_texture"],
+            lambda_hf_noise=config["loss"].get("lambda_hf_noise", 1.5),
+            lambda_syn=config["loss"].get("lambda_syn", 0.4),
+            lambda_ic=config["loss"]["lambda_ic"],
+            lambda_mid_noise=config["loss"].get("lambda_mid_noise", 0.8),
+            lambda_lf_artifact=config["loss"].get("lambda_lf_artifact", 0.6),
+            min_body_pixels=config["loss"]["min_body_pixels"],
+            artifact_grad_factor=config["loss"]["artifact_grad_factor"],
+            flat_threshold=config["loss"]["flat_threshold"],
+        ).to(device)
+
 
     
     # Save base lambdas (for potential future adjustments)
