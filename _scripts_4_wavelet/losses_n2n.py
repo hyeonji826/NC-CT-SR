@@ -121,6 +121,7 @@ class NoiseRemovalLoss(nn.Module):
         
         # ===== 6. HIGH-FREQ NOISE REMOVAL =====
         lap_input = self._laplacian(x_i)
+        lap_input = lap_input - torch.mean(lap_input, dim=-1, keepdim=True)
         lap_pred = self._laplacian(y_pred)
 
         if flat_mask.sum() > 100:

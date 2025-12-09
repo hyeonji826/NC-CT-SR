@@ -1,7 +1,3 @@
-"""
-Utility functions for NS-N2N training
-"""
-
 import torch
 import yaml
 import numpy as np

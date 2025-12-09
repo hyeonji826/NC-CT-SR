@@ -16,27 +16,6 @@ from scipy.ndimage import gaussian_filter, median_filter
 
 
 class NSN2NDataset(Dataset):
-    """
-    NS-N2N Dataset with NPS-guided CT-like Synthetic Noise Augmentation
-
-    Principle:
-        - Adjacent CT slices share anatomy but have largely independent noise
-        - Use slice z as input, slice z±1 as noise-independent target (Noise2Noise)
-        - Add realistic synthetic CT noise based on NPS analysis:
-          * Low-frequency shading (adaptive sigma based on image std)
-          * Horizontal-dominant streak (H:V ≈ 2~3:1)
-          * Per-image adaptive scaling
-
-    Model interface (train_n2n.py / losses_n2n.py와 호환):
-        __getitem__ returns dict with:
-            x_i        : (1, H, W)  center slice (원본 NC-CT, 정규화)
-            x_i_aug    : (1, 5, H, W)  5-slice volume, center에만 synthetic noise 적용
-            x_ip1      : (1, H, W)  neighbor slice (target 역할)
-            x_mid      : (1, H, W)  x_i, x_ip1의 평균(호환용, loss에서 현재 사용 X)
-            W          : (1, H, W)  matched region mask (0~1)
-            noise_synthetic : (1, H, W)  center에 추가한 synthetic noise (정규화 공간)
-    """
-
     def __init__(
         self,
         nc_ct_dir: str,
@@ -267,29 +246,9 @@ class NSN2NDataset(Dataset):
     def _add_ct_like_noise_nps_guided(
         self, 
         hu: np.ndarray, 
-        scale: float = 0.0
+        scale: float = 1.5
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        NPS 분석 기반 realistic CT-like noise 생성
-        
-        NPS 분석 결과:
-        - Low-frequency dominance: 수백~수천 배 (예: 1671.9x)
-        - Horizontal-dominant streak: H:V ≈ 2~3:1
-        - Anisotropy ratio: 매우 높음 (예: 7291)
-        
-        Noise components:
-        1) Low-frequency shading: Gaussian blur (adaptive sigma)
-        2) Mid-frequency correlated noise: Weaker Gaussian
-        3) Horizontal-dominant streak: Sinusoidal pattern
-        
-        Args:
-            hu: HU 공간 입력 이미지
-            scale: Noise amplification factor (1.5 = 1.5배 증폭)
-        
-        Returns:
-            noisy_hu: Noise가 추가된 HU 이미지
-            noise: 추가된 noise (HU 공간)
-        """
+
         hu = hu.astype(np.float32)
         H, W = hu.shape
 
@@ -346,7 +305,7 @@ class NSN2NDataset(Dataset):
         # Low-freq 우세를 반영: 가중치 증가
         # 기존: 0.6*mf + 0.3*lf + 0.1*streak
         # 개선: lf 비중 크게 증가
-        noise_raw = 0.35 * mf + 0.50 * lf + 0.15 * streak
+        noise_raw = 0.5 * mf + 0.5 * lf   # streak 완전 제외
         
         # Body 영역에서 noise statistics 측정
         body_noise = noise_raw[body > 0.5]
@@ -371,15 +330,6 @@ class NSN2NDataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx: int):
-        """
-        Return:
-            x_i          : (1, H, W) center slice (원본)
-            x_i_aug      : (1, 5, H, W) center에 NPS-guided noise + neighbor context
-            x_ip1        : (1, H, W) neighbor slice
-            x_mid        : (1, H, W) (x_i + x_ip1) / 2
-            W            : (1, H, W) matched mask
-            noise_synthetic : (1, H, W) center에 추가한 synthetic noise (정규화 공간)
-        """
         vol_idx, z = self.pairs[idx]
         vol = self.volumes[vol_idx]
         H, W, D = vol.shape

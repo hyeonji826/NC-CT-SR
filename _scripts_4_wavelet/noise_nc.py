@@ -1,20 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-noise_summary_corrected.csv + dicom_metadata_nc.csv → slice_noise_nc.csv
-
-역할:
-    - (patient, slice) 기준으로 NPS 결과와 DICOM 메타를 merge
-    - 환자별로 instance_number 기준 정렬 → z-index 부여 (0 ~ D-1)
-    - 학습에서 쓰기 편한 형태: (patient, z, noise_std, instance_number)
-
-입력:
-    E:\LD-CT SR\00_admin\noise_summary_corrected.csv
-    E:\LD-CT SR\00_admin\dicom_metadata_nc.csv
-
-출력:
-    E:\LD-CT SR\00_admin\slice_noise_nc.csv
-"""
-
 from pathlib import Path
 import pandas as pd
 
