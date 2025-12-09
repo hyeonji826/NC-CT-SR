@@ -25,29 +25,29 @@ class NoiseRemovalLoss(nn.Module):
         self,
         lambda_rc: float = 0.5,
         lambda_hu: float = 0.3,
-        lambda_edge: float = 1.2,        # Strong edge preservation
-        lambda_texture: float = 1.0,     # Strong texture preservation
-        lambda_hf_noise: float = 3.0,    # Strong noise removal
-        lambda_mid_noise: float = 2.0,   # Strong mid-freq removal
+        lambda_edge: float = 2.0,          # Strong edge preservation
+        lambda_hf_edge: float = 0.8,       # Edge 영역 HF 구조 보존
+        lambda_hf_flat: float = 1.0,       # Flat 영역 HF noise 제거 (완화)
         lambda_syn: float = 0.5,
         lambda_ic: float = 0.1,
         min_body_pixels: int = 512,
         artifact_grad_factor: float = 1.9,
         flat_threshold: float = 0.09,
+        hf_target_ratio: float = 0.5,      # HF noise target ratio (완화)
     ):
         super().__init__()
         self.lambda_rc = lambda_rc
         self.lambda_hu = lambda_hu
         self.lambda_edge = lambda_edge
-        self.lambda_texture = lambda_texture
-        self.lambda_hf_noise = lambda_hf_noise
-        self.lambda_mid_noise = lambda_mid_noise
+        self.lambda_hf_edge = lambda_hf_edge
+        self.lambda_hf_flat = lambda_hf_flat
         self.lambda_syn = lambda_syn
         self.lambda_ic = lambda_ic
         
         self.min_body_pixels = min_body_pixels
         self.artifact_grad_factor = artifact_grad_factor
         self.flat_threshold = flat_threshold
+        self.hf_target_ratio = hf_target_ratio
 
     def forward(self, y_pred, noise_pred, batch_dict):
         y_pred = y_pred.squeeze(2)
@@ -85,61 +85,38 @@ class NoiseRemovalLoss(nn.Module):
         else:
             loss_edge = F.l1_loss(grad_x_pred, grad_x_input) + F.l1_loss(grad_y_pred, grad_y_input)
         
-        # ===== 4. STRONG TEXTURE PRESERVATION (fine vessels, trabecular bone) =====
-        texture_mask = (grad_mag_input > self.flat_threshold) & (grad_mag_input < 0.5)
+        # ===== 4. EDGE 영역 HF 구조 보존 (L_hf_edge) =====
+        lap_input = self._laplacian(x_i)
+        lap_pred = self._laplacian(y_pred)
         
-        if texture_mask.sum() > 100:
-            # Preserve both magnitude AND direction
-            loss_texture = (
-                F.l1_loss(grad_mag_pred[texture_mask], grad_mag_input[texture_mask]) +
-                0.5 * F.l1_loss(grad_x_pred[texture_mask], grad_x_input[texture_mask]) +
-                0.5 * F.l1_loss(grad_y_pred[texture_mask], grad_y_input[texture_mask])
-            )
+        edge_mask = (grad_mag_input > 0.05)
+        
+        if edge_mask.sum() > 100:
+            # Edge 영역에서 HF를 origin과 동일하게 유지
+            loss_hf_edge = F.l1_loss(lap_pred[edge_mask], lap_input[edge_mask])
         else:
-            loss_texture = torch.tensor(0.0, device=y_pred.device)
+            loss_hf_edge = torch.tensor(0.0, device=y_pred.device)
 
-        # ===== 5. MID-FREQ NOISE REMOVAL =====
+        # ===== 5. FLAT 영역 HF NOISE 제거 (L_hf_flat) =====
         flat_mask = (grad_mag_input < self.flat_threshold)
         flat_body_mask = flat_mask & body_mask
-
+        
         if flat_body_mask.sum() > 100:
-            mid_sigma = 1.0
-            low_sigma = 3.0
-            
-            low_input = self._gaussian_blur(x_i, low_sigma)
-            low_pred = self._gaussian_blur(y_pred, low_sigma)
-            
-            mid_input = self._gaussian_blur(x_i, mid_sigma) - low_input
-            mid_pred = self._gaussian_blur(y_pred, mid_sigma) - low_pred
-
-            mid_input_abs = torch.abs(mid_input[flat_body_mask])
-            mid_pred_abs = torch.abs(mid_pred[flat_body_mask])
-            target_mid = 0.2 * mid_input_abs  # Aggressive: 20%
-            loss_mid_noise = F.l1_loss(mid_pred_abs, target_mid)
+            lap_input_abs = torch.abs(lap_input[flat_body_mask])
+            lap_pred_abs = torch.abs(lap_pred[flat_body_mask])
+            # Flat 영역에서 HF를 target ratio로 감소 (덜 공격적)
+            target_hf = self.hf_target_ratio * lap_input_abs
+            loss_hf_flat = F.l1_loss(lap_pred_abs, target_hf)
         else:
-            loss_mid_noise = torch.tensor(0.0, device=y_pred.device)
+            loss_hf_flat = torch.tensor(0.0, device=y_pred.device)
         
-        # ===== 6. HIGH-FREQ NOISE REMOVAL =====
-        lap_input = self._laplacian(x_i)
-        lap_input = lap_input - torch.mean(lap_input, dim=-1, keepdim=True)
-        lap_pred = self._laplacian(y_pred)
-
-        if flat_mask.sum() > 100:
-            lap_input_abs = torch.abs(lap_input[flat_mask])
-            lap_pred_abs = torch.abs(lap_pred[flat_mask])
-            
-            target_hf = 0.2 * lap_input_abs  # Aggressive: 20%
-            loss_hf_noise = F.l1_loss(lap_pred_abs, target_hf)
-        else:
-            loss_hf_noise = torch.tensor(0.0, device=y_pred.device)
-        
-        # ===== 7. SYNTHETIC NOISE SUPERVISION =====
+        # ===== 6. SYNTHETIC NOISE SUPERVISION =====
         if flat_body_mask.sum() > 100:
             loss_syn = F.l1_loss(noise_pred[flat_body_mask], noise_synthetic[flat_body_mask])
         else:
             loss_syn = torch.tensor(0.0, device=y_pred.device)
         
-        # ===== 8. ARTIFACT SUPPRESSION (prevent new artifacts) =====
+        # ===== 7. ARTIFACT SUPPRESSION (prevent new artifacts) =====
         if flat_mask.sum() > 100:
             artifact_penalty = torch.clamp(
                 grad_mag_pred[flat_mask] - self.artifact_grad_factor * grad_mag_input[flat_mask],
@@ -154,9 +131,8 @@ class NoiseRemovalLoss(nn.Module):
             self.lambda_rc * loss_rc
             + self.lambda_hu * loss_hu
             + self.lambda_edge * loss_edge
-            + self.lambda_texture * loss_texture
-            + self.lambda_hf_noise * loss_hf_noise
-            + self.lambda_mid_noise * loss_mid_noise
+            + self.lambda_hf_edge * loss_hf_edge
+            + self.lambda_hf_flat * loss_hf_flat
             + self.lambda_syn * loss_syn
             + self.lambda_ic * loss_ic
         )
@@ -166,9 +142,8 @@ class NoiseRemovalLoss(nn.Module):
             "rc": loss_rc.item(),
             "hu": loss_hu.item() if isinstance(loss_hu, torch.Tensor) else 0.0,
             "edge": loss_edge.item(),
-            "texture": loss_texture.item() if isinstance(loss_texture, torch.Tensor) else 0.0,
-            "hf_noise": loss_hf_noise.item() if isinstance(loss_hf_noise, torch.Tensor) else 0.0,
-            "mid_noise": loss_mid_noise.item() if isinstance(loss_mid_noise, torch.Tensor) else 0.0,
+            "hf_edge": loss_hf_edge.item() if isinstance(loss_hf_edge, torch.Tensor) else 0.0,
+            "hf_flat": loss_hf_flat.item() if isinstance(loss_hf_flat, torch.Tensor) else 0.0,
             "syn": loss_syn.item() if isinstance(loss_syn, torch.Tensor) else 0.0,
             "ic": loss_ic.item() if isinstance(loss_ic, torch.Tensor) else 0.0,
         }

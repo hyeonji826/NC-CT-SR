@@ -266,7 +266,7 @@ class NSN2NDataset(Dataset):
         
         # Target noise level 결정 (adaptive)
         # scale 파라미터로 전체 증폭 조절
-        target_mult = np.random.uniform(1.2, 1.6) * scale
+        target_mult = np.random.uniform(1.1, 1.4) * scale
         target_sigma = sigma_origin * target_mult
 
         # ===== COMPONENT 1: Low-frequency shading (NPS 기반) =====
@@ -305,7 +305,7 @@ class NSN2NDataset(Dataset):
         # Low-freq 우세를 반영: 가중치 증가
         # 기존: 0.6*mf + 0.3*lf + 0.1*streak
         # 개선: lf 비중 크게 증가
-        noise_raw = 0.5 * mf + 0.5 * lf   # streak 완전 제외
+        noise_raw = 0.4 * mf + 0.6 * lf   # streak 완전 제외
         
         # Body 영역에서 noise statistics 측정
         body_noise = noise_raw[body > 0.5]
@@ -313,14 +313,17 @@ class NSN2NDataset(Dataset):
         
         # Target sigma에 맞춰 scaling
         if sigma_raw > 0.0 and target_sigma > sigma_origin:
-            desired_increase = target_sigma - sigma_origin
+            desired_increase = np.sqrt(target_sigma**2 - sigma_origin**2)
             scale_factor = desired_increase / sigma_raw
         else:
             scale_factor = 0.0
         
         noise = noise_raw * scale_factor
-        noisy_hu = hu + noise
+        
+        # Body mask 적용: body 외부는 noise 0
+        noise = noise * body
 
+        noisy_hu = hu + noise
         return noisy_hu.astype(np.float32), noise.astype(np.float32)
 
     # ------------------------------------------------------------------

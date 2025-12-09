@@ -122,7 +122,7 @@ def train_epoch(
     total_loss = 0.0
     loss_components = {
         'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
-        'texture': 0.0, 'hf_noise': 0.0, 'syn': 0.0, 'ic': 0.0
+        'hf_edge': 0.0, 'hf_flat': 0.0, 'syn': 0.0, 'ic': 0.0
     }
     
     for batch_idx, batch in enumerate(train_loader):
@@ -178,7 +178,7 @@ def validate(model, val_loader, criterion, device, use_amp):
     total_loss = 0.0
     loss_components = {
         'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
-        'texture': 0.0, 'hf_noise': 0.0, 'syn': 0.0, 'ic': 0.0
+        'hf_edge': 0.0, 'hf_flat': 0.0, 'syn': 0.0, 'ic': 0.0
     }
     
     with torch.no_grad():
@@ -301,14 +301,14 @@ def main():
             lambda_rc=config["loss"]["lambda_rc"],
             lambda_hu=config["loss"]["lambda_hu"],
             lambda_edge=config["loss"]["lambda_edge"],
-            lambda_texture=config["loss"]["lambda_texture"],
-            lambda_hf_noise=config["loss"]["lambda_hf_noise"],
-            lambda_mid_noise=config["loss"]["lambda_mid_noise"],
+            lambda_hf_flat=config["loss"]["lambda_hf_flat"],
+            lambda_hf_edge=config["loss"]["lambda_hf_edge"],
             lambda_syn=config["loss"]["lambda_syn"],
             lambda_ic=config["loss"]["lambda_ic"],
             min_body_pixels=config["loss"]["min_body_pixels"],
             artifact_grad_factor=config["loss"]["artifact_grad_factor"],
             flat_threshold=config["loss"]["flat_threshold"],
+            hf_target_ratio=config["loss"].get("hf_target_ratio", 0.5),
         ).to(device)
     elif loss_type == "artifact_removal":
         print("Using ArtifactRemovalLoss (Stage 2: Artifact Removal)")
@@ -342,15 +342,6 @@ def main():
             flat_threshold=config["loss"]["flat_threshold"],
         ).to(device)
 
-
-    
-    # Save base lambdas (for potential future adjustments)
-    base_lambda_rc = criterion.lambda_rc
-    base_lambda_hu = criterion.lambda_hu
-    base_lambda_edge = criterion.lambda_edge
-    base_lambda_texture = criterion.lambda_texture
-    base_lambda_hf_noise = criterion.lambda_hf_noise
-    base_lambda_ic = criterion.lambda_ic
     
     # Optimizer and scheduler
     optimizer = torch.optim.AdamW(
@@ -360,11 +351,20 @@ def main():
         weight_decay=config["training"]["weight_decay"],
     )
     
-    scheduler = torch.optim.lr_scheduler.StepLR(
+    # ReduceLROnPlateau: validation loss가 개선되지 않으면 학습률 감소
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        step_size=config["training"]["lr_step_size"],
-        gamma=config["training"]["lr_gamma"],
+        mode='min',
+        factor=config["training"]["lr_gamma"],
+        patience=config["training"].get("lr_patience", 10),
+        verbose=True,
+        min_lr=1e-7,
     )
+    
+    # Warmup scheduler
+    warmup_epochs = config["training"]["warmup_epochs"]
+    warmup_lr_start = config["training"]["warmup_lr"]
+    base_lr = config["training"]["learning_rate"]
     
     # AMP scaler
     scaler = GradScaler('cuda', enabled=config["training"]["use_amp"])
@@ -399,7 +399,11 @@ def main():
     num_epochs = config["training"]["num_epochs"]
     
     for epoch in range(start_epoch, num_epochs + 1):
-        # No dynamic lambda scheduling - new loss targets true noise directly
+        # Warmup learning rate
+        if epoch <= warmup_epochs:
+            lr = warmup_lr_start + (base_lr - warmup_lr_start) * (epoch / warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
         
         # Train
         train_loss, train_comps = train_epoch(
@@ -412,24 +416,37 @@ def main():
             model, val_loader, criterion, device, config["training"]["use_amp"]
         )
         
-        # Step scheduler
-        scheduler.step()
+        # Step scheduler (ReduceLROnPlateau needs validation loss)
+        if epoch > warmup_epochs:
+            scheduler.step(val_loss)
         
         # Print progress
         print(f"Epoch {epoch:03d}/{num_epochs} | "
               f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
               f"LR: {optimizer.param_groups[0]['lr']:.2e}")
-        print(f"  Lambdas: RC={criterion.lambda_rc:.2f}, HU={criterion.lambda_hu:.2f}, "
-              f"Edge={criterion.lambda_edge:.2f}, Texture={criterion.lambda_texture:.2f}, "
-              f"HF_Noise={criterion.lambda_hf_noise:.2f}")
+        
+        if loss_type == "noise_removal":
+            print(f"  Lambdas: RC={criterion.lambda_rc:.2f}, HU={criterion.lambda_hu:.2f}, "
+                  f"Edge={criterion.lambda_edge:.2f}, HF_Edge={criterion.lambda_hf_edge:.2f}, "
+                  f"HF_Flat={criterion.lambda_hf_flat:.2f}")
+        elif loss_type == "artifact_removal":
+            print(f"  Lambdas: RC={criterion.lambda_rc:.2f}, HU={criterion.lambda_hu:.2f}, "
+                  f"Edge={criterion.lambda_edge:.2f}, Texture={criterion.lambda_texture:.2f}, "
+                  f"H_Streak={criterion.lambda_h_streak:.2f}, V_Streak={criterion.lambda_v_streak:.2f}")
         
         # TensorBoard logging
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         writer.add_scalar('Lambda/hu', criterion.lambda_hu, epoch)
-        writer.add_scalar('Lambda/texture', criterion.lambda_texture, epoch)
-        writer.add_scalar('Lambda/hf_noise', criterion.lambda_hf_noise, epoch)
+        
+        if loss_type == "noise_removal":
+            writer.add_scalar('Lambda/hf_edge', criterion.lambda_hf_edge, epoch)
+            writer.add_scalar('Lambda/hf_flat', criterion.lambda_hf_flat, epoch)
+        elif loss_type == "artifact_removal":
+            writer.add_scalar('Lambda/texture', criterion.lambda_texture, epoch)
+            writer.add_scalar('Lambda/h_streak', criterion.lambda_h_streak, epoch)
+            writer.add_scalar('Lambda/v_streak', criterion.lambda_v_streak, epoch)
         
         for key, val in train_comps.items():
             writer.add_scalar(f'Train/{key}', val, epoch)
@@ -460,12 +477,29 @@ def main():
                     lpf_sigma=config["dataset"]["lpf_sigma"],
                     lpf_median_size=config["dataset"]["lpf_median_size"],
                     match_threshold=config["preprocessing"]["match_threshold"],
-                    noise_aug_ratio=config["dataset"]["noise_aug_ratio"],  # ★ 훈련이랑 동일 gain
+                    noise_aug_ratio=config["dataset"]["noise_aug_ratio"],
                     body_hu_range=tuple(config["dataset"]["body_hu_range"]),
                     noise_roi_margin_ratio=config["dataset"]["noise_roi_margin_ratio"],
                     noise_tissue_range=tuple(config["dataset"]["noise_tissue_range"]),
                     noise_default_std=config["dataset"]["noise_default_std"],
-                    mode="train",   # ★ train 모드 → synthetic noise 들어감
+                    mode="val",   # ★ val 모드 → synthetic noise 없음, origin 직접 입력
+                )
+                
+                # Create separate dataset for training visualization (with synthetic noise)
+                dataset_train_viz = NSN2NDataset(
+                    nc_ct_dir=config["data"]["nc_ct_dir"],
+                    hu_window=tuple(config["preprocessing"]["hu_window"]),
+                    patch_size=0,
+                    min_body_fraction=config["preprocessing"]["min_body_fraction"],
+                    lpf_sigma=config["dataset"]["lpf_sigma"],
+                    lpf_median_size=config["dataset"]["lpf_median_size"],
+                    match_threshold=config["preprocessing"]["match_threshold"],
+                    noise_aug_ratio=config["dataset"]["noise_aug_ratio"],
+                    body_hu_range=tuple(config["dataset"]["body_hu_range"]),
+                    noise_roi_margin_ratio=config["dataset"]["noise_roi_margin_ratio"],
+                    noise_tissue_range=tuple(config["dataset"]["noise_tissue_range"]),
+                    noise_default_std=config["dataset"]["noise_default_std"],
+                    mode="train",   # ★ train 모드 → synthetic noise 추가
                 )
                 
                 sample_indices = [0, len(dataset_full_img) // 2]
@@ -475,23 +509,24 @@ def main():
                 denoised_list = []
 
                 for idx in sample_indices[:2]:
-                    sample = dataset_full_img[idx]
-
-                    # Clean center slice (origin)
-                    x_clean = sample["x_i"].unsqueeze(0).to(device)          # (1,1,H,W)
-
-                    # 5-slice volume with synthetic noise (input)
-                    x_5_aug = sample["x_i_aug"].unsqueeze(0).to(device)      # (1,1,5,H,W)
-
-                    # Extract noisy center slice for visualization
-                    # x_i_aug shape: (1, 5, H, W) -> center at index 2
-                    x_noisy_center = sample["x_i_aug"][:, 2:3, :, :].to(device)  # (1,1,H,W)
+                    # ===== Inference mode: origin → clean =====
+                    sample_val = dataset_full_img[idx]
+                    
+                    # Origin (NC CT with real noise)
+                    x_origin = sample_val["x_i"].unsqueeze(0).to(device)  # (1,1,H,W)
+                    
+                    # 5-slice volume (NO synthetic noise)
+                    x_5_origin = sample_val["x_i_aug"].unsqueeze(0).to(device)  # (1,1,5,H,W)
 
                     with autocast('cuda', enabled=config["training"]["use_amp"]):
-                        denoised_out, _ = model(x_5_aug)
+                        denoised_out, _ = model(x_5_origin)
                         denoised_out = denoised_out.squeeze(2)  # (1,1,H,W)
+                    
+                    # ===== Training visualization: noised → origin =====
+                    sample_train = dataset_train_viz[idx]
+                    x_noisy_center = sample_train["x_i_aug"][:, 2:3, :, :].to(device)  # (1,1,H,W)
 
-                    origin_list.append(x_clean.cpu())
+                    origin_list.append(x_origin.cpu())
                     noisy_list.append(x_noisy_center.cpu())
                     denoised_list.append(denoised_out.cpu())
 
@@ -516,6 +551,7 @@ def main():
 
                 print(f"  → Saving denoised samples for epoch {epoch}:")
                 save_simple_samples(
+                    origin=origin_batch,
                     noisy=noisy_batch,
                     denoised=denoised_batch,
                     origin_dir=origin_dir,

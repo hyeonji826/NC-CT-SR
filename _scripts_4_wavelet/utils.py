@@ -120,6 +120,7 @@ def compute_noise_hu(
 # -------------------------------------------------------------------------
 
 def save_simple_samples(
+    origin: torch.Tensor,
     noisy: torch.Tensor,
     denoised: torch.Tensor,
     origin_dir: Path,
@@ -135,23 +136,34 @@ def save_simple_samples(
         label = labels[idx]
 
         # Normalized arrays
+        origin_norm = origin[idx, 0].cpu().numpy()
         noisy_norm = noisy[idx, 0].cpu().numpy()
         denoised_norm = denoised[idx, 0].detach().cpu().numpy()
 
         # Convert to HU
         hu_min, hu_max = hu_window
+        origin_hu = denormalize_to_hu(origin_norm, hu_min, hu_max)
         noisy_hu = denormalize_to_hu(noisy_norm, hu_min, hu_max)
         denoised_hu = denormalize_to_hu(denoised_norm, hu_min, hu_max)
 
         # Apply windowing for visualization
+        origin_win = apply_window(origin_hu, wl=40, ww=400)
         noisy_win = apply_window(noisy_hu, wl=40, ww=400)
         denoised_win = apply_window(denoised_hu, wl=40, ww=400)
 
         # Rotate for display
+        origin_win = np.rot90(origin_win, k=1)
         noisy_win = np.rot90(noisy_win, k=1)
         denoised_win = np.rot90(denoised_win, k=1)
 
         # Compute noise (high-pass)
+        origin_hu_std = compute_noise_hu(
+            origin[idx : idx + 1],
+            hu_window,
+            body_hu_range,
+            use_highpass=True,
+            debug=False,
+        )
         noisy_hu_std = compute_noise_hu(
             noisy[idx : idx + 1],
             hu_window,
@@ -167,37 +179,52 @@ def save_simple_samples(
             debug=False,
         )
 
-        reduction = (
+        reduction_from_noisy = (
             (noisy_hu_std - denoised_hu_std) / noisy_hu_std * 100 if noisy_hu_std > 0 else 0.0
         )
+        reduction_from_origin = (
+            (origin_hu_std - denoised_hu_std) / origin_hu_std * 100 if origin_hu_std > 0 else 0.0
+        )
+        
         print(
-            f"  [{label}] Noisy: {noisy_hu_std:.1f} HU → "
+            f"  [{label}] Origin: {origin_hu_std:.1f} HU → "
+            f"Noisy: {noisy_hu_std:.1f} HU → "
             f"Denoised: {denoised_hu_std:.1f} HU "
-            f"({reduction:.1f}% reduction)"
+            f"(vs Noisy: {reduction_from_noisy:.1f}% ↓, vs Origin: {reduction_from_origin:+.1f}%)"
         )
 
         # Figure size
         h, w = noisy_win.shape
         aspect_ratio = w / h
         fig_height = 8
-        fig_width = fig_height * aspect_ratio
+        fig_width = fig_height * aspect_ratio * 3  # 3 images side by side
 
         # Save by label
         label_dir = denoise_dir / label
         label_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save denoised image
-        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
-        ax.imshow(denoised_win, cmap="gray", vmin=0, vmax=1)
-        ax.axis("off")
-        ax.set_title(
-            f"{label} Denoised - {denoised_hu_std:.1f} HU ({reduction:.1f}% ↓)",
+        # Save 3-panel comparison
+        fig, axes = plt.subplots(1, 3, figsize=(fig_width, fig_height))
+        
+        axes[0].imshow(origin_win, cmap="gray", vmin=0, vmax=1)
+        axes[0].axis("off")
+        axes[0].set_title(f"Origin - {origin_hu_std:.1f} HU", fontsize=14, pad=10)
+        
+        axes[1].imshow(noisy_win, cmap="gray", vmin=0, vmax=1)
+        axes[1].axis("off")
+        axes[1].set_title(f"Noisy - {noisy_hu_std:.1f} HU", fontsize=14, pad=10)
+        
+        axes[2].imshow(denoised_win, cmap="gray", vmin=0, vmax=1)
+        axes[2].axis("off")
+        axes[2].set_title(
+            f"Denoised - {denoised_hu_std:.1f} HU ({reduction_from_origin:+.1f}%)",
             fontsize=14,
             pad=10,
         )
-        plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
-        denoise_path = label_dir / f"epoch_{epoch:03d}.png"
-        plt.savefig(denoise_path, dpi=150, bbox_inches="tight")
+        
+        plt.tight_layout()
+        compare_path = label_dir / f"epoch_{epoch:03d}_comparison.png"
+        plt.savefig(compare_path, dpi=150, bbox_inches="tight")
         plt.close()
 
 
