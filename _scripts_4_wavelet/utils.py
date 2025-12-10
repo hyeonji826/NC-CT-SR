@@ -147,13 +147,9 @@ def save_simple_samples(
         denoised_hu = denormalize_to_hu(denoised_norm, hu_min, hu_max)
 
         # Apply windowing for visualization
-        origin_win = apply_window(origin_hu, wl=40, ww=400)
-        noisy_win = apply_window(noisy_hu, wl=40, ww=400)
         denoised_win = apply_window(denoised_hu, wl=40, ww=400)
 
         # Rotate for display
-        origin_win = np.rot90(origin_win, k=1)
-        noisy_win = np.rot90(noisy_win, k=1)
         denoised_win = np.rot90(denoised_win, k=1)
 
         # Compute noise (high-pass)
@@ -194,37 +190,26 @@ def save_simple_samples(
         )
 
         # Figure size
-        h, w = noisy_win.shape
+        h, w = denoised_win.shape
         aspect_ratio = w / h
         fig_height = 8
-        fig_width = fig_height * aspect_ratio * 3  # 3 images side by side
+        fig_width = fig_height * aspect_ratio
 
         # Save by label
         label_dir = denoise_dir / label
         label_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save 3-panel comparison
-        fig, axes = plt.subplots(1, 3, figsize=(fig_width, fig_height))
-        
-        axes[0].imshow(origin_win, cmap="gray", vmin=0, vmax=1)
-        axes[0].axis("off")
-        axes[0].set_title(f"Origin - {origin_hu_std:.1f} HU", fontsize=14, pad=10)
-        
-        axes[1].imshow(noisy_win, cmap="gray", vmin=0, vmax=1)
-        axes[1].axis("off")
-        axes[1].set_title(f"Noisy - {noisy_hu_std:.1f} HU", fontsize=14, pad=10)
-        
-        axes[2].imshow(denoised_win, cmap="gray", vmin=0, vmax=1)
-        axes[2].axis("off")
-        axes[2].set_title(
+        # Save denoised image only
+        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
+        ax.imshow(denoised_win, cmap="gray", vmin=0, vmax=1)
+        ax.axis("off")
+        ax.set_title(
             f"Denoised - {denoised_hu_std:.1f} HU ({reduction_from_origin:+.1f}%)",
             fontsize=14,
             pad=10,
         )
-        
-        plt.tight_layout()
-        compare_path = label_dir / f"epoch_{epoch:03d}_comparison.png"
-        plt.savefig(compare_path, dpi=150, bbox_inches="tight")
+        plt.subplots_adjust(left=0, right=1, top=0.95, bottom=0)
+        plt.savefig(label_dir / f"epoch_{epoch:03d}.png", dpi=150, bbox_inches="tight")
         plt.close()
 
 
