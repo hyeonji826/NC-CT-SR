@@ -23,17 +23,17 @@ class NoiseRemovalLoss(nn.Module):
     """
     def __init__(
         self,
-        lambda_rc: float = 0.5,
-        lambda_hu: float = 0.3,
-        lambda_edge: float = 2.0,          # Strong edge preservation
-        lambda_hf_edge: float = 0.8,       # Edge 영역 HF 구조 보존
-        lambda_hf_flat: float = 1.0,       # Flat 영역 HF noise 제거 (완화)
-        lambda_syn: float = 0.5,
-        lambda_ic: float = 0.1,
-        min_body_pixels: int = 512,
-        artifact_grad_factor: float = 1.9,
-        flat_threshold: float = 0.09,
-        hf_target_ratio: float = 0.5,      # HF noise target ratio (완화)
+        lambda_rc: float,
+        lambda_hu: float,
+        lambda_edge: float,
+        lambda_hf_edge: float,
+        lambda_hf_flat: float,
+        lambda_syn: float,
+        lambda_ic: float,
+        min_body_pixels: int,
+        artifact_grad_factor: float,
+        flat_threshold: float,
+        hf_target_ratio: float,
     ):
         super().__init__()
         self.lambda_rc = lambda_rc
@@ -78,14 +78,17 @@ class NoiseRemovalLoss(nn.Module):
         grad_mag_input = torch.sqrt(grad_x_input**2 + grad_y_input**2 + 1e-8)
         grad_mag_pred = torch.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-8)
         
-        # Strong edge mask: includes vessels
         edge_mask = (grad_mag_input > 0.05)
-        if edge_mask.sum() > 100:
-            loss_edge = F.l1_loss(grad_mag_pred[edge_mask], grad_mag_input[edge_mask])
-        else:
-            loss_edge = F.l1_loss(grad_x_pred, grad_x_input) + F.l1_loss(grad_y_pred, grad_y_input)
         
-        # ===== 4. EDGE 영역 HF 구조 보존 (L_hf_edge) =====
+        if edge_mask.sum() > 100:
+            loss_edge = F.l1_loss(
+                grad_mag_pred[edge_mask],
+                grad_mag_input[edge_mask],
+            )
+        else:
+            loss_edge = torch.tensor(0.0, device=y_pred.device)
+        
+        # ===== 4. HF EDGE STRUCTURE PRESERVATION (L_hf_edge) =====
         lap_input = self._laplacian(x_i)
         lap_pred = self._laplacian(y_pred)
         
@@ -117,14 +120,12 @@ class NoiseRemovalLoss(nn.Module):
             loss_syn = torch.tensor(0.0, device=y_pred.device)
         
         # ===== 7. ARTIFACT SUPPRESSION (prevent new artifacts) =====
-        if flat_mask.sum() > 100:
-            artifact_penalty = torch.clamp(
-                grad_mag_pred[flat_mask] - self.artifact_grad_factor * grad_mag_input[flat_mask],
-                min=0
-            ).mean()
-            loss_ic = artifact_penalty
-        else:
-            loss_ic = torch.tensor(0.0, device=y_pred.device)
+        grad_mag_ratio = grad_mag_pred / (grad_mag_input + 1e-8)
+        artifact_penalty = torch.clamp(
+            grad_mag_ratio - self.artifact_grad_factor,
+            min=0.0
+        )
+        loss_ic = artifact_penalty.mean()
         
         # ===== TOTAL LOSS =====
         total_loss = (
@@ -136,45 +137,52 @@ class NoiseRemovalLoss(nn.Module):
             + self.lambda_syn * loss_syn
             + self.lambda_ic * loss_ic
         )
-
-        loss_dict = {
-            "total": total_loss.item(),
-            "rc": loss_rc.item(),
-            "hu": loss_hu.item() if isinstance(loss_hu, torch.Tensor) else 0.0,
-            "edge": loss_edge.item(),
-            "hf_edge": loss_hf_edge.item() if isinstance(loss_hf_edge, torch.Tensor) else 0.0,
-            "hf_flat": loss_hf_flat.item() if isinstance(loss_hf_flat, torch.Tensor) else 0.0,
-            "syn": loss_syn.item() if isinstance(loss_syn, torch.Tensor) else 0.0,
-            "ic": loss_ic.item() if isinstance(loss_ic, torch.Tensor) else 0.0,
-        }
         
-        return total_loss, loss_dict
+        return total_loss, {
+            "rc": loss_rc.detach(),
+            "hu": loss_hu.detach(),
+            "edge": loss_edge.detach(),
+            "hf_edge": loss_hf_edge.detach(),
+            "hf_flat": loss_hf_flat.detach(),
+            "syn": loss_syn.detach(),
+            "ic": loss_ic.detach(),
+        }
     
+    # ----------------------------------------------------------------------
+    # Helper filters
+    # ----------------------------------------------------------------------
     def _sobel_x(self, x):
-        kernel = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        """Sobel filter in x-direction"""
+        kernel = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=x.dtype,
+            device=x.device,
+        ).view(1, 1, 3, 3)
         return F.conv2d(x, kernel, padding=1)
     
     def _sobel_y(self, x):
-        kernel = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        """Sobel filter in y-direction"""
+        kernel = torch.tensor(
+            [[-1, -2, -1],
+             [ 0,  0,  0],
+             [ 1,  2,  1]],
+            dtype=x.dtype,
+            device=x.device,
+        ).view(1, 1, 3, 3)
         return F.conv2d(x, kernel, padding=1)
     
     def _laplacian(self, x):
-        kernel = torch.tensor([[0, 1, 0], [1, -4, 1], [0, 1, 0]], 
-                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        """Laplacian filter for HF component"""
+        kernel = torch.tensor(
+            [[0,  1, 0],
+             [1, -4, 1],
+             [0,  1, 0]],
+            dtype=x.dtype,
+            device=x.device,
+        ).view(1, 1, 3, 3)
         return F.conv2d(x, kernel, padding=1)
-
-    def _gaussian_blur(self, x, sigma: float):
-        k = int(6 * sigma + 1)
-        if k % 2 == 0:
-            k += 1
-        coords = torch.arange(k, dtype=x.dtype, device=x.device) - k // 2
-        gauss_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
-        gauss_1d = gauss_1d / gauss_1d.sum()
-        kernel_2d = gauss_1d[:, None] * gauss_1d[None, :]
-        kernel_2d = kernel_2d.view(1, 1, k, k)
-        return F.conv2d(x, kernel_2d, padding=k // 2)
 
 
 # ============================================================================
@@ -191,17 +199,17 @@ class ArtifactRemovalLoss(nn.Module):
     """
     def __init__(
         self,
-        lambda_rc: float = 0.5,
-        lambda_hu: float = 0.3,
-        lambda_edge: float = 1.2,
-        lambda_texture: float = 1.0,
-        lambda_h_streak: float = 3.0,    # Horizontal streak (NPS-guided)
-        lambda_v_streak: float = 1.1,    # Vertical streak (weaker)
-        lambda_lf_artifact: float = 2.0, # Low-freq shading
-        lambda_ic: float = 0.2,
-        min_body_pixels: int = 512,
-        artifact_grad_factor: float = 1.9,
-        flat_threshold: float = 0.09,
+        lambda_rc: float,
+        lambda_hu: float,
+        lambda_edge: float,
+        lambda_texture: float,
+        lambda_h_streak: float,
+        lambda_v_streak: float,
+        lambda_lf_artifact: float,
+        lambda_ic: float,
+        min_body_pixels: int,
+        artifact_grad_factor: float,
+        flat_threshold: float,
     ):
         super().__init__()
         self.lambda_rc = lambda_rc
@@ -218,26 +226,29 @@ class ArtifactRemovalLoss(nn.Module):
         self.flat_threshold = flat_threshold
         
         # Directional filters for streak detection
-        # Horizontal streak: average along width (detect row-wise patterns)
-        kernel_size = 15  # Larger for streak detection
-        self.register_buffer('h_streak_kernel', 
-                           torch.ones(1, 1, 1, kernel_size) / kernel_size)
-        # Vertical streak: average along height
-        self.register_buffer('v_streak_kernel', 
-                           torch.ones(1, 1, kernel_size, 1) / kernel_size)
-
+        # Horizontal streak: 1D kernel along x (W)
+        self.register_buffer(
+            "h_kernel",
+            torch.ones(1, 1, 1, 15) / 15.0,
+        )
+        # Vertical streak: 1D kernel along y (H)
+        self.register_buffer(
+            "v_kernel",
+            torch.ones(1, 1, 15, 1) / 15.0,
+        )
+    
     def forward(self, y_pred, noise_pred, batch_dict):
-        y_pred = y_pred.squeeze(2)
-        noise_pred = noise_pred.squeeze(2)
+        # noise_pred는 Stage 2에서는 사용하지 않음 (인터페이스 통일용)
+        _ = noise_pred
         
+        y_pred = y_pred.squeeze(2)
         x_i = batch_dict["x_i"]
-        x_mid = batch_dict["x_mid"]
         W = batch_dict["W"]
         
-        # ===== 1. WEAK RECONSTRUCTION =====
+        # ===== 1. RECONSTRUCTION (L1) =====
         loss_rc = F.l1_loss(y_pred * W, x_i * W)
         
-        # ===== 2. WEAK HU PRESERVATION =====
+        # ===== 2. HU PRESERVATION =====
         body_mask = (x_i > 0.15) & (x_i < 0.85)
         if body_mask.sum() > self.min_body_pixels:
             mean_input = x_i[body_mask].mean()
@@ -246,7 +257,7 @@ class ArtifactRemovalLoss(nn.Module):
         else:
             loss_hu = torch.tensor(0.0, device=y_pred.device)
         
-        # ===== 3. STRONG EDGE PRESERVATION =====
+        # ===== 3. EDGE PRESERVATION =====
         grad_x_pred = self._sobel_x(y_pred)
         grad_y_pred = self._sobel_y(y_pred)
         grad_x_input = self._sobel_x(x_i)
@@ -257,77 +268,67 @@ class ArtifactRemovalLoss(nn.Module):
         
         edge_mask = (grad_mag_input > 0.05)
         if edge_mask.sum() > 100:
-            loss_edge = F.l1_loss(grad_mag_pred[edge_mask], grad_mag_input[edge_mask])
-        else:
-            loss_edge = F.l1_loss(grad_x_pred, grad_x_input) + F.l1_loss(grad_y_pred, grad_y_input)
-        
-        # ===== 4. STRONG TEXTURE PRESERVATION =====
-        texture_mask = (grad_mag_input > self.flat_threshold) & (grad_mag_input < 0.5)
-        
-        if texture_mask.sum() > 100:
-            loss_texture = (
-                F.l1_loss(grad_mag_pred[texture_mask], grad_mag_input[texture_mask]) +
-                0.5 * F.l1_loss(grad_x_pred[texture_mask], grad_x_input[texture_mask]) +
-                0.5 * F.l1_loss(grad_y_pred[texture_mask], grad_y_input[texture_mask])
+            loss_edge = F.l1_loss(
+                grad_mag_pred[edge_mask],
+                grad_mag_input[edge_mask],
             )
         else:
-            loss_texture = torch.tensor(0.0, device=y_pred.device)
-
-        # ===== 5. HORIZONTAL STREAK REMOVAL (NPS-guided) =====
-        flat_mask = (grad_mag_input < self.flat_threshold)
-        flat_body_mask = flat_mask & body_mask
+            loss_edge = torch.tensor(0.0, device=y_pred.device)
         
-        if flat_body_mask.sum() > 100:
-            # Detect row-wise patterns by averaging along width
-            h_resp_input = self._detect_horizontal_streak(x_i)
-            h_resp_pred = self._detect_horizontal_streak(y_pred)
-            
-            h_input_abs = torch.abs(h_resp_input[flat_body_mask])
-            h_pred_abs = torch.abs(h_resp_pred[flat_body_mask])
-            
-            # Aggressive: reduce to 15%
-            target_h = 0.15 * h_input_abs
-            loss_h_streak = F.l1_loss(h_pred_abs, target_h)
+        # ===== 4. TEXTURE PRESERVATION (L_texture) =====
+        # Body 영역에서 gradient 구조를 유지
+        if body_mask.sum() > self.min_body_pixels:
+            loss_texture = (
+                F.l1_loss(grad_x_pred[body_mask], grad_x_input[body_mask])
+                + F.l1_loss(grad_y_pred[body_mask], grad_y_input[body_mask])
+            ) * 0.5
+        else:
+            loss_texture = torch.tensor(0.0, device=y_pred.device)
+        
+        # ===== 5. DIRECTIONAL STREAK SUPPRESSION =====
+        # Horizontal (x 방향으로 긴 줄무늬)
+        h_input = F.conv2d(x_i, self.h_kernel, padding=(0, 7))
+        h_pred = F.conv2d(y_pred, self.h_kernel, padding=(0, 7))
+        # Vertical
+        v_input = F.conv2d(x_i, self.v_kernel, padding=(7, 0))
+        v_pred = F.conv2d(y_pred, self.v_kernel, padding=(7, 0))
+        
+        # Body mask를 conv 크기에 맞춰 crop
+        body_mask_h = body_mask[:, :, :, 7:-7] if h_input.shape[-1] == body_mask.shape[-1] - 14 else body_mask
+        body_mask_v = body_mask[:, :, 7:-7, :] if v_input.shape[-2] == body_mask.shape[-2] - 14 else body_mask
+        
+        if body_mask_h.sum() > self.min_body_pixels:
+            # Horizontal streak는 더 강하게 억제
+            target_h = 0.15 * torch.abs(h_input[body_mask_h])
+            loss_h_streak = F.l1_loss(torch.abs(h_pred[body_mask_h]), target_h)
         else:
             loss_h_streak = torch.tensor(0.0, device=y_pred.device)
         
-        # ===== 6. VERTICAL STREAK REMOVAL =====
-        if flat_body_mask.sum() > 100:
-            v_resp_input = self._detect_vertical_streak(x_i)
-            v_resp_pred = self._detect_vertical_streak(y_pred)
-            
-            v_input_abs = torch.abs(v_resp_input[flat_body_mask])
-            v_pred_abs = torch.abs(v_resp_pred[flat_body_mask])
-            
-            target_v = 0.15 * v_input_abs
-            loss_v_streak = F.l1_loss(v_pred_abs, target_v)
+        if body_mask_v.sum() > self.min_body_pixels:
+            target_v = 0.4 * torch.abs(v_input[body_mask_v])
+            loss_v_streak = F.l1_loss(torch.abs(v_pred[body_mask_v]), target_v)
         else:
             loss_v_streak = torch.tensor(0.0, device=y_pred.device)
         
-        # ===== 7. LOW-FREQ SHADING REMOVAL =====
-        if flat_body_mask.sum() > 100:
-            low_sigma = 5.0
-            low_input = self._gaussian_blur(x_i, low_sigma)
-            low_pred = self._gaussian_blur(y_pred, low_sigma)
-            low_mid = self._gaussian_blur(x_mid, low_sigma)
-
-            lf_input = (low_input - low_mid)[flat_body_mask]
-            lf_pred = (low_pred - low_mid)[flat_body_mask]
-            
-            # Aggressive: reduce to 20%
-            loss_lf_artifact = F.l1_loss(lf_pred, lf_input * 0.2)
+        # ===== 6. LOW-FREQ ARTIFACT SUPPRESSION (L_lf_artifact) =====
+        lf_input = self._gaussian_blur(x_i, sigma=25.0)
+        lf_pred = self._gaussian_blur(y_pred, sigma=25.0)
+        
+        if body_mask.sum() > self.min_body_pixels:
+            loss_lf_artifact = F.l1_loss(
+                lf_pred[body_mask],
+                lf_input[body_mask],
+            )
         else:
             loss_lf_artifact = torch.tensor(0.0, device=y_pred.device)
         
-        # ===== 8. ARTIFACT SUPPRESSION =====
-        if flat_mask.sum() > 100:
-            artifact_penalty = torch.clamp(
-                grad_mag_pred[flat_mask] - self.artifact_grad_factor * grad_mag_input[flat_mask],
-                min=0
-            ).mean()
-            loss_ic = artifact_penalty
-        else:
-            loss_ic = torch.tensor(0.0, device=y_pred.device)
+        # ===== 7. ARTIFACT CONSISTENCY (IC) =====
+        grad_mag_ratio = grad_mag_pred / (grad_mag_input + 1e-8)
+        artifact_penalty = torch.clamp(
+            grad_mag_ratio - self.artifact_grad_factor,
+            min=0.0,
+        )
+        loss_ic = artifact_penalty.mean()
         
         # ===== TOTAL LOSS =====
         total_loss = (
@@ -340,52 +341,50 @@ class ArtifactRemovalLoss(nn.Module):
             + self.lambda_lf_artifact * loss_lf_artifact
             + self.lambda_ic * loss_ic
         )
-
-        loss_dict = {
-            "total": total_loss.item(),
-            "rc": loss_rc.item(),
-            "hu": loss_hu.item() if isinstance(loss_hu, torch.Tensor) else 0.0,
-            "edge": loss_edge.item(),
-            "texture": loss_texture.item() if isinstance(loss_texture, torch.Tensor) else 0.0,
-            "h_streak": loss_h_streak.item() if isinstance(loss_h_streak, torch.Tensor) else 0.0,
-            "v_streak": loss_v_streak.item() if isinstance(loss_v_streak, torch.Tensor) else 0.0,
-            "lf_artifact": loss_lf_artifact.item() if isinstance(loss_lf_artifact, torch.Tensor) else 0.0,
-            "ic": loss_ic.item() if isinstance(loss_ic, torch.Tensor) else 0.0,
-        }
         
-        return total_loss, loss_dict
+        return total_loss, {
+            "rc": loss_rc.detach(),
+            "hu": loss_hu.detach(),
+            "edge": loss_edge.detach(),
+            "texture": loss_texture.detach(),
+            "h_streak": loss_h_streak.detach(),
+            "v_streak": loss_v_streak.detach(),
+            "lf_artifact": loss_lf_artifact.detach(),
+            "ic": loss_ic.detach(),
+        }
     
-    def _detect_horizontal_streak(self, x):
-        """Detect horizontal streaks by averaging along width"""
-        x_pad = F.pad(x, (self.h_streak_kernel.size(3)//2, self.h_streak_kernel.size(3)//2, 0, 0), mode='replicate')
-        h_avg = F.conv2d(x_pad, self.h_streak_kernel)
-        # High-pass: original - smoothed = streaks
-        h_response = x - h_avg
-        return h_response
-    
-    def _detect_vertical_streak(self, x):
-        """Detect vertical streaks by averaging along height"""
-        x_pad = F.pad(x, (0, 0, self.v_streak_kernel.size(2)//2, self.v_streak_kernel.size(2)//2), mode='replicate')
-        v_avg = F.conv2d(x_pad, self.v_streak_kernel)
-        v_response = x - v_avg
-        return v_response
-    
+    # ----------------------------------------------------------------------
+    # Helper filters
+    # ----------------------------------------------------------------------
     def _sobel_x(self, x):
-        kernel = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
-                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        kernel = torch.tensor(
+            [[-1, 0, 1],
+             [-2, 0, 2],
+             [-1, 0, 1]],
+            dtype=x.dtype,
+            device=x.device,
+        ).view(1, 1, 3, 3)
         return F.conv2d(x, kernel, padding=1)
     
     def _sobel_y(self, x):
-        kernel = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
-                              dtype=x.dtype, device=x.device).view(1, 1, 3, 3)
+        kernel = torch.tensor(
+            [[-1, -2, -1],
+             [ 0,  0,  0],
+             [ 1,  2,  1]],
+            dtype=x.dtype,
+            device=x.device,
+        ).view(1, 1, 3, 3)
         return F.conv2d(x, kernel, padding=1)
-
+    
     def _gaussian_blur(self, x, sigma: float):
-        k = int(6 * sigma + 1)
-        if k % 2 == 0:
-            k += 1
+        """Approximate Gaussian blur via separable conv"""
+        # kernel size ~ 6*sigma
+        k = int(6 * sigma) | 1  # odd
+        if k < 3:
+            return x
+        # 1D Gaussian
         coords = torch.arange(k, dtype=x.dtype, device=x.device) - k // 2
-        gauss_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        gauss_1d = torch.exp(-(coords**2) / (2 * sigma * sigma))
         gauss_1d = gauss_1d / gauss_1d.sum()
         kernel_2d = gauss_1d[:, None] * gauss_1d[None, :]
         kernel_2d = kernel_2d.view(1, 1, k, k)
