@@ -29,14 +29,14 @@ def apply_window(hu_img: np.ndarray, wl: float = 40, ww: float = 400) -> np.ndar
 # -------------------------------------------------------------------------
 
 def load_config(config_path: str) -> dict:
-    """Load YAML configuration file."""
+    """Load YAML configuration file"""
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
     return config
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path: Path):
-    """Save training checkpoint."""
+    """Save training checkpoint"""
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -48,7 +48,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path: Path):
 
 
 def load_checkpoint(checkpoint_path: Path, model, optimizer=None, scheduler=None):
-    """Load checkpoint and restore model / optimizer / scheduler."""
+    """Load checkpoint and restore model / optimizer / scheduler"""
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
@@ -65,7 +65,7 @@ def load_checkpoint(checkpoint_path: Path, model, optimizer=None, scheduler=None
 
 
 # -------------------------------------------------------------------------
-# Noise metric (HU)
+# Noise metric (HU) - ROBUST VERSION
 # -------------------------------------------------------------------------
 
 def compute_noise_hu(
@@ -77,6 +77,11 @@ def compute_noise_hu(
     use_highpass: bool = True,
     debug: bool = False,
 ) -> float:
+    """
+    Compute noise std in HU within body region
+    
+    ROBUST: Relaxed body mask threshold + multiple fallback strategies
+    """
     hu_min, hu_max = hu_window
     arr = x_01[0, 0].detach().cpu().numpy()
     H, W = arr.shape
@@ -86,16 +91,38 @@ def compute_noise_hu(
     w_margin = int(W * (1.0 - roi_w) / 2.0)
     roi = arr[h_margin : H - h_margin, w_margin : W - w_margin]
 
-    # Body mask
-    body_mask_norm = (roi > 0.15) & (roi < 0.85)
+    # ROBUST Body mask with relaxed threshold
+    # Original: (0.15, 0.85) - too narrow for high-noise images
+    # New: (0.10, 0.90) - more permissive
+    body_mask_norm = (roi > 0.10) & (roi < 0.90)
+    
+    if debug:
+        print(f"    [DEBUG] ROI shape: {roi.shape}")
+        print(f"    [DEBUG] ROI value range: [{roi.min():.3f}, {roi.max():.3f}]")
+        print(f"    [DEBUG] Body mask pixels: {body_mask_norm.sum()} / {roi.size}")
+    
+    # Fallback 1: If mask too small, use even more relaxed threshold
     if body_mask_norm.sum() < 100:
+        body_mask_norm = (roi > 0.05) & (roi < 0.95)
+        if debug:
+            print(f"    [DEBUG] Fallback: Relaxed to (0.05, 0.95), pixels: {body_mask_norm.sum()}")
+    
+    # Fallback 2: If still too small, use entire ROI
+    if body_mask_norm.sum() < 100:
+        body_mask_norm = np.ones_like(roi, dtype=bool)
+        if debug:
+            print(f"    [DEBUG] Fallback: Using entire ROI")
+    
+    # Minimal check
+    if body_mask_norm.sum() < 10:
+        if debug:
+            print(f"    [DEBUG] ERROR: Body mask too small (<10 pixels), returning 0.0")
         return 0.0
 
     # Convert to HU
     roi_hu = roi * (hu_max - hu_min) + hu_min
 
     if use_highpass:
-        # High-pass filtering to measure only noise
         lp = gaussian_filter(roi_hu, sigma=1.0)
         hp = roi_hu - lp
         noise_std_hu = float(hp[body_mask_norm].std())
@@ -129,6 +156,7 @@ def save_simple_samples(
     hu_window: Tuple[float, float],
     body_hu_range: Tuple[float, float],
 ):
+    """Save denoised samples by HN/LN"""
     denoise_dir.mkdir(parents=True, exist_ok=True)
 
     labels = ["HN", "LN"]
@@ -146,13 +174,10 @@ def save_simple_samples(
         noisy_hu = denormalize_to_hu(noisy_norm, hu_min, hu_max)
         denoised_hu = denormalize_to_hu(denoised_norm, hu_min, hu_max)
 
-        # Apply windowing for visualization
+        # Apply windowing
         denoised_win = apply_window(denoised_hu, wl=40, ww=400)
 
-        # Rotate for display
-        denoised_win = np.rot90(denoised_win, k=1)
-
-        # Compute noise (high-pass)
+        # Compute noise
         origin_hu_std = compute_noise_hu(
             origin[idx : idx + 1],
             hu_window,
@@ -186,20 +211,17 @@ def save_simple_samples(
             f"  [{label}] Origin: {origin_hu_std:.1f} HU → "
             f"Noisy: {noisy_hu_std:.1f} HU → "
             f"Denoised: {denoised_hu_std:.1f} HU "
-            f"(vs Noisy: {reduction_from_noisy:.1f}% ↓, vs Origin: {reduction_from_origin:+.1f}%)"
+            f"(vs Noisy: {reduction_from_noisy:.1f}%↓, vs Origin: {reduction_from_origin:+.1f}%)"
         )
 
-        # Figure size
         h, w = denoised_win.shape
         aspect_ratio = w / h
         fig_height = 8
         fig_width = fig_height * aspect_ratio
 
-        # Save by label
         label_dir = denoise_dir / label
         label_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save denoised image only
         fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_height))
         ax.imshow(denoised_win, cmap="gray", vmin=0, vmax=1)
         ax.axis("off")
@@ -221,7 +243,7 @@ def save_origin_noised_samples(
     hu_window: Tuple[float, float],
     body_hu_range: Tuple[float, float],
 ):
-    """Save origin (clean NC) and synthetic noised images once"""
+    """Save origin and noised samples once"""
     origin_dir.mkdir(parents=True, exist_ok=True)
     noised_dir.mkdir(parents=True, exist_ok=True)
 
@@ -229,37 +251,30 @@ def save_origin_noised_samples(
     for idx in range(min(2, origin.shape[0])):
         label = labels[idx]
 
-        # Normalized arrays
         origin_norm = origin[idx, 0].cpu().numpy()
         noised_norm = noised[idx, 0].cpu().numpy()
 
-        # Convert to HU
         hu_min, hu_max = hu_window
         origin_hu_img = denormalize_to_hu(origin_norm, hu_min, hu_max)
         noised_hu_img = denormalize_to_hu(noised_norm, hu_min, hu_max)
 
-        # Apply windowing
         origin_win = apply_window(origin_hu_img, wl=40, ww=400)
         noised_win = apply_window(noised_hu_img, wl=40, ww=400)
 
-        # Rotate
-        origin_win = np.rot90(origin_win, k=1)
-        noised_win = np.rot90(noised_win, k=1)
-
-        # Compute noise
+        # Compute noise with debug for first sample
         origin_hu_std = compute_noise_hu(
             origin[idx : idx + 1],
             hu_window,
             body_hu_range,
             use_highpass=True,
-            debug=False,
+            debug=(idx == 0),  # Debug first sample only
         )
         noised_hu_std = compute_noise_hu(
             noised[idx : idx + 1],
             hu_window,
             body_hu_range,
             use_highpass=True,
-            debug=False,
+            debug=(idx == 0),
         )
 
         print(f"  [{label}] Origin: {origin_hu_std:.1f} HU → Noised: {noised_hu_std:.1f} HU")
@@ -293,7 +308,7 @@ def save_origin_noised_samples(
 # -------------------------------------------------------------------------
 
 class EarlyStopping:
-    """Early stopping handler."""
+    """Early stopping handler"""
 
     def __init__(self, patience: int = 50, min_delta: float = 0.00003):
         self.patience = patience

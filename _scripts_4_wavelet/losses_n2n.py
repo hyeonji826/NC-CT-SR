@@ -34,6 +34,7 @@ class NoiseRemovalLoss(nn.Module):
         artifact_grad_factor: float,
         flat_threshold: float,
         hf_target_ratio: float,
+        edge_threshold: float = 0.05,  # Edge detection threshold
     ):
         super().__init__()
         self.lambda_rc = lambda_rc
@@ -47,6 +48,7 @@ class NoiseRemovalLoss(nn.Module):
         self.min_body_pixels = min_body_pixels
         self.artifact_grad_factor = artifact_grad_factor
         self.flat_threshold = flat_threshold
+        self.edge_threshold = edge_threshold
         self.hf_target_ratio = hf_target_ratio
 
     def forward(self, y_pred, noise_pred, batch_dict):
@@ -78,7 +80,7 @@ class NoiseRemovalLoss(nn.Module):
         grad_mag_input = torch.sqrt(grad_x_input**2 + grad_y_input**2 + 1e-8)
         grad_mag_pred = torch.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-8)
         
-        edge_mask = (grad_mag_input > 0.05)
+        edge_mask = (grad_mag_input > self.edge_threshold)
         
         if edge_mask.sum() > 100:
             loss_edge = F.l1_loss(
@@ -92,7 +94,7 @@ class NoiseRemovalLoss(nn.Module):
         lap_input = self._laplacian(x_i)
         lap_pred = self._laplacian(y_pred)
         
-        edge_mask = (grad_mag_input > 0.05)
+        edge_mask = (grad_mag_input > self.edge_threshold)
         
         if edge_mask.sum() > 100:
             # Edge 영역에서 HF를 origin과 동일하게 유지
@@ -210,6 +212,7 @@ class ArtifactRemovalLoss(nn.Module):
         min_body_pixels: int,
         artifact_grad_factor: float,
         flat_threshold: float,
+        edge_threshold: float = 0.05,
     ):
         super().__init__()
         self.lambda_rc = lambda_rc
@@ -224,6 +227,7 @@ class ArtifactRemovalLoss(nn.Module):
         self.min_body_pixels = min_body_pixels
         self.artifact_grad_factor = artifact_grad_factor
         self.flat_threshold = flat_threshold
+        self.edge_threshold = edge_threshold
         
         # Directional filters for streak detection
         # Horizontal streak: 1D kernel along x (W)
@@ -266,7 +270,7 @@ class ArtifactRemovalLoss(nn.Module):
         grad_mag_input = torch.sqrt(grad_x_input**2 + grad_y_input**2 + 1e-8)
         grad_mag_pred = torch.sqrt(grad_x_pred**2 + grad_y_pred**2 + 1e-8)
         
-        edge_mask = (grad_mag_input > 0.05)
+        edge_mask = (grad_mag_input > self.edge_threshold)
         if edge_mask.sum() > 100:
             loss_edge = F.l1_loss(
                 grad_mag_pred[edge_mask],

@@ -1,9 +1,7 @@
 """
-NS-N2N Training Script with Plan B Strategy
-
-Plan B: Structure/HU preservation FIRST, noise reduction LATER
-- Early epochs (0-30): Strong lambda_rc/hu/edge, weak lambda_noise
-- Later epochs (30+): Gradually increase lambda_noise
+NS-N2N Training Script
+Stage 1: Noise Removal (random high-freq grain)
+Stage 2: Artifact Removal (directional streaks, shading)
 """
 
 import sys
@@ -12,13 +10,14 @@ import argparse
 from pathlib import Path
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 from model_3d_unet_trans import UNet3DTransformer
-from losses_n2n import NoiseRemovalLoss, ArtifactRemovalLoss, HighQualityNSN2NLoss
+from losses_n2n import NoiseRemovalLoss, ArtifactRemovalLoss
+from dataset_n2n import NSN2NDataset
 from utils import (
     load_config,
     save_checkpoint,
@@ -30,7 +29,6 @@ from utils import (
 
 
 def set_seed(seed: int):
-    """Set random seed for reproducibility"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -38,37 +36,14 @@ def set_seed(seed: int):
 
 
 def create_dataloaders(config: dict):
-    """Create train and validation dataloaders with separate datasets"""
-    from dataset_n2n import NSN2NDataset  # Local import to avoid circular
-    
+    """Create train/val dataloaders"""
     nc_ct_dir = config["data"]["nc_ct_dir"]
     hu_window = tuple(config["preprocessing"]["hu_window"])
     patch_size = config["preprocessing"]["patch_size"]
     min_body_fraction = config["preprocessing"]["min_body_fraction"]
-    
     batch_size = config["training"]["batch_size"]
     num_workers = config["training"]["num_workers"]
-
-    # Slice noise map (for NPS-guided noise augmentation)
-    slice_noise_csv = Path(config["dataset"]["slice_noise_csv"])
-    slice_noise_map = None
-    slice_noise_mean = None
-    
-    if slice_noise_csv.is_file():
-        import pandas as pd
-        df_noise = pd.read_csv(slice_noise_csv)
-        # Expect columns: patient, z, noise_std (HU)
-        slice_noise_map = {
-            (str(row["patient"]), int(row["z"])): float(row["noise_std"])
-            for _, row in df_noise.iterrows()
-        }
-        slice_noise_mean = df_noise["noise_std"].mean()
-        print(f"[INFO] Loaded slice noise map from {slice_noise_csv}")
-        print(f"       Global mean noise_std (HU): {slice_noise_mean:.2f}")
-    else:
-        print(f"[WARN] slice_noise_csv not found: {slice_noise_csv}")
-    
-    from dataset_n2n import NSN2NDataset
+    slice_noise_csv = config["dataset"].get("slice_noise_csv", None)
 
     # Train dataset (with NPS-guided synthetic noise)
     dataset_train = NSN2NDataset(
@@ -84,15 +59,17 @@ def create_dataloaders(config: dict):
         noise_roi_margin_ratio=config["dataset"]["noise_roi_margin_ratio"],
         noise_tissue_range=tuple(config["dataset"]["noise_tissue_range"]),
         noise_default_std=config["dataset"]["noise_default_std"],
-        slice_noise_csv=slice_noise_csv if slice_noise_csv.is_file() else None,
+        slice_noise_csv=slice_noise_csv,
         mode="train",
+        augment_streaks=config["dataset"].get("augment_streaks", False),
+        streak_strength=config["dataset"].get("streak_strength", 0.1),
     )
 
     # Validation dataset (no synthetic noise, origin only)
     dataset_val = NSN2NDataset(
         nc_ct_dir=nc_ct_dir,
         hu_window=hu_window,
-        patch_size=patch_size,
+        patch_size=0,  # No crop for validation
         min_body_fraction=min_body_fraction,
         lpf_sigma=config["dataset"]["lpf_sigma"],
         lpf_median_size=config["dataset"]["lpf_median_size"],
@@ -116,26 +93,21 @@ def create_dataloaders(config: dict):
     )
     val_loader = DataLoader(
         dataset_val,
-        batch_size=batch_size,
+        batch_size=2,  # Fixed: HN/LN pair
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
         drop_last=False,
     )
 
     return train_loader, val_loader
 
 
-def train_epoch(
-    model, train_loader, criterion, optimizer, scaler, device, use_amp
-):
+def train_epoch(model, train_loader, criterion, optimizer, scaler, device, use_amp):
     """Train for one epoch"""
     model.train()
     total_loss = 0.0
-    loss_components = {
-        'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
-        'hf_edge': 0.0, 'hf_flat': 0.0, 'syn': 0.0, 'ic': 0.0
-    }
+    loss_components = {}
     
     for batch in train_loader:
         x_i = batch["x_i"].to(device)
@@ -172,9 +144,8 @@ def train_epoch(
             optimizer.step()
         
         total_loss += loss.item()
-        for k in loss_components.keys():
-            if k in comp:
-                loss_components[k] += comp[k].item()
+        for k, v in comp.items():
+            loss_components[k] = loss_components.get(k, 0.0) + v.item()
     
     n = len(train_loader)
     total_loss /= n
@@ -184,17 +155,18 @@ def train_epoch(
     return total_loss, loss_components
 
 
-def validate_epoch(model, val_loader, criterion, device, use_amp):
-    """Validation for one epoch"""
+def validate_epoch(
+    model, val_loader, criterion, device, use_amp,
+    sample_dir, origin_dir, noised_dir, epoch,
+    hu_window, body_hu_range, save_samples=False
+):
+    """Validation for one epoch with sample saving"""
     model.eval()
     total_loss = 0.0
-    loss_components = {
-        'rc': 0.0, 'hu': 0.0, 'edge': 0.0,
-        'hf_edge': 0.0, 'hf_flat': 0.0, 'syn': 0.0, 'ic': 0.0
-    }
+    loss_components = {}
     
     with torch.no_grad():
-        for batch in val_loader:
+        for i, batch in enumerate(val_loader):
             x_i = batch["x_i"].to(device)
             x_i_aug = batch["x_i_aug"].to(device)
             x_ip1 = batch["x_ip1"].to(device)
@@ -219,9 +191,25 @@ def validate_epoch(model, val_loader, criterion, device, use_amp):
                 loss, comp = criterion(y_pred, noise_pred, batch_dict)
             
             total_loss += loss.item()
-            for k in loss_components.keys():
-                if k in comp:
-                    loss_components[k] += comp[k].item()
+            for k, v in comp.items():
+                loss_components[k] = loss_components.get(k, 0.0) + v.item()
+            
+            # Save first batch samples
+            if save_samples and i == 0:
+                # origin: x_i (clean center slice, no flip)
+                # noised: x_i_aug center slice (synthetic noise added, no flip)
+                # denoised: y_pred (model output)
+                x_i_center = x_i_aug[:, :, 2:3, :, :]  # (B, 1, 1, H, W)
+                save_simple_samples(
+                    origin=x_i.squeeze(2),
+                    noisy=x_i_center.squeeze(2),
+                    denoised=y_pred.squeeze(2),
+                    origin_dir=origin_dir,
+                    denoise_dir=sample_dir,
+                    epoch=epoch,
+                    hu_window=hu_window,
+                    body_hu_range=body_hu_range,
+                )
     
     n = len(val_loader)
     total_loss /= n
@@ -232,67 +220,57 @@ def validate_epoch(model, val_loader, criterion, device, use_amp):
 
 
 def main():
-    # Parse arguments
     parser = argparse.ArgumentParser(description='Train NS-N2N CT Denoising Model')
-    parser.add_argument('--config', type=str, default=None,
-                        help='Path to config file (default: looks for config/config_n2n.yaml or config_n2n.yaml)')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to config YAML file')
     args = parser.parse_args()
     
-    # Load configuration - try multiple paths
-    if args.config:
-        config_path = Path(args.config)
-    else:
-        # Try config folder first, then same directory
-        script_dir = Path(__file__).parent
-        possible_paths = [
-            script_dir / "config" / "config_n2n.yaml",
-            script_dir / "config_n2n.yaml",
-        ]
-        for p in possible_paths:
-            if p.is_file():
-                config_path = p
-                break
-        else:
-            print("ERROR: No config file specified and no default config found.")
-            sys.exit(1)
+    config = load_config(args.config)
+    print(f"[INFO] Loaded config from {args.config}")
     
-    config = load_config(config_path)
-    print(f"[INFO] Loaded config from {config_path}")
-    
-    # Set device and seed
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
-    set_seed(config.get("seed", 42))
+    set_seed(config["training"].get("seed", 42))
     
-    # Create output directory
-    output_dir = Path(config["data"]["output_dir"]) / config["experiment"]["name"]
+    # Output directory: stage-specific with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_name = config["training"]["exp_name"]
+    output_dir = Path(config["data"]["output_dir"]) / f"{exp_name}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    
     ckpt_dir = output_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
     log_dir = output_dir / "logs"
     log_dir.mkdir(exist_ok=True)
+    sample_dir = output_dir / "sample" / "denoise"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    origin_dir = output_dir / "sample" / "origin"
+    origin_dir.mkdir(parents=True, exist_ok=True)
+    noised_dir = output_dir / "sample" / "noise"
+    noised_dir.mkdir(parents=True, exist_ok=True)
     
-    # TensorBoard writer
+    # Save config copy
+    import shutil
+    shutil.copy(args.config, output_dir / "config.yaml")
+    
+    # TensorBoard
     writer = SummaryWriter(log_dir=str(log_dir))
     
-    # Create dataloaders
+    # Dataloaders
     train_loader, val_loader = create_dataloaders(config)
     
-    # Create model
+    # Model
     model = UNet3DTransformer(
-        in_chans=config["model"]["in_chans"],
-        img_size=config["model"]["img_size"],
-        window_size=config["model"]["window_size"],
-        img_range=config["model"]["img_range"],
-        depths=config["model"]["depths"],
-        embed_dim=config["model"]["embed_dim"],
+        in_channels=1,
+        base_channels=config["model"]["base_channels"],
         num_heads=config["model"]["num_heads"],
     ).to(device)
     
     # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=config["training"]["lr"],
+        lr=config["training"]["learning_rate"],
+        betas=config["training"]["betas"],
         weight_decay=config["training"]["weight_decay"],
     )
     
@@ -300,31 +278,27 @@ def main():
     use_amp = config["training"].get("use_amp", True)
     scaler = GradScaler(enabled=use_amp)
     
-    # ============================================================
-    # LOSS FUNCTION SELECTION
-    # - "noise_removal": Stage 1 (random noise removal)
-    # - "artifact_removal": Stage 2 (directional streaks, shading)
-    # - default: HighQualityNSN2NLoss (legacy)
-    # ============================================================
-    loss_type = config["loss"].get("loss_type", "default")
+    # Loss function selection
+    loss_type = config["loss"]["loss_type"]
     
     if loss_type == "noise_removal":
-        print("Using NoiseRemovalLoss (Stage 1: Random Noise Removal)")
+        print("[INFO] Using NoiseRemovalLoss (Stage 1)")
         criterion = NoiseRemovalLoss(
             lambda_rc=config["loss"]["lambda_rc"],
             lambda_hu=config["loss"]["lambda_hu"],
             lambda_edge=config["loss"]["lambda_edge"],
-            lambda_hf_flat=config["loss"]["lambda_hf_flat"],
             lambda_hf_edge=config["loss"]["lambda_hf_edge"],
+            lambda_hf_flat=config["loss"]["lambda_hf_flat"],
             lambda_syn=config["loss"]["lambda_syn"],
             lambda_ic=config["loss"]["lambda_ic"],
             min_body_pixels=config["loss"]["min_body_pixels"],
             artifact_grad_factor=config["loss"]["artifact_grad_factor"],
             flat_threshold=config["loss"]["flat_threshold"],
-            hf_target_ratio=config["loss"].get("hf_target_ratio", 0.5),
+            hf_target_ratio=config["loss"]["hf_target_ratio"],
+            edge_threshold=config["loss"].get("edge_threshold", 0.05),
         ).to(device)
     elif loss_type == "artifact_removal":
-        print("Using ArtifactRemovalLoss (Stage 2: Artifact Removal)")
+        print("[INFO] Using ArtifactRemovalLoss (Stage 2)")
         criterion = ArtifactRemovalLoss(
             lambda_rc=config["loss"]["lambda_rc"],
             lambda_hu=config["loss"]["lambda_hu"],
@@ -337,63 +311,80 @@ def main():
             min_body_pixels=config["loss"]["min_body_pixels"],
             artifact_grad_factor=config["loss"]["artifact_grad_factor"],
             flat_threshold=config["loss"]["flat_threshold"],
+            edge_threshold=config["loss"].get("edge_threshold", 0.05),
         ).to(device)
     else:
-        print("Using HighQualityNSN2NLoss (Default/Legacy)")
-        criterion = HighQualityNSN2NLoss(
-            lambda_rc=config["loss"]["lambda_rc"],
-            lambda_hu=config["loss"]["lambda_hu"],
-            lambda_edge=config["loss"]["lambda_edge"],
-            lambda_texture=config["loss"]["lambda_texture"],
-            lambda_hf_noise=config["loss"].get("lambda_hf_noise", 1.5),
-            lambda_syn=config["loss"].get("lambda_syn", 0.4),
-            lambda_ic=config["loss"]["lambda_ic"],
-            lambda_mid_noise=config["loss"].get("lambda_mid_noise", 0.8),
-            lambda_lf_artifact=config["loss"].get("lambda_lf_artifact", 0.6),
-            min_body_pixels=config["loss"]["min_body_pixels"],
-            artifact_grad_factor=config["loss"]["artifact_grad_factor"],
-            flat_threshold=config["loss"]["flat_threshold"],
-        ).to(device)
+        raise ValueError(f"Unknown loss_type: {loss_type}")
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=config["training"]["epochs"],
-        eta_min=config["training"]["min_lr"],
+        mode='min',
+        factor=config["training"]["lr_gamma"],
+        patience=config["training"]["lr_patience"],
+        verbose=True,
     )
+    
+    # Resume or load pretrained
+    start_epoch = 1
+    resume_path = config["training"].get("resume", None)
+    if resume_path and Path(resume_path).is_file():
+        print(f"[INFO] Loading checkpoint from {resume_path}")
+        epoch, loss = load_checkpoint(Path(resume_path), model, optimizer, scheduler)
+        start_epoch = epoch + 1
+        print(f"[INFO] Resumed from epoch {epoch} (loss: {loss:.4f})")
     
     # Early stopping
     early_stopping = EarlyStopping(
         patience=config["training"]["early_stopping_patience"],
-        delta=config["training"]["early_stopping_delta"],
-        verbose=True,
-        path=str(ckpt_dir / "best_model.pth"),
+        min_delta=config["training"]["early_stopping_delta"],
     )
     
-    # ============================================================
-    # TRAINING LOOP
-    # ============================================================
-    num_epochs = config["training"]["epochs"]
-    global_step = 0
+    # Training loop
+    num_epochs = config["training"]["num_epochs"]
     best_val_loss = float("inf")
     
-    for epoch in range(1, num_epochs + 1):
+    # Save origin/noised samples once (epoch 0)
+    print("\n[INFO] Saving origin/noised samples...")
+    model.eval()
+    with torch.no_grad():
+        # Use train_loader to get synthetic noise
+        train_iter = iter(train_loader)
+        batch = next(train_iter)
+        
+        x_i = batch["x_i"].to(device)
+        x_i_aug = batch["x_i_aug"].to(device)
+        x_i_center = x_i_aug[:, :, 2:3, :, :]
+        
+        # Take first 2 samples (HN/LN)
+        save_origin_noised_samples(
+            origin=x_i[:2].squeeze(2),
+            noised=x_i_center[:2].squeeze(2),
+            origin_dir=origin_dir,
+            noised_dir=noised_dir,
+            hu_window=tuple(config["preprocessing"]["hu_window"]),
+            body_hu_range=tuple(config["dataset"]["body_hu_range"]),
+        )
+    
+    for epoch in range(start_epoch, num_epochs + 1):
         print(f"\nEpoch {epoch:03d}/{num_epochs}")
         
-        # Train
         train_loss, train_comp = train_epoch(
             model, train_loader, criterion, optimizer, scaler, device, use_amp
         )
-        # Validate
+        
+        save_samples = (epoch % config["training"]["sample_interval"] == 0)
         val_loss, val_comp = validate_epoch(
-            model, val_loader, criterion, device, use_amp
+            model, val_loader, criterion, device, use_amp,
+            sample_dir, origin_dir, noised_dir, epoch,
+            tuple(config["preprocessing"]["hu_window"]),
+            tuple(config["dataset"]["body_hu_range"]),
+            save_samples=save_samples,
         )
         
-        # Scheduler step
-        scheduler.step()
+        scheduler.step(val_loss)
         
-        # Logging
-        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+        print(f"Train: {train_loss:.4f} | Val: {val_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
         writer.add_scalar("Loss/train", train_loss, epoch)
         writer.add_scalar("Loss/val", val_loss, epoch)
         
@@ -403,51 +394,38 @@ def main():
             writer.add_scalar(f"Val/{k}", v, epoch)
         
         # Save checkpoint
-        save_checkpoint(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "config": config,
-                "val_loss": val_loss,
-            },
-            ckpt_dir / f"model_epoch_{epoch:03d}.pth",
-        )
+        if epoch % config["training"]["save_interval"] == 0:
+            save_checkpoint(
+                model, optimizer, scheduler, epoch, val_loss,
+                ckpt_dir / f"model_epoch_{epoch:03d}.pth"
+            )
         
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "config": config,
-                    "val_loss": val_loss,
-                },
-                ckpt_dir / "best_model.pth",
+                model, optimizer, scheduler, epoch, val_loss,
+                ckpt_dir / "best_model.pth"
             )
+            print(f"  [BEST] Saved best model (val_loss: {val_loss:.4f})")
         
-        # Early stopping check
-        early_stopping(val_loss)
-        if early_stopping.early_stop:
+        # Early stopping
+        if early_stopping(val_loss):
             print("Early stopping triggered!")
             break
         
         # Cleanup old checkpoints
         if epoch % (config["training"]["save_interval"] * 3) == 0:
             all_ckpts = sorted(ckpt_dir.glob("model_epoch_*.pth"))
-            if len(all_ckpts) > config["training"]["keep_last_n"]:
-                for old_ckpt in all_ckpts[:-config["training"]["keep_last_n"]]:
+            keep_last_n = config["training"]["keep_last_n"]
+            if len(all_ckpts) > keep_last_n:
+                for old_ckpt in all_ckpts[:-keep_last_n]:
                     old_ckpt.unlink()
     
     writer.close()
     print(f"\n{'='*70}")
     print(f"Training completed! Best val loss: {best_val_loss:.4f}")
+    print(f"Output directory: {output_dir}")
     print(f"{'='*70}\n")
 
 

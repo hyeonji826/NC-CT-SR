@@ -32,6 +32,8 @@ class NSN2NDataset(Dataset):
         noise_default_std: float = 0.1,
         mode: str = "train",
         slice_noise_csv: str | None = None,
+        augment_streaks: bool = False,  # Stage 2에서 True
+        streak_strength: float = 0.15,  # Streak 강도 (0~1)
     ) -> None:
 
         super().__init__()
@@ -45,6 +47,8 @@ class NSN2NDataset(Dataset):
         self.lpf_median_size = int(lpf_median_size)
         self.match_threshold = float(match_threshold)
         self.noise_aug_ratio = float(noise_aug_ratio)
+        self.augment_streaks = augment_streaks
+        self.streak_strength = streak_strength
         self.mode = mode
 
         self.body_hu_min, self.body_hu_max = float(body_hu_range[0]), float(body_hu_range[1])
@@ -246,7 +250,9 @@ class NSN2NDataset(Dataset):
     def _add_ct_like_noise_nps_guided(
         self, 
         hu: np.ndarray, 
-        scale: float = 1.5
+        scale: float = 1.5,
+        augment_streaks: bool = False,
+        streak_strength: float = 0.1,
     ) -> Tuple[np.ndarray, np.ndarray]:
 
         hu = hu.astype(np.float32)
@@ -302,10 +308,15 @@ class NSN2NDataset(Dataset):
             streak += amp_v * np.sin(2.0 * np.pi * freq_v * xx + phase_v)
         
         # ===== WEIGHTED COMBINATION (NPS 기반) =====
-        # Low-freq 우세를 반영: 가중치 증가
-        # 기존: 0.6*mf + 0.3*lf + 0.1*streak
-        # 개선: lf 비중 크게 증가
-        noise_raw = 0.4 * mf + 0.6 * lf   # streak 완전 제외
+        # augment_streaks=True: Stage별로 streak 포함 (artifact 학습)
+        # augment_streaks=False: Random noise만 (streak 제외)
+        if augment_streaks:
+            # Stage 1: 약한 streak (모델이 artifact 패턴 학습)
+            # Stage 2: 더 강한 streak (artifact 제거 강화)
+            noise_raw = (1.0 - streak_strength) * (0.4 * mf + 0.6 * lf) + streak_strength * streak
+        else:
+            # Streak 완전 제외 (랜덤 noise만)
+            noise_raw = 0.4 * mf + 0.6 * lf
         
         # Body 영역에서 noise statistics 측정
         body_noise = noise_raw[body > 0.5]
@@ -386,6 +397,8 @@ class NSN2NDataset(Dataset):
             noisy_hu, noise_hu = self._add_ct_like_noise_nps_guided(
                 hu_center, 
                 scale=scale,
+                augment_streaks=self.augment_streaks,
+                streak_strength=self.streak_strength,
             )
             x_center_noisy = self._window_and_normalize(noisy_hu)
             noise_synthetic = (x_center_noisy - x_center).astype(np.float32)
@@ -406,10 +419,11 @@ class NSN2NDataset(Dataset):
             x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic
         )
 
-        # flip augmentation
-        x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic = self._maybe_flip(
-            x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic
-        )
+        # flip augmentation (only for train mode)
+        if self.mode == "train":
+            x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic = self._maybe_flip(
+                x_5slices_aug, x_center, x_pair, x_mid, W, noise_synthetic
+            )
 
         # contiguous arrays
         x_5slices_aug = np.ascontiguousarray(x_5slices_aug)
