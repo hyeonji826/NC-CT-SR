@@ -1,0 +1,6 @@
+# artifact removal 실행코드
+cd "f:\LD-CT SR\_scripts_2"
+python train.py --config config_streak_removal.yaml --mode streak_removal
+
+ 체크포인트에서 재개할 때
+python train.py --config config_streak_removal.yaml --mode streak_removal --resume "경로/best_model.pth"

@@ -419,57 +419,28 @@ def sinogram_to_ct_tensor(sinogram_tensor: torch.Tensor, n_angles: int = 360,
 # 샘플 시각화 저장
 # ============================================================
 
-def save_sample_images(images_dict: Dict[str, torch.Tensor],
-                       save_path: str, epoch: int,
-                       window_level: float = 40.0,
-                       window_width: float = 400.0,
-                       metrics: Dict[str, float] = None,
-                       rotation: int = -1) -> None:
+def save_ct_slice(tensor: torch.Tensor,
+                  save_path: str,
+                  window_level: float = 40.0,
+                  window_width: float = 400.0) -> None:
     """
-    학습 중 시각화용 샘플 이미지를 저장한다.
-    CT 윈도잉을 적용하여 진단적 대비를 갖는 8-bit 영상으로 출력.
+    단일 CT 슬라이스를 그대로 저장 (회전/반전 없음).
+    CT 윈도잉 적용하여 8-bit grayscale PNG로 저장.
 
     Args:
-        images_dict: {'name': tensor} 형태의 이미지 딕셔너리
+        tensor: (1, 1, H, W) or (B, 1, H, W) normalized [-1, 1] tensor
         save_path: 저장 경로
-        epoch: 에폭 번호
         window_level: CT 윈도우 레벨 (HU)
         window_width: CT 윈도우 폭 (HU)
-        metrics: {'psnr': float, 'ssim': float} 형태의 지표 (선택)
     """
     try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
+        from skimage.io import imsave
     except ImportError:
         return
 
-    n_images = len(images_dict)
-    fig, axes = plt.subplots(1, n_images, figsize=(4 * n_images, 4))
-    if n_images == 1:
-        axes = [axes]
-
-    for ax, (name, tensor) in zip(axes, images_dict.items()):
-        img = tensor.detach().cpu().numpy().squeeze()
-        display = apply_ct_window(img, window_level, window_width)
-        display = np.rot90(display, k=rotation)  # rotation: -1=오른쪽, 1=왼쪽
-        display = np.flipud(display)              # 상하 반전
-        display = np.fliplr(display)              # 좌우 반전
-        ax.imshow(display, cmap='gray', vmin=0, vmax=255)
-        ax.set_title(name, fontsize=10)
-        ax.axis('off')
-
-    # 제목: 에폭 + 윈도우 설정 + 지표
-    title_parts = [f'Epoch {epoch}  (WL={window_level}, WW={window_width})']
-    if metrics:
-        psnr = metrics.get('psnr', 0)
-        ssim = metrics.get('ssim', 0)
-        title_parts.append(f'PSNR: {psnr:.2f} dB | SSIM: {ssim:.4f}')
-
-    plt.suptitle('\n'.join(title_parts), fontsize=11)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close(fig)
+    img = tensor.detach().cpu().numpy().squeeze()  # (H, W)
+    display = apply_ct_window(img, window_level, window_width)  # uint8
+    imsave(save_path, display)
 
 
 # ============================================================

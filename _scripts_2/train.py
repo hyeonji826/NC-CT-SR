@@ -1,7 +1,7 @@
 """
-train.py - MA-HybridNet 학습 파이프라인
+train.py - Artifact Removal 학습 파이프라인
 
-모드: streak_removal (Medical-Aware Hybrid Denoising Network)
+모드: streak_removal (CT Streak Artifact Removal Network)
 
 실행:
   python train.py --config config_streak_removal.yaml --mode streak_removal
@@ -25,7 +25,7 @@ from tqdm import tqdm
 from utils import (
     setup_logger, save_checkpoint,
     compute_psnr, compute_ssim,
-    save_sample_images,
+    save_ct_slice,
 )
 
 
@@ -61,9 +61,9 @@ def setup_directories(output_root: str) -> dict:
 # Medical-Aware Hybrid Network Trainer
 # ============================================================
 
-class MAHybridNetTrainer:
+class ArtifactRemovalTrainer:
     """
-    MA-HybridNet Trainer (Medical-Aware Hybrid Denoising Network).
+    Artifact Removal Trainer (CT Streak Artifact Removal).
 
     특징:
         - HU + Spatial + Frequency 다중 모달 특징 융합
@@ -75,8 +75,8 @@ class MAHybridNetTrainer:
     """
 
     def __init__(self, config: dict):
-        from model import MAHybridNet
-        from losses import MedicalAwareLoss, GradientTextureDiscriminator, compute_sobel_2ch
+        from model import ArtifactRemovalNet
+        from losses import StreakRemovalLoss, GradientTextureDiscriminator, compute_sobel_2ch
 
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -97,7 +97,7 @@ class MAHybridNetTrainer:
         self.samples_dir.mkdir(exist_ok=True)
 
         # Logger
-        self.logger = setup_logger(str(self.log_dir), 'MAHybridNet')
+        self.logger = setup_logger(str(self.log_dir), 'ArtifactRemoval')
 
         # Training config
         ma_cfg = config.get('streak_removal', {})
@@ -120,16 +120,15 @@ class MAHybridNetTrainer:
         self.nafnet_depth = model_cfg.get('nafnet_depth', 18)
         self.nafnet_width = model_cfg.get('nafnet_width', 384)
 
-        # Loss config (Residual Learning)
-        lambda_l1 = ma_cfg.get('lambda_l1', 1.0)
-        lambda_noise_residual = ma_cfg.get('lambda_noise_residual', 2.0)
-        lambda_ssim = ma_cfg.get('lambda_ssim', 2.0)
-        lambda_edge = ma_cfg.get('lambda_edge', 1.5)
-        lambda_lowfreq = ma_cfg.get('lambda_lowfreq', 2.0)
-        lambda_nps = ma_cfg.get('lambda_nps', 0.5)
-        lambda_texture = ma_cfg.get('lambda_texture', 1.0)
-        lambda_artifact = ma_cfg.get('lambda_artifact', 1.0)
-        lambda_uniformity = ma_cfg.get('lambda_uniformity', 0.5)
+        # Loss config (Streak Removal 특화)
+        lambda_streak_l1 = ma_cfg.get('lambda_streak_l1', 2.0)
+        lambda_perceptual = ma_cfg.get('lambda_perceptual', 1.0)
+        lambda_ssim = ma_cfg.get('lambda_ssim', 1.0)
+        lambda_edge = ma_cfg.get('lambda_edge', 1.0)
+        lambda_texture = ma_cfg.get('lambda_texture', 0.5)
+        lambda_artifact = ma_cfg.get('lambda_artifact', 2.0)
+        lambda_uniformity = ma_cfg.get('lambda_uniformity', 1.0)
+        streak_boost = ma_cfg.get('streak_boost', 3.0)
 
         # HU range
         data_cfg = config.get('data', {})
@@ -183,7 +182,7 @@ class MAHybridNetTrainer:
                 )
         else:
             # Fallback: original Noisier2Noise
-            self.logger.info("Loading MA-Hybrid datasets (original N2N)...")
+            self.logger.info("Loading Artifact Removal datasets (original N2N)...")
             from dataset import get_noisier_finetune_dataloaders
             self.train_loader, self.val_loader, self.test_loader = \
                 get_noisier_finetune_dataloaders(
@@ -201,15 +200,19 @@ class MAHybridNetTrainer:
         self.logger.info(f"[val]   Batches: {len(self.val_loader)}")
 
         # Model
-        self.logger.info("Building MA-HybridNet model...")
-        self.model = MAHybridNet(
+        self.use_streak_map = model_cfg.get('use_streak_map', False)
+        self.logger.info("Building Artifact Removal model...")
+        self.model = ArtifactRemovalNet(
             img_size=self.crop_size,
             swin_embed_dim=self.swin_embed_dim,
             swin_depths=self.swin_depths,
             swin_num_heads=self.swin_num_heads,
             nafnet_depth=self.nafnet_depth,
             nafnet_width=self.nafnet_width,
+            use_streak_map=self.use_streak_map,
         ).to(self.device)
+        if self.use_streak_map:
+            self.logger.info("  Streak map conditioning: ENABLED")
 
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -221,18 +224,17 @@ class MAHybridNetTrainer:
         self.lambda_adversarial = td_cfg.get('lambda_adversarial', 0.01)
         inpaint_trust = td_cfg.get('inpaint_trust', 0.3)
 
-        # Loss (Residual Learning + inpaint trust via |raw-processed| diff)
-        self.criterion = MedicalAwareLoss(
-            lambda_l1=lambda_l1,
+        # Loss (Streak Removal 특화)
+        self.criterion = StreakRemovalLoss(
+            lambda_streak_l1=lambda_streak_l1,
+            lambda_perceptual=lambda_perceptual,
             lambda_ssim=lambda_ssim,
             lambda_edge=lambda_edge,
-            lambda_lowfreq=lambda_lowfreq,
-            lambda_nps=lambda_nps,
             lambda_texture=lambda_texture,
             lambda_artifact=lambda_artifact,
-            lambda_noise_residual=lambda_noise_residual,
             lambda_uniformity=lambda_uniformity,
             inpaint_trust=inpaint_trust,
+            streak_boost=streak_boost,
         )
 
         # Optimizer (Generator)
@@ -329,14 +331,14 @@ class MAHybridNetTrainer:
                         'batch_size': self.batch_size,
                         'lr': self.lr,
                         'noise_std': config.get('noise', {}).get('target_noise_std_hu', 15.0),
-                        'lambda_l1': lambda_l1,
-                        'lambda_noise_residual': lambda_noise_residual,
+                        'lambda_streak_l1': lambda_streak_l1,
+                        'lambda_perceptual': lambda_perceptual,
                         'lambda_ssim': lambda_ssim,
                         'lambda_edge': lambda_edge,
-                        'lambda_lowfreq': lambda_lowfreq,
                         'lambda_texture': lambda_texture,
                         'lambda_artifact': lambda_artifact,
                         'lambda_uniformity': lambda_uniformity,
+                        'streak_boost': streak_boost,
                         'lambda_adversarial': self.lambda_adversarial,
                         'inpaint_trust': inpaint_trust,
                         'use_discriminator': self.use_discriminator,
@@ -355,7 +357,7 @@ class MAHybridNetTrainer:
                 self.use_wandb = False
 
         self.logger.info("=" * 60)
-        self.logger.info("MA-HybridNet Training Ready")
+        self.logger.info("Artifact Removal Training Ready")
         self.logger.info(f"Epochs: {self.start_epoch} → {self.epochs}")
         self.logger.info("=" * 60)
 
@@ -500,8 +502,13 @@ class MAHybridNetTrainer:
             if 'inpaint_mask' in batch:
                 inpaint_mask = batch['inpaint_mask'].to(self.device)
 
+            # Streak map (optional, pre-computed)
+            streak_map = None
+            if 'streak_map' in batch:
+                streak_map = batch['streak_map'].to(self.device)
+
             # === Generator forward ===
-            pred, aux = self.model(input_norm, input_hu)
+            pred, aux = self.model(input_norm, input_hu, streak_map=streak_map)
 
             if torch.isnan(pred).any() or torch.isinf(pred).any():
                 self.logger.warning(f"Batch {batch_idx}: Model output NaN/Inf, skipping")
@@ -547,13 +554,11 @@ class MAHybridNetTrainer:
                 g_adv_loss = F.binary_cross_entropy_with_logits(
                     d_fake_g, torch.ones_like(d_fake_g))
 
-            # === Generator loss ===
+            # === Generator loss (Streak Removal) ===
             loss, loss_dict = self.criterion(
                 pred, target_norm,
-                input_noisy=input_norm,
-                noise_pred=aux['noise_pred'],
-                water_mask=aux['water_mask'],
                 bone_mask=aux['bone_mask'],
+                streak_map=streak_map,
                 action_masks=action_masks,
                 inpaint_mask=inpaint_mask,
             )
@@ -630,13 +635,15 @@ class MAHybridNetTrainer:
                 if 'inpaint_mask' in batch:
                     inpaint_mask = batch['inpaint_mask'].to(self.device)
 
-                pred, aux = self.model(input_norm, input_hu)
+                streak_map = None
+                if 'streak_map' in batch:
+                    streak_map = batch['streak_map'].to(self.device)
+
+                pred, aux = self.model(input_norm, input_hu, streak_map=streak_map)
                 loss, _ = self.criterion(
                     pred, target_norm,
-                    input_noisy=input_norm,
-                    noise_pred=aux['noise_pred'],
-                    water_mask=aux['water_mask'],
                     bone_mask=aux['bone_mask'],
+                    streak_map=streak_map,
                     action_masks=action_masks,
                     inpaint_mask=inpaint_mask,
                 )
@@ -665,53 +672,54 @@ class MAHybridNetTrainer:
         return avg_loss
 
     def _save_fixed_sample(self, epoch: int, psnr: float, ssim: float):
-        """Fixed sample 시각화."""
+        """Fixed sample 시각화 (단일 이미지, 정방향 그대로)."""
         self.model.eval()
         with torch.no_grad():
             fixed_inp = self.fixed_sample['input']
             fixed_inp_hu = self.fixed_sample['input_hu']
-            fixed_tgt = self.fixed_sample['target']
 
-            fixed_out, aux = self.model(fixed_inp, fixed_inp_hu)
+            # Original input: 처음 한 번만 저장
+            original_path = self.samples_dir / 'original_input.png'
+            if not original_path.exists():
+                save_ct_slice(fixed_inp, str(original_path))
+                self.logger.info(f"  Original input saved: {original_path.name}")
 
-            # Save
-            sample_path = self.samples_dir / f'ma_epoch_{epoch:04d}.png'
-            save_sample_images(
-                {'Input': fixed_inp,
-                 'Output': fixed_out,
-                 'Target': fixed_tgt},
-                str(sample_path),
-                epoch,
-                metrics={'psnr': psnr, 'ssim': ssim},
-                rotation=-2  # 180도 회전
+            # Model output: 에포크별 저장
+            fixed_out, _ = self.model(fixed_inp, fixed_inp_hu, streak_map=None)
+            output_path = self.samples_dir / f'artifact_removal_epoch{epoch:04d}.png'
+            save_ct_slice(fixed_out, str(output_path))
+
+            self.logger.info(
+                f"  Sample saved: {output_path.name} "
+                f"(PSNR={psnr:.2f}, SSIM={ssim:.4f})"
             )
 
     def _update_curriculum_weights(self, epoch: int):
         """
         Curriculum Loss Scheduling.
-        Phase 1 (0~transition): L1 높게(구조 안정화), artifact 낮게 시작 → 점진 증가
+        Phase 1 (0~transition): streak_l1 높게(구조 안정화), artifact 낮게 시작 → 점진 증가
         Phase 2 (transition~):  config 설정값 유지
         """
         transition = self.config.get('streak_removal', {}).get('curriculum_epochs', 20)
-        base_l1 = self.config.get('streak_removal', {}).get('lambda_l1', 2.0)
-        base_art = self.config.get('streak_removal', {}).get('lambda_artifact', 1.5)
+        base_l1 = self.config.get('streak_removal', {}).get('lambda_streak_l1', 2.0)
+        base_art = self.config.get('streak_removal', {}).get('lambda_artifact', 2.0)
 
         if epoch < transition:
             alpha = epoch / transition
-            self.criterion.lambda_l1 = base_l1 * 1.2       # 초반 구조 강조 +20%
+            self.criterion.lambda_streak_l1 = base_l1 * 1.2   # 초반 구조 강조 +20%
             self.criterion.lambda_artifact = 0.3 + (base_art - 0.3) * alpha
         else:
-            self.criterion.lambda_l1 = base_l1
+            self.criterion.lambda_streak_l1 = base_l1
             self.criterion.lambda_artifact = base_art
 
         if epoch % 10 == 0 or epoch < 5:
             self.logger.info(
-                f"  [Curriculum] L1={self.criterion.lambda_l1:.2f}, "
+                f"  [Curriculum] streak_l1={self.criterion.lambda_streak_l1:.2f}, "
                 f"Artifact={self.criterion.lambda_artifact:.2f}")
 
     def run(self):
         """전체 학습 루프."""
-        self.logger.info("Starting MA-HybridNet training...")
+        self.logger.info("Starting training...")
 
         for epoch in range(self.start_epoch, self.epochs):
             self._update_curriculum_weights(epoch)
@@ -735,7 +743,7 @@ class MAHybridNetTrainer:
                         'val/psnr': self._last_val_psnr,
                         'val/ssim': self._last_val_ssim,
                         'lr': current_lr,
-                        'curriculum/lambda_l1': self.criterion.lambda_l1,
+                        'curriculum/lambda_streak_l1': self.criterion.lambda_streak_l1,
                         'curriculum/lambda_artifact': self.criterion.lambda_artifact,
                     }
                     # 개별 loss 항목
@@ -745,7 +753,7 @@ class MAHybridNetTrainer:
                                 log_dict[f'train/{k}'] = v
                     # 샘플 이미지 (10 에폭마다)
                     if epoch % 10 == 0:
-                        sample_path = self.samples_dir / f'ma_epoch_{epoch:04d}.png'
+                        sample_path = self.samples_dir / f'artifact_removal_epoch{epoch:04d}.png'
                         if sample_path.exists():
                             log_dict['sample'] = wandb.Image(str(sample_path))
                     wandb.log(log_dict)
@@ -799,7 +807,7 @@ class MAHybridNetTrainer:
                 self.logger.info(f"Early stopping triggered (patience={self.patience})")
                 break
 
-        self.logger.info("MA-HybridNet training completed!")
+        self.logger.info("Artifact Removal training completed!")
         self.logger.info(f"Best val_loss: {self.best_val_loss:.6f}")
 
         if self.use_wandb:
@@ -815,7 +823,7 @@ class MAHybridNetTrainer:
 # ============================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description='MA-HybridNet Training Pipeline')
+    p = argparse.ArgumentParser(description='Artifact Removal Training Pipeline')
     p.add_argument('--config', type=str, default='config_streak_removal.yaml',
                    help='YAML 설정 파일 경로')
     p.add_argument('--mode', type=str, default=None,
@@ -847,7 +855,7 @@ if __name__ == '__main__':
     print(f"[Mode] {mode}")
 
     if mode == 'streak_removal':
-        trainer = MAHybridNetTrainer(cfg)
+        trainer = ArtifactRemovalTrainer(cfg)
         trainer.run()
 
     else:

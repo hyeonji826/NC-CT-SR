@@ -842,7 +842,7 @@ class SwinN2NLDM(nn.Module):
 
 
 # ============================================================
-# Medical-Aware Hybrid Network (MA-HybridNet)
+# Artifact Removal Network
 # ============================================================
 
 class HUGuidedClassifier(nn.Module):
@@ -1483,9 +1483,9 @@ class HybridBackbone(nn.Module):
         return output
 
 
-class MAHybridNet(nn.Module):
+class ArtifactRemovalNet(nn.Module):
     """
-    Medical-Aware Hybrid Denoising Network.
+    Artifact Removal Network (CT Streak Artifact Removal).
 
     통합 아키텍처:
         1. Multi-Feature Extraction:
